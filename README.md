@@ -29,6 +29,7 @@ from warpgate import Gate, TCP, peer
 
 
 async def main():
+    # Put a unique name here for your gateway.
     async with Gate("peer.alpha") as gate:
         link = await gate.connect(
             peer.find("peer.bravo"),
@@ -57,6 +58,7 @@ async def handle(pipe, msg):
 
 
 async def main():
+    # Put a unique name here for your gateway.
     gate = Gate(name="echo.host")
     await gate.listen(handle)
 
