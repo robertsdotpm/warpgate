@@ -1,0 +1,38 @@
+pipeline {
+    agent any
+
+    environment {
+        VENV_DIR = "${WORKSPACE}/venv"
+        PYTHON = "${VENV_DIR}/bin/python3"
+        PIP = "${VENV_DIR}/bin/pip"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Setup Virtualenv') {
+            steps {
+                sh '''
+                    python3 -m venv "$VENV_DIR"
+                    . "$VENV_DIR/bin/activate"
+                    "$PIP" install --upgrade pip
+                    "$PIP" install pytest
+                    "$PIP" install .
+                '''
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    . "$VENV_DIR/bin/activate"
+                    "$PYTHON" -m unittest tests/test_hello_world.py
+                '''
+            }
+        }
+    }
+}

@@ -1,0 +1,173 @@
+# warpgate — project instructions
+
+## Python compatibility
+
+`requires-python = ">=3.5"` is intentional and must not be changed. Do not raise the minimum Python version under any circumstances.
+
+## Dependency versions
+
+Never add version pins to package dependencies in `setup.py`, `pyproject.toml`, or any requirements file. List packages by name only (e.g. `"ecdsa"` not `"ecdsa>=0.18"`). The only version constraint that may appear is `python_requires=">=3.5"`.
+
+## String formatting
+
+Never use f-string literals (`f"..."`). They require Python 3.6+ and break the 3.5 constraint. Use `.format()` or import and use `fstr(template, args_tuple)` from `aionetiface.utility.utils`:
+
+```python
+"value is {}".format(val)
+fstr("value is {0}", (val,))
+```
+
+`fstr()` is a regex-based formatter and **only supports `{N}` positional placeholders**. Format-spec syntax (`{N!r}`, `{N!s}`, `{N:>5}`, `{N:.3f}`, etc.) raises `ValueError` because the regex captures the whole `1!r` and tries `int("1!r")`. If you want repr/str/formatted output, pre-format the value and pass the resulting string:
+
+```python
+# WRONG -- raises ValueError inside fstr at call time
+log(fstr("name={0!r} count={1:>5}", (name, count)))
+
+# RIGHT
+log(fstr("name={0} count={1}", (repr(name), "%5d" % count)))
+```
+
+This bug bites silently because the `ValueError` from fstr in a logging call (e.g. inside an `except` handler that itself uses fstr with `!r`) cascades and can swallow the original exception — making the failure look like a hang or silent drop rather than a logging issue. Stick to plain `{N}` in every fstr template.
+
+## Naming
+
+Never use leading-underscore names for variables, attributes, methods, or functions (e.g. no `_foo`, `_cancel_tasks`, `_private`). Use plain names. The single exception is dunder names (`__init__`, `__all__`, etc.) which are required by Python itself.
+
+## Print statements
+
+Never remove or comment out `print()` calls. They are intentional debugging and observability hooks — leave them exactly as found.
+
+## Error handling
+
+- Use `ValueError` for invalid input at API boundaries.
+- Use `AssertionError` (or bare `assert`) for internal invariants that should never be false.
+- Do not use `RuntimeError` as a catch-all for invariant violations.
+- Do not use `ast.literal_eval` on user-supplied input — parse it explicitly.
+- Pick one error idiom per function: either return a sentinel value or raise — not both.
+
+## Writing tests
+
+**Never use pytest-specific code.** All tests use `unittest` with `AsyncTestCase` from `aionetiface.testing`.
+
+### The required pattern
+
+```python
+import unittest
+from aionetiface.testing import AsyncTestCase
+
+class TestMyFeature(AsyncTestCase):
+    async def asyncSetUp(self):
+        # async setup — runs before each test
+        self.node = await start_something()
+
+    async def asyncTearDown(self):
+        # async teardown — runs after each test
+        await self.node.close()
+
+    async def test_something(self):
+        result = await self.node.do_thing()
+        self.assertEqual(result, expected)
+
+    async def test_skip_example(self):
+        if condition:
+            self.skipTest("reason")
+        ...
+```
+
+### Rules
+
+- Base class is always `AsyncTestCase` — never `unittest.TestCase`, `unittest.IsolatedAsyncioTestCase`, or any pytest class.
+- Test methods are `async def` coroutines — the backport handles them on Python 3.5–3.7.
+- Use `self.skipTest("reason")` — never `pytest.skip(...)`.
+- Never import `pytest`. Never use `@pytest.mark.*` decorators.
+- `aionetiface.testing` calls `aionetiface_setup_event_loop()`, applies the linecache no-op, and opens the Windows firewall rule automatically when imported. No conftest.py setup needed.
+
+### Heavy tests live in their own file
+
+The runner spawns one unittest subprocess per `test_*.py` file, so every file's tests share one Python process. Tests that start `Node`s, open MQTT/TCP connections, or spawn dispatcher tasks accumulate state across each test in that process — sockets in TIME_WAIT, MQTT sessions the broker is rate-limiting, dispatcher tasks the loop never fully drained. By the 4th or 5th heavy test in a single file, that residue can stall the next test long enough to hit the runner's per-file SIGKILL budget. We hit this in real life: `test_demo_smoke.py`, `test_docs_quickstart.py`, and `test_auto_connect.py` all had connectivity classes that hung 300s on multiple VMs until each heavy class was extracted into its own file.
+
+Rule: when a class spins up real `Node`s / MQTT clients / TURN servers, move it into its own `test_*.py` so it gets a fresh subprocess. Keep network-free unit tests grouped together; isolate the heavy stuff. Put the heavy class's helpers into a sibling `<name>_helpers.py` (no `test_` prefix so the runner doesn't pick it up) and import from there. Reference layout: `test_auto_connect.py` keeps the unit-test classes; `test_auto_connect_ipv4.py` / `_ipv6` / `_reverse` / `_multi` / `_punch` / `_turn` each hold one AsyncTestCase class; shared helpers live in `auto_connect_helpers.py`.
+
+### Running tests
+
+Pull all four repos first:
+
+```cmd
+cd C:\Users\<user>\projects\warpgate && git fetch origin && git reset --hard origin/ai_experiment
+cd C:\Users\<user>\projects\aionetiface && git fetch origin && git reset --hard origin/ai_experiment
+cd C:\Users\<user>\projects\namebump && git fetch origin && git reset --hard origin/main
+cd C:\Users\<user>\projects\sidewire && git fetch origin && git reset --hard origin/main
+```
+
+Run with `unittest discover` (sequential, reliable):
+
+```sh
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+On Windows:
+
+```cmd
+C:\Users\<user>\.pyenv\pyenv-win\versions\3.8.6\python.exe -m unittest discover -s tests -p "test_*.py" -v
+```
+
+### asyncio debug mode
+
+Never call `loop.set_debug(True)`. `IsolatedAsyncioTestCase` (Python 3.8+) sets it automatically, but `aionetiface.testing` neutralises the linecache overhead with a no-op patch.
+
+### Install quirks (Python 3.5)
+
+`setuptools>=68` uses Python 3.8+ syntax. On Python 3.5, bypass the build system:
+
+```sh
+pip install wheel "setuptools<50"
+pip install --no-build-isolation --no-deps -e .
+pip install --no-build-isolation --no-deps -e ../aionetiface
+pip install --no-build-isolation --no-deps -e ../namebump
+pip install --no-build-isolation --no-deps -e ../sidewire
+```
+
+On Python 3.5.0 specifically:
+
+```sh
+pip install "pathlib2==2.2.1" "pytest==4.6.11"
+```
+
+## PNP/MQTT propagation race after node startup
+
+When `node_start` returns (or `setup_node` in `demo/__main__.py`), the node has put its PNP record on the configured PNP servers and subscribed to its MQTT signaling topic. Those operations may not yet be visible to every server in the pool. A peer that resolves this node's nickname, or routes signaling via its MQTT topic, in the immediate window after node startup completes can race a server that hasn't yet seen the put / accepted the subscribe, and will silently hang in the resolve or dispatch step.
+
+**This affects every cross-node test in the matrix** — anything with a listener-then-connector flow. The connector side MUST allow a settling window of ~8 seconds before it starts resolving the listener's nickname. `demo/__main__.py:setup_node` enforces this with `await asyncio.sleep(8)` after `Nickname.put` completes; tests or callers that bypass `setup_node` must insert an equivalent sleep themselves before any cross-node lookup.
+
+The full warning lives in the `node_start` docstring at `node/node_start.py`.
+
+## Demo `--ip` vs `--nic`: bind/advertise asymmetry
+
+`warpgate.demo` accepts both `--nic <name>` and `--ip <addr>`. They are NOT interchangeable:
+
+- `--nic <name>` (no `--ip`): leaves `node.listen_ips=[]`. `listen_on_ifs` takes the broad branch — `listen_local(TCP, port, nic)` for v4 + `nic.route(IP6).bind()` for the v6 ext. The bind set matches what `make_node_addr` advertises. **This is the safe default.**
+- `--ip <addr>` (with or without `--nic`): populates `node.listen_ips=[addr,...]`. `listen_on_ifs` takes the strict branch — only IPs literally in `listen_ips` get bound. But `make_node_addr` still advertises the full per-NIC surface (every NIC IP across both AFs, plus v6 link-locals via the `route.link_locals` override in the v6 NIC slot). Net result: the published address claims reachability the bind side never provided. Peers that hit those un-bound addresses get TCP RST (`ConnectionRefused`) — silent for `direct_connect`, NO_ECHO for `reverse_connect` / `tcp_punch` / etc.
+
+The `unix_sweep` runner pins this to `--nic` only for that reason. If you need the strict narrowing of `--ip`, also fix the addr side (truncate `route.link_locals` and the cross-AF entries in the published addr to match what was bound) — otherwise the asymmetry will bite the v6 NIC_BIND pathway in particular.
+
+## Windows XP ephemeral port range and SYN cap (matters for tcp_punch tuning)
+
+XP's TCP/IP stack has two legacy quirks that any tcp_punch-related constant must respect:
+
+- **Ephemeral source-port range** is `1025-5000` (~3975 ports), inherited from BSD-era WinSock. Vista raised it; Win7+ uses the IANA ephemeral range `49152-65535`. The narrow range only applies when the kernel auto-assigns a source port — explicit `bind(port=N)` works for any unprivileged port. But the NAT mapping the *router* creates for XP-originated traffic was tested using the auto-assigned 1025-5000 ports, so the NAT classifier's results are only valid in that range. Bucket-derived ports outside that range can produce different mapping behavior than the classifier observed. `BASE_PORT=2024` was chosen so the bucket pool overlaps with XP's ephemeral range; do not raise it without re-testing XP.
+
+- **Concurrent half-open TCP connect cap** is **10** on XP SP2+ (Tcpip Event 4226 in the System log when tripped). Vista SP1 raised it to 50; Win7+ removed it. tcp_punch's `NUM_PORTS` value is the number of source-port SYNs each side fires concurrently at the peer's single predicted dest port — so `NUM_PORTS` MUST stay `<= 10` to avoid the XP cap. We use `NUM_PORTS=8` for headroom (8 SYNs in flight, 2 cap-slots free). Bumping above 10 silently queues the excess SYNs past the punch window and breaks XP convergence; dropping below ~4 leaves too few attempts to converge when port prediction has any error (XP's non-monotonic ephemeral allocator gives wider mapping spread than other Windows). The historical `NUM_PORTS=2` (db0c676) hid behind a punch_client `n=16` hardcode until 2a36880 removed the override; that's the regression you want to avoid re-introducing.
+
+The corollary for `interface_utils` and `socket.py`: do not hand XP a deterministic-bind port outside `[1025, 5000]` if the path needs the NAT mapping to match the classifier's reading. For tcp_punch the bucket math + `BASE_PORT=2024` already handles this; other code paths that pin specific source ports on XP need to be range-aware.
+
+## Windows XP cross-NAT tcp_punch is not fixable from user-space (`tcpip.sys` simul-open RST)
+
+Pcap forensics on XP-as-listener cross-NAT tcp_punch shows the wire-level handshake completing in full (SYN crossover, SYN-ACK both directions, final ACK), the engine catching `successful=N/N`, the plugin returning `pipe=True` — and then ~140 ms after the handshake XP's `tcpip.sys` unilaterally RSTs the connection. `selector_proxy` on the bridged socket reports `ConnectionResetError(104)` and the demo's echo round-trip fails.
+
+**The 174 ms RST is intrinsic to XP's TCP/IP stack** and not preventable from app code. Tested and ruled out as causes: TCP SACK / timestamps on the Linux peer (sysctl), `SO_LINGER` on Windows close, repeated `connect_ex` calls (strict one-shot didn't change it), the half-open SYN cap (Tcpip Event 4226), TCP task offload (`DisableTaskOffload=1`), TCP Large Send Offload (`TsoEnable=0`), per-NIC checksum offload (`TcpipOffload=0`), AV / NDIS filter drivers (none loaded; `PSched\Linkage` empty), NIC bindings (only IPv4/IPv6 left). Every variant produces the same deterministic 174 ms RST.
+
+XP-SP3 with the final QFE patches (POSReady 2009, build 2600.xpsp_sp3_qfe) is the most-patched XP that exists, so this is the final form of the stack — not a regression that was fixed in a later XP update.
+
+**The only known way to make TCP simul-open work on XP is to bypass `tcpip.sys`.** Hamachi shipped a kernel-level NDIS filter driver (or a TDI hook) that intercepted packets before XP's stack saw them, performed the simul-open handshake out-of-stack, and only injected the connection up to user-space once it was already established. That path is not reachable from a Python library: it requires a signed Windows kernel driver (WHQL or a CA-signed cross-cert valid for XP), per-platform builds, and a userspace↔kernel IPC layer.
+
+**Routing recommendation**: when the dest peer's `os_token` matches `XP` or `Windows-2000`, the connection planner should deprioritise `tcp_punch` and prefer `udp_punch` → `turn`. UDP has no simul-open RST issue and the NAT mappings persist for minutes, so the same use case routes cleanly. This is the same lesson Skype landed on in the XP era — direct P2P went over UDP, TCP only for supernode/relay hops where one end had a reachable IP. tcp_punch remains correct for non-XP-listener pairs and stays in the matrix.

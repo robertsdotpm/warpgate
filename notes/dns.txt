@@ -1,0 +1,42 @@
+DNS deserves special mention cause its such a piece of shit. 
+
+'No Internet connection.'
+'No route to host.'
+'Could not find host.'
+
+Sometimes, when something breaks in a network nothing is wrong.
+Sometimes, its just DNS 'working' as usual.
+
+As I see it -- broken connectivity from DNS issues exposes the same
+issues you see with network programming. Everyone chooses the laziest
+possible approach. They let magical functions try to automatically
+determine all behavior instead of specifying what they need.
+Consequently, when the magic breaks so does the software.
+
+You'll see that good software is written to bypass problems with
+DNS. Browsers will hardcode some backup DNS resolvers and they'll
+hardcode IP addresses for fallbacks. If the goal of Warpgate is to
+improve connectivity it must properly handle DNS failure. They
+really are quite common on some networks. 
+
+Technical notes:
+
+In Python the function socket.getaddrinfo is used to resolve a
+domain name to an IP. This is a standard 'blocking' function
+and asyncio uses a process executor to run this function in.
+That means that DNS queries in Python aren't really async.
+They've been implemented as a hack using [whatever] process
+executors are available to the event loop...
+
+That exposes other problems. If using a process executor pool
+the default number of processes is set to the CPU core no.
+So if you need to resolve many domains in rapid succession a
+bottleneck can occur quickly. Likewise, if you're already
+using the pool for your own work there won't be enough free
+executors to run DNS queries in. 
+
+All of this is very prone to having bottlenecks and timeouts.
+So the address class in Warpgate wraps an actual async DNS library.
+This also helps mitigate issues with depending on a systems
+own configured DNS resolves and cache -- both of which
+are easily broken.

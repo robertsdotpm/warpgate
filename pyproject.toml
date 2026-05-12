@@ -1,22 +1,54 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpgate"
-version = "0.0.1"
-description = "coming soon"
+version = "4.0.2"
+description = "Asynchronous P2P networking library and service"
 readme = "README.md"
 requires-python = ">=3.5"
+license = {text = "public domain"}
 authors = [
-    {name="Matthew Roberts", email="matthew@roberts.pm"}
+    {name = "Matthew Roberts", email = "matthew@roberts.pm"}
 ]
-license = {text = "MIT"}  # or whichever license
+keywords = [
+    "NAT traversal", "TCP hole punching", "simultaneous open",
+    "UPnP", "STUN", "TURN", "P2P", "peer-to-peer", "networking",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
     "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Topic :: Internet",
+    "Topic :: System :: Networking",
 ]
 dependencies = [
-    "aionetiface"
+    "aionetiface",
+    "namebump",
+    "sidewire",
+    "ecdsa",
+]
+
+[project.urls]
+Homepage = "https://github.com/robertsdotpm/p2pd"
+Repository = "https://github.com/robertsdotpm/p2pd"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["tests*", "docs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "network: tests that require live network connectivity (stun, turn, pnp, etc.)",
 ]

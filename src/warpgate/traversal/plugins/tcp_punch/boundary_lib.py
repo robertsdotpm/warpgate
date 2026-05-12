@@ -1,0 +1,236 @@
+"""Sliding-window boundary analysis for port prediction."""
+import time
+import random
+
+# --- NTP Constants ---
+NTP_SERVER = "pool.ntp.org"
+NTP_PORT = 123
+NTP_DELTA = 2208988800  # 70-year offset between NTP epoch (1900) and Unix epoch (1970)
+NTP_PACKET_SIZE = 48
+MAX_NTP_RETRIES = 5
+NTP_TIMEOUT = 1.0
+
+# --------------------------
+# --- Time Rendezvous Constants ---
+# WINDOW must be > 2 * MAX_CLOCK_ERROR (2 * 20 = 40) to guarantee both hosts
+# select the same time bucket/boundary despite the clock offset.
+WINDOW = 42
+MAX_CLOCK_ERROR = 20  # The known max clock difference (1-20s)
+MIN_RUN_WINDOW = 10  # Minimum time required to run setup before the rendezvous
+# NUM_PORTS = number of source-port SYNs each side fires at the peer's
+# single predicted dest port. Higher N = more chances to converge when
+# port prediction has any error (e.g. XP's non-monotonic ephemeral
+# allocator producing wider mapping spread). 16 was the historical
+# value before db0c676 (which dropped to 2 nominally but kept punch_client
+# pinned at hardcoded n=16 -- so the live spray was 16 the whole time).
+# When 2a36880 removed the hardcode, NUM_PORTS=2 actually took effect
+# and broke XP tcp_punch. Bumping back to 16 restores what was
+# empirically working before. XP's 10-half-open cap (Tcpip Event 4226)
+# matters per *instant*, but with the 5 ms spray cadence the SYNs are
+# staggered over ~75 ms; combined with sub-second SYN turnaround on
+# LAN-routed traffic, the kernel keeps the in-flight half-open count
+# bounded well below 16 at any single moment.
+NUM_PORTS = 16
+BASE_PORT = 2024
+# Wider sample space than the original 20000 -- combined with the lower
+# BASE_PORT this gives the allocator the full user-port range (~2k-52k),
+# which makes collisions across back-to-back runs in the same NTP bucket
+# significantly less likely.
+PORT_RANGE = 50000
+CONNECT_TIMEOUT = 5.0
+RETRY_INTERVAL = 0.05
+MAX_SLEEP = 10
+LARGE_PRIME = 2654435761
+
+# Ports that SIP-ALG and RTP helper modules on SOHO routers (Asus,
+# Linksys, MikroTik) may silently inspect, mangle, or redirect.
+# stable_ports() re-samples when the bucket RNG lands on one of
+# these so they never appear in the spray set.
+SIP_ALG_BLACKLIST = frozenset(
+    [5060, 5061] + list(range(10000, 20001))
+)
+# --------------------------
+
+# --------------------------
+# --- Punch Parameter Presets ---
+#
+# DEFAULT_PUNCH_PARAMS: Robust conservative values for CLI / standalone usage.
+#   - Large WINDOW (42 s) and MAX_CLOCK_ERROR (20 s) tolerate poor NTP sync.
+#   - Rendezvous wait: 10–52 seconds worst-case.
+#
+# FAST_PUNCH_PARAMS: Tight values for network-protocol usage where punch_time
+#   is communicated between peers so both sides use the exact same value.
+#   Constraint: window > 2 * max_clock_error  →  6 > 2*2 = 4  ✓
+#   - Rendezvous wait: 2–8 seconds.
+#   - max_sleep (8 s) is deliberately above the 8 s worst-case remaining wait
+#     so sleep_until() does NOT fire early — both sides synchronise exactly.
+# --------------------------
+
+DEFAULT_PUNCH_PARAMS = {
+    # Time rendezvous
+    "window": WINDOW,  # 42 s
+    "max_clock_error": MAX_CLOCK_ERROR,  # 20 s
+    "min_run_window": MIN_RUN_WINDOW,  # 10 s
+    # Engine timing
+    "connect_timeout": CONNECT_TIMEOUT,  # 5.0 s spray window
+    "monitor_timeout": CONNECT_TIMEOUT,  # 5.0 s monitor window
+    "retry_interval": RETRY_INTERVAL,  # 0.05 s selector poll interval
+    # PunchClient / plugin timing
+    "max_sleep": MAX_SLEEP,  # 10 s cap for sleep_until
+    "coordinator_delay": 2.0,  # s delay before spawning punch process
+}
+
+FAST_PUNCH_PARAMS = {
+    # Time rendezvous — sized for SysClock-quorum'd peers.  Both sides
+    # compute punch_time through SysClock (NTP-quorum-backed) so peer-
+    # to-peer skew is the residual error in the quorum result --
+    # typically sub-second on modern OSes.  XP cross-NAT tcp_punch is
+    # routed away (see XP RST CLAUDE note), so only intra-LAN XP-
+    # punch passes through these params, where peer clocks usually
+    # share an upstream and fall well inside max_clock_error=4.
+    # Constraint: window > 2 * max_clock_error  →  10 > 8 ✓; the +2 s
+    # buffer above the strict minimum gives slack against sub-second
+    # jitter at bucket boundaries.  Worst-case rendezvous wait =
+    # window + max_clock_error = 14 s (down from 62 s).  If matrix
+    # sweep flakes appear, bump max_clock_error first (5 or 6) and
+    # widen window to 2*max+2.
+    "window": 10,
+    "max_clock_error": 4,
+    # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
+    # sized it for *manual CLI* usage where a human types ssh commands
+    # on two machines and needs ~10s of slack to start both sides.
+    # Network-protocol invocation completes setup in <1s after PunchMsg
+    # arrives -- 10s is wildly conservative and was the actual cause of
+    # the bucket-fork failures we saw (~5% sweep flake): two peers with
+    # NTP-correct clocks 0.79s apart straddled the 10s "skip to next
+    # bucket" threshold, one bumped, the other didn't, and they ended
+    # up firing 42s apart on different ports.  Dropping to 3 s shrinks
+    # the fork window from 10/42=24% of every bucket transition to
+    # 3/42=7%; together with the small absolute setup cost (~100 ms
+    # for socket binds) this is comfortably enough headroom.
+    # Back to 3 s now that NUM_PORTS=8 restores XP convergence margin.
+    # The 3 -> 10 revert earlier was a guess at fixing XP; the real
+    # cause was NUM_PORTS dropping from 16 to 2 (db0c676 + 2a36880).
+    # 3 s wins back the original sweep-flake reduction (bucket-fork
+    # window 3/42 = 7% vs 10/42 = 24% per bucket transition).
+    "min_run_window": 3,
+    # Engine timing — bumped from 2.0 to 3.0 each after the matrix sweep
+    # showed udp_punch flaking on busy hosts. With 18 sockets each spraying
+    # at 50 Hz the connector saw only 1/18 of expected PROBEs back -- the
+    # asyncio executor thread couldn't keep up with the 2 s window under
+    # MQTT broker churn + plugin coordination chatter. 3 s gives ~50%
+    # headroom on both directions, still well below DEFAULT_PUNCH_PARAMS's
+    # 5.0 s and well within plugin's 30/40 s timeout.
+    "connect_timeout": 3.0,  # 3.0 s spray window (5.0 caused regression)
+    "monitor_timeout": 3.0,  # 3.0 s monitor window
+    "retry_interval": 0.05,  # 0.05 s selector poll interval (unchanged)
+    # PunchClient / plugin timing
+    "max_sleep": 16,  # 16 s cap — above worst-case wait of 14 s
+    # (window + max_clock_error) so sleep_until reaches the actual
+    # rendezvous time without the cap firing early.
+    "coordinator_delay": 0.5,  # 0.5 s — sleep_until handles the actual
+    # rendezvous wait; this is just a setup buffer before spawning
+    # the punch worker, doesn't need to scale with window.
+}
+
+
+def now_from_network(network_timer, network_time):
+    """Returns the current Unix timestamp aligned to the NTP reference."""
+    elapsed = time.monotonic() - network_timer
+    return network_time + int(elapsed)
+
+
+def quantized_bucket(now, window=WINDOW, max_error=MAX_CLOCK_ERROR):
+    """
+    Calculates the time bucket number, robust against clock offsets.
+    By subtracting the max error, we shift the timeline so that both hosts,
+    regardless of their actual time offset, fall into the same integer bucket.
+    """
+    return int((now - max_error) // window)
+
+
+def stable_boundary(bucket):
+    """
+    Deterministic boundary stable against small clock offsets, used as PRNG seed.
+    """
+    return (bucket * LARGE_PRIME) % 0xFFFFFFFF
+
+
+def stable_ports(
+boundary,
+    num_ports=NUM_PORTS,
+    base_port=BASE_PORT,
+    port_range=PORT_RANGE,
+):
+    """
+    Deterministic, smooth port selection using PRNG seeded by boundary.
+    """
+    rng = random.Random(boundary)
+    ports = set()
+    while len(ports) < num_ports:
+        port = base_port + rng.randint(0, port_range - 1)
+        if port not in SIP_ALG_BLACKLIST:
+            ports.add(port)
+
+    return sorted(ports, reverse=True)
+
+
+# Per-OS port pool for the bucket allocator. The os_token is whatever
+# the platform module emitted on the peer (e.g. "Windows-XP",
+# "Windows-10", "Linux-5.10.0", "Darwin-22.1.0"). Match by substring so
+# we don't have to enumerate every possible release string.
+#
+# The motivating case is Windows XP. XP's NAT classification is run from
+# its normal ephemeral allocator (1025-5000); the FULL_CONE+EQUAL_DELTA
+# reading we get back is only valid for sources in that range. The
+# default bucket pool (BASE_PORT=2024, PORT_RANGE=50000) picks ports up
+# to 52023, well outside XP's classified range -- the router NAT then
+# behaves differently than the classifier observed (different mapping
+# strategy, sometimes silently rewrites the source port), so the
+# external port the peer is told to connect to is wrong and tcp_punch's
+# simultaneous-open never converges. Pinning XP's allocator to its
+# 1025-5000 pool keeps the bind ports in the range the classifier
+# actually validated.
+DEFAULT_PORT_POOL = (BASE_PORT, PORT_RANGE)
+WINXP_PORT_POOL = (1025, 5000 - 1025 + 1)  # 1025..5000
+
+
+def port_pool_for_os(os_token):
+    """Return (base_port, port_range) for the bucket allocator for os_token.
+
+    os_token is the platform.system()+'-'+platform.release() string the
+    peer advertised (or None if the peer didn't ship one). Match by
+    substring so unknown future releases of the same OS family route
+    to the right pool. Returns DEFAULT_PORT_POOL on unknown OS or None.
+    """
+    if not os_token:
+        return DEFAULT_PORT_POOL
+    if "XP" in os_token:
+        return WINXP_PORT_POOL
+    if "2000" in os_token and "Windows" in os_token:
+        return WINXP_PORT_POOL
+    return DEFAULT_PORT_POOL
+
+
+def compute_rendezvous(
+now,
+    window=WINDOW,
+    min_run_window=MIN_RUN_WINDOW,
+    max_error=MAX_CLOCK_ERROR,
+):
+    """
+    Computes the current time bucket and the rendezvous time (start of the NEXT bucket).
+    """
+    # 1. Determine the current, shared bucket
+    bucket = quantized_bucket(now, window, max_error)
+
+    # 2. Calculate the start of the *next* bucket's valid time window.
+    # The rendezvous time is the start of the (bucket + 1) window.
+    rendezvous_time = (bucket + 1) * window + max_error
+
+    # 3. Check if there's enough time left for setup. If not, skip to the following bucket.
+    if rendezvous_time - now < min_run_window:
+        bucket += 1
+        rendezvous_time = (bucket + 1) * window + max_error
+
+    return bucket, rendezvous_time
