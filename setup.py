@@ -16,9 +16,9 @@ install_reqs = [
     "ecdsa",
 ]
 setup(
-    version="4.0.2",
+    version="4.0.3",
     name="warpgate",
-    description="Asynchronous P2P networking library and service",
+    description="Async NAT traversal library",
     keywords=(
         "NAT traversal, TCP hole punching, simultaneous open, UPnP, STUN, TURN, SIP, DHCP, add IP to interface, NATPMP, P2P, Peer-to-peer networking library, python"
     ),
