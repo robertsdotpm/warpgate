@@ -66,6 +66,13 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # Hardware & Network Setup
     await load_network_interfaces(node)
 
+    # Validate --ip / listen_ips against the now-loaded NIC set.
+    # Deferred from Node.__init__ because the Gate path doesn't
+    # pre-populate node.ifs there.
+    if node.listen_ips:
+        from .node_connect import apply_listen_ips
+        apply_listen_ips(node)
+
     # Identity & Security
     await load_machine_identity(node)
     kp = load_cryptography_and_auth(node)

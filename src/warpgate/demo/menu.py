@@ -29,6 +29,46 @@ async def connect_option(node, con_opts):
     else:
         dest_addr = await get_dest_addr(node, last_addr)
 
+    # Self-connect guard. The cascade has no native "same machine,
+    # same NIC, same identity" path -- punching to yourself fails in
+    # confusing ways (your own STUN reflection becomes the dest, NAT
+    # mappings collide on the kernel) and the symptoms look like
+    # generic plugin failures rather than "you can't punch to
+    # yourself". Catch the common shapes up front and tell the user
+    # what to do instead.
+    self_names = set()
+    full = getattr(node, "full_name", None)
+    if full:
+        self_names.add(full)
+        # Allow comparing without the TLD too.
+        if "." in full:
+            self_names.add(full.split(".", 1)[0])
+    pnp = getattr(node, "pnp_name", None)
+    if pnp:
+        self_names.add(pnp)
+    dest_str = dest_addr if isinstance(dest_addr, str) else None
+    own_bytes = getattr(node, "addr_bytes", None)
+    is_self = False
+    if dest_str and dest_str.strip() in self_names:
+        is_self = True
+    if own_bytes is not None and dest_addr == own_bytes:
+        is_self = True
+    if is_self:
+        cout()
+        cout("That's this node's own address -- warpgate can't")
+        cout("punch a hole to itself (your STUN reflection becomes")
+        cout("the destination and the kernel's NAT mapping collides")
+        cout("with itself).")
+        cout()
+        cout("To test locally, open a SECOND terminal on this machine")
+        cout("with a DIFFERENT --nic (or a different --ip alias on the")
+        cout("same NIC), e.g.:")
+        cout()
+        cout("    python3 -m warpgate.demo --nic <other-nic-name>")
+        cout()
+        cout("then connect this node to the other's nickname.")
+        return "menu"
+
     # Get connect cmd segments manually if not set.
     plugin_name = await choose_connection_methods(con_method)
     if plugin_name == "menu":

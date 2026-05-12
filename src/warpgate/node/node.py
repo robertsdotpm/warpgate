@@ -52,7 +52,15 @@ class Node(Daemon):
         self.ifs = ifs if ifs is not None else []
         self.listen_ips = norm_listen_ips(ip if ip is not None else [])
         self.listen_port = port
-        if self.listen_ips:
+        # listen_ips validation is deferred to node_start (after
+        # load_network_interfaces populates self.ifs).  Earlier this
+        # validation ran here, but the Gate entry-point doesn't pre-load
+        # NICs -- self.ifs is empty at __init__ time when Gate is used,
+        # so any listen_ips check was guaranteed to fail with "listen
+        # IPs not found on any interface".  Direct Node() callers that
+        # pass ifs= still work because the same validation now runs
+        # post-NIC-load inside node_start.
+        if self.listen_ips and self.ifs:
             apply_listen_ips(self)
 
         # Resource state. msg_cbs is a set so add_msg_cb is idempotent --

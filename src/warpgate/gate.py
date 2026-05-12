@@ -52,17 +52,29 @@ class peer(object):
         return PeerHandle(name)
 
 
-def derive_default_pnp_name(nic_macs, listen_port):
-    """sha256(NIC MAC list + listen port), truncated.  Same inputs → same
-    name → same keystore file → stable identity across runs.
+def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
+    """sha256(NIC MAC list + listen port + listen IPs), truncated.
+
+    Same inputs → same name → same keystore file → stable identity
+    across runs.
 
     Keyed on MAC addresses so the derivation is unique per machine.
     Kernel ifindex (nic.id on Linux) is reproducible per machine but
     collides cross-machine (ifindex 2 = primary NIC on essentially
     every Linux box), which produced same-name collisions across
-    unrelated hosts."""
+    unrelated hosts.
+
+    listen_ips is folded in so two processes on the SAME machine
+    that pin --ip to different aliases on one NIC (e.g. one to
+    10.0.1.76 and one to 10.0.1.110) get distinct identities
+    without needing --id.  Empty / None listen_ips means "bind to
+    the full per-NIC surface", which is the safe default and stays
+    keyed on (mac, port) alone.
+    """
     parts = sorted(str(x) for x in nic_macs if x)
     parts.append(str(listen_port))
+    if listen_ips:
+        parts.extend(sorted(str(ip) for ip in listen_ips if ip))
     payload = ":".join(parts).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 
@@ -136,7 +148,10 @@ class Gate(object):
             await load_network_interfaces(self.node)
             await load_machine_identity(self.node)
             nic_macs = [getattr(nic, "mac", None) for nic in self.node.ifs]
-            self.node.pnp_name = derive_default_pnp_name(nic_macs, self.node.listen_port)
+            self.node.pnp_name = derive_default_pnp_name(
+                nic_macs, self.node.listen_port,
+                listen_ips=self.node.listen_ips,
+            )
         else:
             self.node.pnp_name = self.requested_name
 

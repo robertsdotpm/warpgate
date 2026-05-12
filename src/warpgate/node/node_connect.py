@@ -241,9 +241,26 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
             continue
 
     if tried == 0:
+        # Help the demo / interactive user understand the most common
+        # cause: both peers are on the same machine and share NIC IPs,
+        # so every candidate pair gets filtered as "self-target". The
+        # cascade has no way to punch a hole to itself.
+        hint = ""
+        if route_type == NIC_BIND:
+            hint = (" -- this usually means the source and destination "
+                    "advertise the same NIC IPs (e.g. both processes "
+                    "are bound to the same NIC on this machine). Run "
+                    "the other end with a different --nic or pin --ip "
+                    "to a distinct alias on the same NIC so the pair "
+                    "has distinguishable endpoints.")
+        elif route_type == EXT_BIND:
+            hint = (" -- this usually means both peers share the same "
+                    "external (WAN) IP, e.g. they're behind the same "
+                    "router. Use --pathway local instead, or place one "
+                    "peer on a different network.")
         raise ValueError(
-            "No viable (src, dest) interface pair for af={} route_type={}".format(
-                af, route_type,
+            "No viable (src, dest) interface pair for af={0} route_type={1}{2}".format(
+                af, route_type, hint,
             )
         )
     # tried > 0 but every attempt raised ValueError -- re-surface the
