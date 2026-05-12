@@ -1,6 +1,6 @@
-# warpgate
+# Warpgate
 
-**Any peer. Any NAT.** — async NAT traversal library for Python.
+**Any peer. Any NAT.** — Async NAT traversal library for Python 3.
 
 `[Python 3.5 → 3.13] [Windows XP–11 · Linux · macOS · BSD · Android]`
 
