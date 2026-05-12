@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpgate"
-version = "4.0.2"
-description = "Asynchronous P2P networking library and service"
+version = "4.0.4"
+description = "Async NAT traversal library"
 readme = "README.md"
 requires-python = ">=3.5"
 license = {text = "public domain"}
@@ -18,6 +18,9 @@ keywords = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.5",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
