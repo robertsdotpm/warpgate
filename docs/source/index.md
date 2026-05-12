@@ -72,3 +72,17 @@ pip install warpgate
 
 MIT — every line, every sibling project. No paid tier, no telemetry,
 no vendor lock-in.
+
+```{toctree}
+:maxdepth: 2
+:caption: Contents
+:hidden:
+
+introduction
+quickstart
+connections
+nodes
+configuration
+plugins
+writing_a_plugin
+```
