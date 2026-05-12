@@ -1,5 +1,6 @@
 """Utilities for the simple TCP selector punch engine."""
 import asyncio
+import os
 import socket
 import struct
 import sys
@@ -9,6 +10,22 @@ from aionetiface.net.bind.bind_rules import binder_sync
 from aionetiface.net.net_utils import ip_strip_if
 from aionetiface.net.socket import apply_nic_pin_sockopts
 from aionetiface.utility.cmd_tools import cmd as run_shell_cmd
+
+
+# Same gate the aionetiface log() helper uses: ~/aionetiface/logs/.
+# When it doesn't exist, log() is a no-op and the user has opted out
+# of file-logging entirely -- so the diagnostic shellouts below
+# should opt out too instead of spamming "/bin/sh: 1: netstat: not
+# found" on stripped-down hosts where neither the dir nor the tools
+# are present.
+WARPGATE_DIAG_LOGS_DIR = os.path.join(
+    os.path.expanduser("~"), "aionetiface", "logs",
+)
+
+
+def diag_enabled():
+    """True iff the user has opted into diagnostic logging."""
+    return os.path.isdir(WARPGATE_DIAG_LOGS_DIR)
 
 
 async def log_time_wait_residue(src_ip):
@@ -26,6 +43,12 @@ async def log_time_wait_residue(src_ip):
     way the diag works on every platform we run on.
     """
     if not src_ip:
+        return
+    if not diag_enabled():
+        # No ~/aionetiface/logs/ -> user hasn't opted into diagnostic
+        # logging. Skip the netstat shellout entirely so we don't
+        # spam "command not found" on hosts (containers, minimal
+        # FreeBSD installs, embedded boxes) that lack the tool.
         return
     try:
         text = await run_shell_cmd("netstat -an", timeout=10)
