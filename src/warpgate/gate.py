@@ -52,10 +52,25 @@ class peer(object):
         return PeerHandle(name)
 
 
-def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
-    """sha256(NIC MAC list + listen port + listen IPs), truncated.
+def derive_default_pnp_digest(nic_macs, listen_port, listen_ips=None):
+    """Raw 16-char hex digest of the same payload derive_default_pnp_name
+    hashes.  Exposed so callers (e.g. the demo) can fall back to the
+    hex form when the human-readable form collides with another peer
+    that happened to hash to the same noun_noun_NNN."""
+    parts = sorted(str(x) for x in nic_macs if x)
+    parts.append(str(listen_port))
+    if listen_ips:
+        parts.extend(sorted(str(ip) for ip in listen_ips if ip))
+    payload = ":".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
 
-    Same inputs → same name → same keystore file → stable identity
+
+def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
+    """Deterministic human-readable PNP name of the form
+    ``noun_noun_NN`` derived from a sha256(NIC MACs + listen port +
+    listen IPs) digest.
+
+    Same inputs -> same name -> same keystore file -> stable identity
     across runs.
 
     Keyed on MAC addresses so the derivation is unique per machine.
@@ -70,13 +85,15 @@ def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
     without needing --id.  Empty / None listen_ips means "bind to
     the full per-NIC surface", which is the safe default and stays
     keyed on (mac, port) alone.
+
+    Output is run through nouns.hex_to_human() so the registered
+    nickname is something a person can say out loud (e.g.
+    "river_otter_42") instead of a 16-char hex blob.
     """
-    parts = sorted(str(x) for x in nic_macs if x)
-    parts.append(str(listen_port))
-    if listen_ips:
-        parts.extend(sorted(str(ip) for ip in listen_ips if ip))
-    payload = ":".join(parts).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:16]
+    from .node.nouns import hex_to_human
+    return hex_to_human(
+        derive_default_pnp_digest(nic_macs, listen_port, listen_ips),
+    )
 
 
 class Gate(object):

@@ -6,6 +6,9 @@ from aionetiface import (
 )
 from ..traversal.traversal_utils import close_plugin
 from ..node.auto_connect import auto_connect
+from ..node.nickname import (
+    FullNameFailure, PnpServerResourceLimit, PnpServerUnreachable,
+)
 from . import stop_rw
 from .utils import (
     ainput, choose_address_families, choose_connection_methods,
@@ -118,6 +121,26 @@ async def connect_option(node, con_opts):
         plugin = await node.connect(af, route_type, dest_addr, plugin_name)
     except (OSError, ConnectionError, asyncio.TimeoutError) as e:
         cout("Connection error: " + str(e))
+        return "menu"
+    except FullNameFailure as e:
+        # PNP lookup couldn't find the destination nickname on any
+        # configured server. Either the name was never registered,
+        # has expired, or was deleted.
+        cout("Nickname not found: " + str(e))
+        cout("Make sure the other peer is running and has registered "
+             "this name.")
+        return "menu"
+    except PnpServerUnreachable as e:
+        cout("PNP server unreachable: " + str(e))
+        cout("Check your network connection and try again.")
+        return "menu"
+    except PnpServerResourceLimit as e:
+        cout("PNP server reported a resource limit: " + str(e))
+        return "menu"
+    except LookupError as e:
+        # resolve_pnp_addr raises LookupError when the PNP record is
+        # missing on the server but the round-trip itself succeeded.
+        cout("Nickname not found: " + str(e))
         return "menu"
     except ValueError as e:
         # node.connect raises ValueError for predictable user-input
