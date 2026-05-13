@@ -19,13 +19,43 @@ import asyncio
 import time
 import signal
 import os
+import json as stdlib_json
+import os as stdlib_os
+import time as stdlib_time
 from aionetiface import (
     StartNodeNicknameFailed, TunnelFailed,
     allow_windows_firewall,
     async_run, async_wrap_errors, fstr,
+    get_aionetiface_install_root,
     log, log_exception,
     sock_has_data, sys, to_b, to_s,
 )
+
+
+def report_servers_json_age():
+    """Print how many days old the on-disk servers.json is, or note
+    that the file is missing.  Read directly from disk so the value
+    reflects what update_server_list last wrote, not whatever the
+    in-memory INFRA constant happens to say."""
+    try:
+        path = stdlib_os.path.join(
+            get_aionetiface_install_root(), "servers.json",
+        )
+        if not stdlib_os.path.exists(path):
+            cout("servers.json not on disk yet (will be created at next "
+                 "refresh)")
+            return
+        with open(path, "r", encoding="utf-8") as fp:
+            ts = stdlib_json.load(fp).get("timestamp", 0)
+        if not ts:
+            cout("servers.json present but has no timestamp field")
+            return
+        age_days = (stdlib_time.time() - ts) / 86400.0
+        cout(fstr("servers.json age = {0} days (last server-side change)",
+                  ("%.1f" % age_days,)))
+    except (OSError, ValueError):
+        # Stale / corrupted / unreadable -- non-fatal diag print.
+        cout("servers.json age = unreadable")
 from ..node.nickname import (
     FullNameFailure, PnpServerResourceLimit, PnpServerUnreachable,
 )
@@ -93,6 +123,7 @@ async def setup_node():
     cout()
     cout(fstr("Node started = {0}", (to_s(node.addr_bytes),)))
     cout(fstr("Node port = {0}", (node.listen_port,)))
+    report_servers_json_age()
 
     nick = gate.full_name
     if nick is not None:
