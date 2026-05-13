@@ -40,6 +40,7 @@
 """
 import selectors
 import socket
+import struct
 import time
 from aionetiface import log
 from .tcp_punch_utils import bind_tcp_sockets, connect_on_tcp_sockets
@@ -241,6 +242,27 @@ af,
         log("[ENGINE] choose_winning_tcp_sock -> {0}".format(
             "selected" if sock else "no winner",
         ))
+
+        # Revert SO_LINGER {1,0} on the winning socket. We set it at
+        # bind time so failed-punch close()es bypass TIME_WAIT and
+        # free the deterministic 4-tuple for the next NTP-bucket
+        # retry.  After the punch lands, that socket is about to
+        # carry application bytes, and a future close() RST would
+        # discard whatever's still in the kernel buffers (the 5h
+        # 100MB transfer test surfaced this -- sender close()
+        # truncated the receiver mid-drain).  Flip linger back to
+        # default so the eventual close() does the normal FIN/FIN-
+        # ACK dance instead.
+        if sock is not None:
+            try:
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER,
+                    struct.pack("ii", 0, 0),
+                )
+            except OSError:
+                # Best-effort; leaving linger on is a graceful
+                # degradation, not a correctness break.
+                pass
 
         return sock
     finally:
