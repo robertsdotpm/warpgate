@@ -8,13 +8,17 @@ Timeout budget (PLUGIN_CONF["timeout"] = 180):
         + worker dispatch / engine setup overhead (varies by host,
           ~5-15 s on slow stacks)
         + the post-punch reverse-bridge accept (typically <1 s)
-        + a safety margin for slow stacks (XP/Vista) so the run_plugin
-          wait_for doesn't cancel the awaiting reverse_server.accept
-          before the worker has had a chance to connect back. The
-          previous 80 s left only ~10 s margin which v13's vista-from-xp
-          ate, manifesting as WinError 10061 on the worker's connect-
-          back to a listener that had just been torn down by the
-          cancellation propagating from the timeout firing.
+        + a safety margin for slow stacks (Vista / older BSDs) so the
+          run_plugin wait_for doesn't cancel the awaiting
+          reverse_server.accept before the worker has had a chance to
+          connect back.  The previous 80 s left only ~10 s margin
+          which the v13 sweep ate on slow pairs, manifesting as
+          WinError 10061 on the worker's connect-back to a listener
+          that had just been torn down by the cancellation
+          propagating from the timeout firing.  XP cross-NAT
+          tcp_punch is routed away to udp_punch / turn (see
+          project_xp_tcp_punch_simul_open_rst memory) so the budget
+          here doesn't need to accommodate XP specifically anymore.
 
 PROTO_MESSAGES is consumed by plugin_loader: it merges each entry into
 TraversalManager.sig_proto so PunchMsg dispatches without core
@@ -196,10 +200,11 @@ class PunchPlugin(Plugin):
         # Safe two-level lookup: load_stun_clients populates entries
         # only for the (af, if_index) combinations that successfully
         # resolved a STUN server during node startup. On hosts where
-        # v6 STUN never came up (XP / Vista without a working v6
-        # path) the inner dict is missing the if_index entirely, and
-        # bare self.stun_clients[af][if_index] raises KeyError before
-        # the "no STUN clients loaded" guard below ever runs.
+        # v6 STUN never came up (Vista without a working v6 path, or
+        # any host where the v6 default route briefly flapped at
+        # startup) the inner dict is missing the if_index entirely,
+        # and bare self.stun_clients[af][if_index] raises KeyError
+        # before the "no STUN clients loaded" guard below ever runs.
         stuns = self.stun_clients.get(self.af, {}).get(if_index, [])
 
         # Lazy retry: load_stun_clients ran once at node startup and
