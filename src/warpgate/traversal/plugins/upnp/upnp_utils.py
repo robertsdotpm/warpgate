@@ -1,11 +1,13 @@
 """Helper functions for UPnP IGD port-mapping."""
 import asyncio
 import urllib.parse
+from xml.parsers.expat import ExpatError
 from aionetiface import (
     dict_child, NET_CONF, IP4, IP6, to_s, to_b, fstr, log, log_exception,
     WebCurl, async_wrap_errors, strip_none,
 )
 from aionetiface.vendor import xmltodict
+
 
 UPNP_CONF = dict_child(
     {
@@ -175,6 +177,8 @@ async def get_upnp_forwarding_services(route, dest, path):
         log("upnp got:" + str(dest))
         if services:
             return (dest, services)
+    except ExpatError:
+        pass
     except (OSError, ValueError, KeyError):
         log(
             fstr(
