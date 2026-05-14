@@ -219,42 +219,23 @@ af,
         log("[ENGINE] entering sleep_until -> punch rendezvous")
         f_sleep_until()
 
-        # Initiate simultaneous open.  Passing ``sel`` enables the
-        # selector-aware early-exit inside the spray: as soon as one
-        # socket reaches ESTABLISHED (plus 50ms grace for stragglers)
-        # the spray returns instead of running out the full
-        # spray_duration window.  On healthy punches this shaves up
-        # to spray_duration off the engine's wall-clock cost (the
-        # subsequent monitor pass already had this short-circuit, but
-        # only ran after the blind spray finished).
-        log("[ENGINE] sleep_until done; spraying {0} connects for up to {1}s".format(
+        # Initiate simultaneous open
+        log("[ENGINE] sleep_until done; spraying {0} connects for {1}s".format(
             len(pre_connect_infos), spray_duration,
         ))
-        early_successful = connect_on_tcp_sockets(
-            same_machine, pre_connect_infos, dest_ip,
-            spray_duration=spray_duration, sel=sel,
+        connect_on_tcp_sockets(
+            same_machine, pre_connect_infos, dest_ip, spray_duration=spray_duration,
         )
 
-        if early_successful:
-            # Spray found ESTABLISHED transitions and exited early.
-            # Skip the monitor pass entirely -- nothing further to
-            # detect, and the bridge handoff fires faster.
-            successful = early_successful
-            log("[ENGINE] spray early-exit; successful={0}/{1} (skipping monitor)".format(
-                len(successful), len(pre_connect_infos),
-            ))
-        else:
-            # Spray completed its full window without confirmed
-            # ESTABLISHED.  Fall through to the legacy monitor pass
-            # so late arrivals still get picked up.
-            successful = socket_event_monitor(
-                sel, monitor_duration=monitor_duration, retry_interval=retry_interval
-            )
-            log("[ENGINE] monitor done; successful={0}/{1}".format(
-                len(successful), len(pre_connect_infos),
-            ))
+        # Immediately monitor, no blind sleep
+        successful = socket_event_monitor(
+            sel, monitor_duration=monitor_duration, retry_interval=retry_interval
+        )
 
         sock_list = list(successful)
+        log("[ENGINE] monitor done; successful={0}/{1}".format(
+            len(sock_list), len(pre_connect_infos),
+        ))
 
         # Application-level validation should still be done after this
         sock = choose_winning_tcp_sock(dest_ip, sock_list, our_ip)

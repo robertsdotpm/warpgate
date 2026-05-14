@@ -1,7 +1,6 @@
 """Utilities for the simple TCP selector punch engine."""
 import asyncio
 import os
-import selectors
 import socket
 import struct
 import sys
@@ -265,9 +264,8 @@ def connect_on_tcp_sockets(
     bound_infos,
     dest_ip,
     spray_duration=5.0,
-    sel=None,
 ):
-    """Spray SYN packets at the destination for up to `spray_duration` seconds.
+    """Spray SYN packets at the destination for `spray_duration` seconds.
 
     Loops over the bound sockets calling connect_ex on each.  Both peers
     need to be in SYN_SENT when the other's SYN arrives for simul-open
@@ -276,30 +274,8 @@ def connect_on_tcp_sockets(
     runs sleep 5ms between iterations to avoid busy-spin; same-machine
     iterates flat-out since the loopback path has no RTT slack.
 
-    spray_duration: max time to keep spraying (seconds).
-
-    sel: optional selectors selector with the bound sockets registered
-    for EVENT_WRITE.  When supplied, this function polls between spray
-    iterations and exits early as soon as the first socket transitions
-    to ESTABLISHED (plus a 50ms grace for stragglers in the same fire).
-    Returns the set of successful sockets found during the spray
-    window.  When ``sel=None`` (legacy callers) the function still
-    runs the full spray and returns an empty set; the caller's
-    subsequent socket_event_monitor pass picks up the connections
-    instead.
-
-    The previous blind ``time.sleep(spray_duration)``-style spray cost
-    up to ~connect_timeout on every healthy punch -- the punch landed
-    in the first 50-300ms but the loop still ran the full window
-    before handing off to socket_event_monitor.  Inlining the
-    selector poll here lets us bail the instant the punch confirms,
-    which is the largest single contributor to the tcp_punch median
-    latency.
+    spray_duration: how long to keep spraying (seconds).
     """
-    successful = set()
-    first_success_at = None
-    GRACE_SEC = 0.050
-
     start = time.monotonic()
     end = start + spray_duration
     first_iter = True
@@ -316,51 +292,8 @@ def connect_on_tcp_sockets(
                     log("[ENGINE-DBG] connect_ex raised: " + repr(exc))
         first_iter = False
 
-        # Inline selector poll -- enables early-exit on first
-        # ESTABLISHED.  Same event-handling shape as
-        # socket_event_monitor, just folded into the spray so the
-        # function returns as soon as the punch lands rather than
-        # waiting out the rest of spray_duration.
-        if sel is not None:
-            events = sel.select(timeout=0.005)
-            for key, mask in events:
-                sock = key.fileobj
-                if mask & selectors.EVENT_WRITE:
-                    try:
-                        e = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                        if e == 0:
-                            sock.getpeername()
-                            if sock not in successful:
-                                successful.add(sock)
-                                if first_success_at is None:
-                                    first_success_at = time.monotonic()
-                            sel.modify(sock, selectors.EVENT_READ)
-                    except OSError:
-                        pass
-                if mask & selectors.EVENT_READ:
-                    try:
-                        data = sock.recv(1, socket.MSG_PEEK)
-                        if data:
-                            if sock not in successful:
-                                successful.add(sock)
-                                if first_success_at is None:
-                                    first_success_at = time.monotonic()
-                    except BlockingIOError:
-                        if sock not in successful:
-                            successful.add(sock)
-                            if first_success_at is None:
-                                first_success_at = time.monotonic()
-                    except OSError:
-                        pass
-
-            if (first_success_at is not None
-                    and (time.monotonic() - first_success_at) >= GRACE_SEC):
-                return successful
-
         if not same_machine:
             time.sleep(0.005)
-
-    return successful
 
 
 def sleep_until(punch_time, f_timer, max_sleep=10):
