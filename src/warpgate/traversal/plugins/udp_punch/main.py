@@ -343,6 +343,25 @@ class UdpPunchPlugin(Plugin):
                 log("[UDP-PUNCH] advance_punching_protocol: peer sent empty mappings list; dropping")
                 return None
 
+        # Re-entry guard: sidewire's republish loop and the multi-broker
+        # rendezvous can both deliver duplicates of the same signed msg
+        # to the listener, which re-enters run() and lands here again
+        # with reply.payload.mappings populated.  nat_alloc.port_alloc()
+        # is stateful (NATPredictAlloc walks a state machine that
+        # asserts on invalid progressions) and a second call fires
+        # `AssertionError("Invalid nat predict state progression.")`.
+        # By the time the second reply arrives we've already folded
+        # the first one's mappings into puncher.port_allocs and the
+        # engine task is in-flight; the duplicate has nothing to
+        # contribute, so drop it before it crashes the predictor.
+        if recv_mappings is not None and puncher.port_allocs:
+            log(fstr(
+                "[UDP-PUNCH] advance_punching_protocol: duplicate reply "
+                "ignored (port_allocs already populated, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
 

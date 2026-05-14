@@ -301,6 +301,16 @@ class PunchPcapPlugin(Plugin):
                 log("tcp_punch_pcap: peer sent empty mappings; dropping")
                 return None
 
+        # Re-entry guard: same as tcp_punch / udp_punch.  See those
+        # plugins for the full rationale.
+        if recv_mappings is not None and puncher.port_allocs:
+            log(fstr(
+                "tcp_punch_pcap: duplicate reply ignored "
+                "(port_allocs already populated, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
 

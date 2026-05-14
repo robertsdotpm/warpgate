@@ -387,6 +387,22 @@ class PunchPlugin(Plugin):
                 log("[TCP-PUNCH] advance_punching_protocol: peer sent empty mappings list; dropping")
                 return None
 
+        # Re-entry guard: same shape as udp_punch's guard.  sidewire
+        # republishes the punch msg until app-ack'd, and the
+        # multi-broker fan-out means several duplicates can arrive at
+        # the listener within seconds.  Each one re-enters run() and
+        # lands here; nat_alloc.port_alloc() walks a state machine
+        # that asserts on invalid progressions, so the second call
+        # raises AssertionError.  Drop duplicates once port_allocs is
+        # already populated.
+        if recv_mappings is not None and puncher.port_allocs:
+            log(fstr(
+                "[TCP-PUNCH] advance_punching_protocol: duplicate reply "
+                "ignored (port_allocs already populated, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         # Compute the next round of port predictions.
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
