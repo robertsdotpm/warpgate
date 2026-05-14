@@ -303,9 +303,14 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
         mode, src_nat, dest_nat, recv_mappings, test_no
     )
 
-    # Preload nat predictions then
-    # mock single mapping can be a function.
-    preloaded_mappings = await preload_mappings(len(recv_mappings), stuns)
+    # Preload nat predictions: ONE STUN call instead of N. For
+    # EQUAL_DELTA / PRESERV_DELTA NATs (the matrix VMs and most SOHO
+    # consumer NATs) the delta is constant, so a single STUN reveals
+    # it and the remaining N-1 external ports are computed without
+    # extra round-trips. preload_mappings still returns a list; we
+    # rely on get_single_mapping's existing IndexError fallback to
+    # preloaded_mappings[0] for indices beyond the truncated list.
+    preloaded_mappings = await preload_mappings(1, stuns)
     assert len(preloaded_mappings)
 
     # Use default ports for client if unknown
