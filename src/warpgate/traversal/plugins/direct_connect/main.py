@@ -25,6 +25,19 @@ class DirectConnect(Plugin):
     transport = TCP
 
     async def run(self, reply=None):
+        # Re-entry guard.  TM's recv_signal_msg falls through to
+        # scheduling another run_plugin task when a duplicate signal
+        # for the same pipe_id arrives while plugin.result is still
+        # pending -- the dedupe only fires once result.done() is True.
+        # direct_connect is one-shot: it opens TCP + sends one CON_ID
+        # frame.  Without this guard, sidewire's MQTT republish causes
+        # 5+ duplicate TCP back-connects from the peer, each sending
+        # the same CON_ID frame, and self.result.set_result() raises
+        # InvalidStateError on the second attempt.
+        if getattr(self, "run_started", False):
+            return
+        self.run_started = True
+
         dest = (self.dest["ip"], self.dest["port"])
         try:
             route = await self.bind()
