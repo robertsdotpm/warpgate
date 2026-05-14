@@ -244,8 +244,13 @@ af,
             len(sock_list), len(pre_connect_infos),
         ))
 
-        # Application-level validation should still be done after this
-        sock = choose_winning_tcp_sock(dest_ip, sock_list, our_ip)
+        # Application-level validation should still be done after this.
+        # Pass monitor_duration (which is FAST_PUNCH_PARAMS["monitor_timeout"])
+        # as the non-master's sentinel-wait budget so it tracks the
+        # configured punch profile instead of using a stale hardcoded 5.0s.
+        sock = choose_winning_tcp_sock(
+            dest_ip, sock_list, our_ip, sentinel_wait=monitor_duration,
+        )
         log("[ENGINE] choose_winning_tcp_sock -> {0}".format(
             "selected" if sock else "no winner",
         ))

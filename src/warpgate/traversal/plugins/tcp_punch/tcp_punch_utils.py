@@ -311,16 +311,3 @@ def connect_on_tcp_sockets(
 
         if not same_machine:
             time.sleep(0.005)
-
-
-def sleep_until(punch_time, f_timer, max_sleep=10):
-    """Block until punch_time (from f_timer()), sleeping at most max_sleep seconds."""
-    now = f_timer()
-    sleep_time = max(0, punch_time - now)
-
-    # Cap sleep time to avoid large blocks if the host clock is far behind
-    if sleep_time > max_sleep:
-        sleep_time = max_sleep
-
-    if sleep_time > 0:
-        time.sleep(sleep_time)
