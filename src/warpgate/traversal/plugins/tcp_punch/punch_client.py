@@ -1,45 +1,3 @@
-"""
-Design:
-
-    - timing strategies:
-        - ntp reference + future time
-        - could also be based on receive time + future offset
-            - requires communication between hosts
-
-    - existing code:
-        - partial success:
-            - use initial predicted mappings
-
-        - response:
-            - use their predicted mappings
-
-    - full graceful degrade:
-        - timing: ntp assumed in same window
-        - deterministic mappings -> same port
-            - no predictions for mappings
-        - connect + listen select engine
-        - works well to test algorithm behind LAN and simple NATs
-        - no communication between hosts
-
-    - future work
-
-        - "hard side" + "easy side" UDP algorithm:
-            - hard side:
-                - 256 sockets and outbound cons to same easy ip:port
-            - easy side:
-                - 1 socket and 256 multiplexed sends to random hard ip:ports
-                - src NAT preserves same ip:port alloc for send
-                - collision ends up with 66% success for hard side
-            - requirements:
-                - NAT-specific tuple allocation iter for: src bind, src ip, dest ip dest port
-                    - socket set(src ip, src port) reuse based on proto (only for UDP)
-            - reference:
-                - "https://tailscale.com/blog/how-nat-traversal-works" (NAT notes for nerds)
-        -
-
-    - limitations:
-        - FD limit on windows is 64
-"""
 import sys
 import time
 import argparse
@@ -211,7 +169,7 @@ self,
                         int(remaining),
                     ))
 
-    def add_port_allocator(self, f_port_alloc, n=None):
+    def add_port_allocator(self, f_port_alloc, n=None, seed=None):
         """Run a port-allocation function and append unique PortAlloc entries to the list.
 
         n=None defers to the allocator's own default (boundary_port_alloc
@@ -220,12 +178,20 @@ self,
         hard-coded default of 16 was overriding that intent on every
         call site -- the matrix had been running with 16-port sprays
         since db0c676 landed.
+
+        seed overrides the timestamp passed to f_port_alloc.  The plugin
+        path uses this to feed punch_time (identical on both peers via
+        PunchMsg) into boundary_port_alloc so connector and listener
+        derive ports from the same bucket regardless of when each side's
+        create_puncher actually ran.  Default (None) keeps the CLI
+        standalone path unchanged -- it uses self.timestamp.
         """
+        t = seed if seed is not None else self.timestamp
         kw = {"params": self.params, "our_os": self.our_os, "their_os": self.their_os}
         if n is None:
-            port_allocs, reserved = f_port_alloc(self.timestamp, **kw)
+            port_allocs, reserved = f_port_alloc(t, **kw)
         else:
-            port_allocs, reserved = f_port_alloc(self.timestamp, n=n, **kw)
+            port_allocs, reserved = f_port_alloc(t, n=n, **kw)
         for port_alloc in port_allocs:
             is_unique = True
             for stored_port_alloc in self.port_allocs:

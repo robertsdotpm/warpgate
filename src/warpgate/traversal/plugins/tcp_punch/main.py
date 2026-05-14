@@ -300,35 +300,35 @@ class PunchPlugin(Plugin):
         # secondary -- both sides agree on one wall-clock instant via
         # the signal exchange itself.
         #
-        # For boundary_port_alloc seeding both sides MUST use the same
-        # timestamp value, otherwise their bucket-derived port pools
-        # can diverge across a window boundary (signal RTT + Windows
-        # SYMMETRIC-NAT predict latency easily crosses a 3 s window).
-        # We solve this by always seeding from the connector's tx_unix:
-        # the connector uses its own local clock; the listener takes
-        # the connector's tx_unix out of the inbound PunchMsg and
-        # seeds boundary_port_alloc with that.  Identical bucket on
-        # both peers, port_alloc deterministic and matched.
+        # puncher.timestamp stays as the LOCAL sys_clock.time() because
+        # PunchClient.sleep_until uses it as the reference for "now"
+        # when computing the remaining sleep -- setting it to anything
+        # other than the local wall-clock would break the sleep math.
+        # boundary_port_alloc is seeded separately from punch_time (see
+        # add_port_allocator(seed=...) below) so both peers derive
+        # ports from the same bucket regardless of timestamp skew.
         #
         # The CLI standalone path in punch_client.py __main__ keeps
         # compute_rendezvous because it has no PunchMsg channel to
-        # communicate either the pin or the seed.
+        # communicate the pin.
+        timestamp = self.sys_clock.time()
         if reply is not None and getattr(reply.payload, "ntp", 0):
-            # Listener: take the connector's pinned moment + seed timestamp.
+            # Listener: take the connector's pinned moment verbatim.
             punch_time = float(reply.payload.ntp)
-            timestamp = float(reply.payload.tx_unix or self.sys_clock.time())
         else:
             # Connector: pin a near-future absolute moment.
-            timestamp = self.sys_clock.time()
             punch_time = timestamp + PLUGIN_PIN_OFFSET
 
         puncher.set_timestamp(timestamp)
         puncher.set_punch_time(punch_time)
 
         # Deterministic predictions based on boundary math.
-        # PunchClient.add_port_allocator forwards self.params to the allocator
-        # so it uses the same window / error constants for bucket derivation.
-        puncher.add_port_allocator(boundary_port_alloc)
+        # Seed boundary_port_alloc with punch_time -- since both peers
+        # take punch_time verbatim (connector picks, listener reads
+        # from PunchMsg) they derive the same bucket and produce the
+        # same port pool regardless of timestamp drift between
+        # create_puncher calls.
+        puncher.add_port_allocator(boundary_port_alloc, seed=punch_time)
 
         # Return the new puncher and the STUN clients
         return puncher, stuns
