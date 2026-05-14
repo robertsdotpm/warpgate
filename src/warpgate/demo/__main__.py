@@ -64,6 +64,13 @@ from ..node.node_start import register_and_persist
 from . import stop_rw
 from .defs import MENU_BANNER, PROGRAM_BANNER, demo_node_conf
 from .cmd_arg_defs import args
+# Side-effect import: cmd_arg_proc reads args (see above) and mutates
+# demo_node_conf accordingly -- it's the bridge between argparse output
+# and the conf dict the Gate / Node actually reads.  Without this
+# import the file's top-level statements never execute, which silently
+# breaks --disable_upnp, --pnp, --mqtt, --install_path, and the
+# get_nickname subcommand's conf overrides.
+from . import cmd_arg_proc  # noqa: F401
 from .utils import (
     add_echo_support, ainput_interrupt_w, cout,
     display_ifs_loaded,
