@@ -82,15 +82,18 @@ sel,
     each other on the same RTT-aligned pair, so this catches the
     sibling sockets without dragging the punch out.
 
-    NOTE: XP cross-NAT tcp_punch is no longer a target for this
-    plugin -- the 174ms post-handshake RST in tcpip.sys is intrinsic
-    to XP's stack and unfixable from user-space (routed away to
-    udp_punch / turn via the os_token check; see
-    project_xp_tcp_punch_simul_open_rst memory).  Raw-packet
-    simul-open lives in tcp_punch_pcap as a separate plugin.  The
-    50ms grace here predates the XP-route-away decision and the
-    figure was sized against that constraint; revisit if needed,
-    but a tight grace is still cheap so it's been left at 50ms.
+    DO NOT OPTIMIZE THIS LOOP -- the current early-exit + grace
+    structure is the safe shape.  Tightening the grace, removing the
+    grace_extended bump-on-multi, or replacing the loop with a fast-
+    path "first event wins" has been tried in past sessions and each
+    variant produced subtle convergence regressions (e.g. handing off
+    to choose_winning before the master's b"$" sentinel could fan
+    out, or selecting a sibling socket whose peer-side state was
+    still mid-handshake).  The 50ms+50ms grace is deliberately
+    conservative because the cost of waiting is small and the cost of
+    a wrong winner is a silent broken pipe.  If you think this can
+    be made faster, write it down in punch_speed memory instead and
+    talk to the user before touching the code.
 
     monitor_duration: max time to watch for connection events (seconds).
     retry_interval:   selector poll timeout per iteration (seconds).
