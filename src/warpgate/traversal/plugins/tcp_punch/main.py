@@ -179,6 +179,18 @@ class PunchPlugin(Plugin):
         except BaseException as exc:
             raise
 
+        # Instrumentation: when a reply with mappings just landed, log
+        # the round-trip from our outgoing send to this receipt.  The
+        # send timestamp is stashed on self.outgoing_sent_at below
+        # before send_signal fires.
+        if (reply is not None
+                and getattr(self, "outgoing_sent_at", None) is not None):
+            rtt_ms = int((time.time() - self.outgoing_sent_at) * 1000)
+            log("[PUNCH-RTT] tcp_punch signal_rtt={0}ms plugin_id={1}".format(
+                rtt_ms, self.plugin_id,
+            ))
+            self.outgoing_sent_at = None
+
         # None signals the exchange is complete; the background punch process
         # takes it from here.
         if outgoing_msg is None:
@@ -189,6 +201,7 @@ class PunchPlugin(Plugin):
 
         # --- Send our port predictions to the peer ---
         log("[PUNCH-RUN] sending outgoing PunchMsg plugin_id={0}".format(self.plugin_id))
+        self.outgoing_sent_at = time.time()
         await self.send_signal(outgoing_msg)
 
     async def setup_puncher_client(self, reply):

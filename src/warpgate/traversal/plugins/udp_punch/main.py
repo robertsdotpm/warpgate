@@ -128,6 +128,17 @@ class UdpPunchPlugin(Plugin):
             puncher, reply, puncher.punch_time
         )
 
+        # Instrumentation: log signal RTT when a reply with mappings
+        # just landed.  Mirrors tcp_punch/main.py's PUNCH-RTT line.
+        if (reply is not None
+                and getattr(self, "outgoing_sent_at", None) is not None):
+            import time as _time
+            rtt_ms = int((_time.time() - self.outgoing_sent_at) * 1000)
+            log("[PUNCH-RTT] udp_punch signal_rtt={0}ms plugin_id={1}".format(
+                rtt_ms, self.plugin_id,
+            ))
+            self.outgoing_sent_at = None
+
         # None signals the exchange is complete; the in-process engine
         # task takes over from here.
         if outgoing_msg is None:
@@ -148,6 +159,8 @@ class UdpPunchPlugin(Plugin):
                 m.to_json() for m in send_mappings
             ]
 
+        import time as _time
+        self.outgoing_sent_at = _time.time()
         await self.send_signal(outgoing_msg)
 
     async def setup_puncher_client(self, reply):

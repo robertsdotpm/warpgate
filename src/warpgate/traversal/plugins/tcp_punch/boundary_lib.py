@@ -132,7 +132,11 @@ FAST_PUNCH_PARAMS = {
     # appearing -- those turned out to be a NameError in the
     # re-entry guard (fstr not imported, fixed in edde6f3), not a
     # genuine bailout firing, so this profile is safe again.
-    "window": 4,
+    # Tightest profile: window=3 is the minimum given max_clock_error=1
+    # (constraint window > 2 * max_clock_error -> 3 > 2 ✓).  Worst-case
+    # rendezvous wait = window + max_clock_error = 4s, average wait
+    # ~2.5s (with min_run_window=1 below).
+    "window": 3,
     "max_clock_error": 1,
     # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
     # sized it for *manual CLI* usage where a human types ssh commands
@@ -165,8 +169,15 @@ FAST_PUNCH_PARAMS = {
     # MQTT broker churn + plugin coordination chatter. 3 s gives ~50%
     # headroom on both directions, still well below DEFAULT_PUNCH_PARAMS's
     # 5.0 s and well within plugin's 30/40 s timeout.
-    "connect_timeout": 3.0,  # 3.0 s spray window (5.0 caused regression)
-    "monitor_timeout": 3.0,  # 3.0 s monitor window
+    # Tightest profile: spray runs full window, monitor early-exits at
+    # 50ms grace on first ESTABLISHED so monitor_timeout is the
+    # fail-fast ceiling on a non-converging punch.  1.5s spray gives
+    # both peers a tight overlap window for simul-open SYN exchange;
+    # may flake on slow stacks (older Windows, BSD with high jitter)
+    # where convergence trails into the second half-second.  If sweep
+    # regressions appear, bump connect_timeout back to 3.0 first.
+    "connect_timeout": 1.5,  # 1.5 s spray window (tightened from 3.0)
+    "monitor_timeout": 1.5,  # 1.5 s fail-fast ceiling (was 3.0)
     "retry_interval": 0.05,  # 0.05 s selector poll interval (unchanged)
     # PunchClient / plugin timing -- max_sleep is filled in below from
     # derive_max_sleep(window, max_clock_error).
