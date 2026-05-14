@@ -180,7 +180,7 @@ async def setup_node():
             usage = await gate.node.nick_client.usage()
             if isinstance(usage, dict):
                 cout(fstr(
-                    "PNP quota = {0}/{1} names used (AF={2})",
+                    "Nickname quota = {0}/{1} names used for your IP (AF={2})",
                     (usage.get("names_used"), usage.get("name_limit"),
                      usage.get("af")),
                 ))
