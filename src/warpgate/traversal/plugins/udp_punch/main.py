@@ -77,6 +77,38 @@ class UdpPunchPlugin(Plugin):
 
     async def run(self, reply=None):
         """Coordinate the punch exchange and fire the in-process UDP engine."""
+        # Pre-bucket clock-truth sanity check (mirrors tcp_punch's
+        # equivalent at the top of its run()).  If the peer's reply
+        # carries a tx_unix timestamp and the observed skew is larger
+        # than what (clock_uncertainty + max_clock_error + signal
+        # latency budget) can bridge, the bucket math literally cannot
+        # converge -- bail immediately rather than waste ~5 s of
+        # rendezvous wait + spray on a doomed punch.  The bucket
+        # algorithm itself remains the sole authority for fire time
+        # (see DO NOT comment above tcp_punch.delayed_start_punching_proc).
+        if reply is not None:
+            peer_tx = getattr(reply.payload, "tx_unix", 0)
+            if peer_tx:
+                peer_unc = float(getattr(reply.payload, "clock_uncertainty", 0.0))
+                our_unc = float(getattr(self.sys_clock, "uncertainty", 0.0))
+                max_err = FAST_PUNCH_PARAMS.get("max_clock_error", 4)
+                our_now = int(self.sys_clock.time())
+                SIGNAL_LATENCY_BUDGET = 10
+                budget = our_unc + peer_unc + max_err + SIGNAL_LATENCY_BUDGET
+                skew = abs(our_now - peer_tx)
+                if skew > budget:
+                    log("[UDP-PUNCH-RUN] pre-bucket bailout: clock skew "
+                        "{0}s exceeds budget {1}s (our_unc={2:.2f} "
+                        "peer_unc={3:.2f} max_err={4} latency={5}); "
+                        "plugin_id={6}".format(
+                            skew, int(budget), our_unc, peer_unc,
+                            max_err, SIGNAL_LATENCY_BUDGET,
+                            self.plugin_id,
+                        ))
+                    if not self.result.done():
+                        self.result.set_result(None)
+                    return
+
         puncher = self.punch_clients.get(self.plugin_id)
         if puncher is None:
             puncher, stuns = await self.setup_puncher_client(reply)
@@ -274,6 +306,13 @@ class UdpPunchPlugin(Plugin):
 
     async def advance_punching_protocol(self, puncher, reply, punch_time):
         """Compute the next round of port predictions; return outgoing UdpPunchMsg or None when done."""
+        # Clock-truth witness fields: peer reads these to run the
+        # pre-bucket bailout in its own run() (see top of run()).
+        # Both fields cost nothing to send and the bailout saves
+        # ~5 s of doomed rendezvous on bad clock pairs.
+        tx_unix = int(self.sys_clock.time())
+        clock_uncertainty = float(getattr(self.sys_clock, "uncertainty", 0.0))
+
         # For LAN, STUN is useless (returns each side's own port).
         # boundary_port_alloc in delayed_run_engine handles port
         # alignment between peers via NTP-aligned bucket. Send one
@@ -290,6 +329,8 @@ class UdpPunchPlugin(Plugin):
                     "mappings": [],
                     "ntp": punch_time,
                     "nonce": puncher.udp_nonce.hex(),
+                    "tx_unix": tx_unix,
+                    "clock_uncertainty": clock_uncertainty,
                 },
             })
             msg.meta.plugin_name = "udp_punch"
@@ -325,6 +366,8 @@ class UdpPunchPlugin(Plugin):
                 "mappings": mappings,
                 "ntp": punch_time,
                 "nonce": puncher.udp_nonce.hex(),
+                "tx_unix": tx_unix,
+                "clock_uncertainty": clock_uncertainty,
             },
         })
         msg.meta.plugin_name = "udp_punch"
