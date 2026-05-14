@@ -40,7 +40,12 @@ from aionetiface import (
 )
 from aionetiface.nic.nat.nat_defs import SYMMETRIC_NAT
 from .node_connect import resolve_pnp_addr
-from .node_protocol import WG_LIVENESS_PING_PREFIX, WG_LIVENESS_PONG_PREFIX
+from .node_protocol import (
+    WG_LIVENESS_PING_PREFIX,
+    WG_LIVENESS_PONG_PREFIX,
+    register_liveness_pong_future,
+    unregister_liveness_pong_future,
+)
 from .node_utils import enrich_addr_map_with_loopback
 from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
@@ -56,6 +61,16 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     carry bytes" failure mode -- NAT closed the mapping, OS RST'd the
     socket, multi-NIC route asymmetry, etc.
 
+    PONG delivery uses a per-nonce future registered on the pipe
+    (register_liveness_pong_future).  node_protocol peels incoming
+    PONG bytes off and resolves the matching future, so PONG content
+    never enters the pipe's SUB_ALL subscription queue and can't
+    pollute the application's first recv() call.  This replaces an
+    earlier design where verify drained SUB_ALL until it found the
+    matching PONG -- duplicate PONGs from listener-side multi-broker
+    fan-out remained queued and surfaced as echo_msg=b'WG-LIVENESS-...'
+    in the application echo (observed on macOS and Win10).
+
     ``transport=TCP`` runs one PING with a ``per_try_timeout`` budget
     (TCP retransmits handle datagram loss for us).  ``transport=UDP``
     loops up to ``retries`` times, re-sending the PING with a fresh
@@ -69,47 +84,38 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     the cascade on False.
     """
     nonce = os.urandom(8).hex().encode("ascii")
-    expected = WG_LIVENESS_PONG_PREFIX + nonce
     ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
 
-    # Subscribe BEFORE sending so the PONG can't race into a queue
-    # that doesn't exist yet.  Idempotent re-subscribe is fine; the
-    # caller may also subscribe later without conflict.
-    try:
-        pipe.subscribe(SUB_ALL)
-    except (AttributeError, TypeError):
-        # Some pipe shapes (raw selector_proxy wraps) may not expose
-        # subscribe; treat as best-effort and continue.
-        pass
+    loop = asyncio.get_event_loop()
+    pong_fut = loop.create_future()
+    register_liveness_pong_future(pipe, nonce, pong_fut)
 
     attempts = retries if transport == UDP else 1
-    for attempt in range(attempts):
-        try:
-            await pipe.send(ping)
-        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-            log(fstr(
-                "verify_pipe_alive: send failed attempt={0}/{1}: {2}: {3}",
-                (attempt + 1, attempts, type(exc).__name__, str(exc) or "(no message)"),
-            ))
-            return False
-
-        deadline = time.monotonic() + per_try_timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+    try:
+        for attempt in range(attempts):
             try:
-                msg = await pipe.recv(SUB_ALL, timeout=remaining)
-            except (asyncio.TimeoutError, OSError):
-                msg = None
-            if msg is None:
-                break
-            if expected in msg:
+                await pipe.send(ping)
+            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
+                log(fstr(
+                    "verify_pipe_alive: send failed attempt={0}/{1}: {2}: {3}",
+                    (attempt + 1, attempts, type(exc).__name__,
+                     str(exc) or "(no message)"),
+                ))
+                return False
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pong_fut), per_try_timeout,
+                )
                 return True
-            # Some other bytes arrived (probe traffic, late punch
-            # straggler, application data the peer eagerly sent).
-            # Discard and keep waiting within this attempt's deadline.
-    return False
+            except asyncio.TimeoutError:
+                if pong_fut.done():
+                    return True
+                # Loop to next attempt (UDP) or fall through (TCP).
+                continue
+        return False
+    finally:
+        unregister_liveness_pong_future(pipe, nonce)
 
 
 def plugins_for_phase(phase):

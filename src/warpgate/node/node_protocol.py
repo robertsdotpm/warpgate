@@ -18,19 +18,43 @@ from ..traversal.plugins.direct_connect.con_id_frame import CON_ID_PREFIX
 # Liveness handshake used by auto_connect's winner-verification step.
 # Once a plugin reports a successful pipe to the cascade, auto_connect
 # fires WG-LIVENESS-PING:<nonce>\n at the pipe and expects
-# WG-LIVENESS-PONG:<nonce>\n back inside a short timeout (~500ms TCP,
-# slightly longer with retries for UDP).  If the PONG doesn't land the
-# pipe gets closed and the cascade falls through to the next phase,
-# catching the "engine declared ESTABLISHED but the connection is
-# actually broken" failure mode (NAT closed the mapping, RST,
-# multi-NIC route asymmetry, etc).
+# WG-LIVENESS-PONG:<nonce>\n back inside a short timeout.  If the PONG
+# doesn't land the pipe gets closed and the cascade falls through to
+# the next phase, catching the "engine declared ESTABLISHED but the
+# connection is actually broken" failure mode (NAT closed the mapping,
+# RST, multi-NIC route asymmetry, etc).
 #
-# node_protocol intercepts incoming PINGs here so the listener side
-# auto-responds without bothering user msg_cbs.  PONG bytes are NOT
-# peeled -- they flow through to subscribed queues so the initiator's
-# verify_pipe_alive can read them.
+# Both PING and PONG are peeled at this layer so neither reaches user
+# msg_cbs.  Listener side: receives PING, auto-responds with PONG.
+# Initiator side: receives PONG, resolves the per-nonce future that
+# verify_pipe_alive is awaiting.  The previous design left PONG bytes
+# in the SUB_ALL subscription queue for verify to read; duplicate
+# PONGs from listener-side multi-broker delivery then polluted the
+# application's first recv() (seen as echo_msg=b'WG-LIVENESS-PONG:...'
+# in failing macOS / Win10 runs).  Future-based delivery sidesteps the
+# queue entirely.
 WG_LIVENESS_PING_PREFIX = b"WG-LIVENESS-PING:"
 WG_LIVENESS_PONG_PREFIX = b"WG-LIVENESS-PONG:"
+
+
+def register_liveness_pong_future(pipe, nonce, fut):
+    """Register a future to be resolved when WG-LIVENESS-PONG with the
+    given nonce arrives on this pipe.  verify_pipe_alive calls this
+    before sending its PING; node_protocol below resolves the future
+    when the matching PONG lands.  Each pipe holds its own dict so
+    concurrent verifies on different pipes don't cross-talk.
+    """
+    if not hasattr(pipe, "liveness_pong_futures"):
+        pipe.liveness_pong_futures = {}
+    pipe.liveness_pong_futures[nonce] = fut
+
+
+def unregister_liveness_pong_future(pipe, nonce):
+    """Clean up the per-nonce future registration after verify completes
+    (whether by match or by timeout)."""
+    futures = getattr(pipe, "liveness_pong_futures", None)
+    if futures is not None:
+        futures.pop(nonce, None)
 from ..traversal.plugins.random_probe.random_probe_defs import (
     PROBE_LEN,
     PROBE_MAGIC,
@@ -112,6 +136,29 @@ async def node_protocol(node, msg, client_tup, pipe):
         pipe.con_id_seen = True
         if node.traversal is not None:
             node.traversal.resolve_inbound_by_plugin_id(plugin_id, pipe)
+        if not msg:
+            return
+
+    # Liveness PONG peel (initiator side).  When auto_connect's
+    # verify_pipe_alive sent a PING, it registered a per-nonce future
+    # on this pipe via register_liveness_pong_future.  Resolve the
+    # matching future and discard the bytes -- they must never reach
+    # user msg_cbs or the SUB_ALL subscription queue, otherwise stale
+    # PONG copies (from listener-side multi-broker fan-out) pollute
+    # the application's first recv() call.
+    if msg.startswith(WG_LIVENESS_PONG_PREFIX):
+        nl = msg.find(b"\n", len(WG_LIVENESS_PONG_PREFIX))
+        if nl == -1:
+            nonce = msg[len(WG_LIVENESS_PONG_PREFIX):]
+            msg = b""
+        else:
+            nonce = msg[len(WG_LIVENESS_PONG_PREFIX):nl]
+            msg = msg[nl + 1:]
+        futures = getattr(pipe, "liveness_pong_futures", None)
+        if futures is not None:
+            fut = futures.get(nonce)
+            if fut is not None and not fut.done():
+                fut.set_result(True)
         if not msg:
             return
 
