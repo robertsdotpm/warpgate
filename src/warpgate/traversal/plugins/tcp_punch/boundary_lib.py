@@ -33,6 +33,22 @@ MIN_RUN_WINDOW = 10  # Minimum time required to run setup before the rendezvous
 # bounded well below 16 at any single moment.
 NUM_PORTS = 16
 BASE_PORT = 2024
+
+# Plugin path NTP-pin offset: when tcp_punch runs as a traversal plugin
+# (auto_connect cascade), the connector picks an absolute punch moment
+# `now + PLUGIN_PIN_OFFSET` and ships it inside the outgoing PunchMsg.
+# The listener reads the value back out of `payload.ntp` and uses it
+# verbatim, so both peers fire on the same wall-clock instant without
+# any bucket math. The floor is bounded by signal RTT through MQTT
+# (~300-600 ms on healthy paths) plus listener setup (socket binds +
+# NAT predict, ~200 ms). 1.0 s leaves slack; reduce toward ~0.5 s
+# once measured variance allows.
+#
+# This constant has NO effect on the CLI standalone path
+# (`punch_client.py` __main__): that path keeps the compute_rendezvous
+# bucket math because there's no PunchMsg exchange to communicate a
+# pinned time -- both sides must derive it independently from NTP.
+PLUGIN_PIN_OFFSET = 1.0
 # Wider sample space than the original 20000 -- combined with the lower
 # BASE_PORT this gives the allocator the full user-port range (~2k-52k),
 # which makes collisions across back-to-back runs in the same NTP bucket

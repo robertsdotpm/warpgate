@@ -50,13 +50,12 @@ import time
 from aionetiface import log, fstr, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
 from ....protocol.proto_defs import P2P_PUNCH
 from .proto import PunchMsg
-from .boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
+from .boundary_lib import FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, compute_rendezvous  # noqa: F401
 from .punch_client import PunchClient
 from .boundary_alloc import boundary_port_alloc
 from .nat_predict_alloc import NATPredictAlloc
 from .punch_defs import TCP_PUNCH_LAN
 from .punch_process import start_punching_process
-from .tcp_punch_utils import log_time_wait_residue
 from .nat_predict import NATMapping
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
@@ -298,26 +297,22 @@ class PunchPlugin(Plugin):
         timestamp = self.sys_clock.time()
         puncher.set_timestamp(timestamp)
 
-        # Calculate the primary + secondary punch times for two-bucket
-        # overlap dual-fire.  See PunchClient.run_engine for the strategy:
-        # when the connector and listener call compute_rendezvous on
-        # opposite sides of a bucket boundary they pick adjacent buckets,
-        # but their {primary, primary+1} candidate sets always overlap on
-        # one common bucket -- so firing at both rendezvous in sequence
-        # guarantees the peer-pair lands on a synchronised fire moment.
-        # The secondary is exactly one WINDOW past the primary; both peers
-        # compute the same window arithmetic so they agree on the second
-        # rendezvous as well.
-        p = puncher.params
-        _, punch_time = compute_rendezvous(
-            timestamp,
-            window=p["window"],
-            min_run_window=p["min_run_window"],
-            max_error=p["max_clock_error"],
-        )
-        secondary_punch_time = punch_time + p["window"]
+        # NTP-pinned future start.  The connector picks an absolute
+        # punch moment (now + PLUGIN_PIN_OFFSET) and the listener reads
+        # the value back out of the inbound PunchMsg's payload.ntp
+        # field.  No bucket math, no compute_rendezvous, no two-bucket
+        # secondary -- both sides agree on one wall-clock instant via
+        # the signal exchange itself.  The CLI standalone path in
+        # punch_client.py __main__ keeps compute_rendezvous because it
+        # has no PunchMsg channel to communicate the pin.
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.
+            punch_time = timestamp + PLUGIN_PIN_OFFSET
 
-        puncher.set_punch_time(punch_time, secondary_punch_time=secondary_punch_time)
+        puncher.set_punch_time(punch_time)
 
         # Deterministic predictions based on boundary math.
         # PunchClient.add_port_allocator forwards self.params to the allocator
@@ -519,14 +514,6 @@ class PunchPlugin(Plugin):
             # will be revisited in a dedicated session.
             log("[PUNCH-DELAY] finally plugin_id={0}".format(self.plugin_id))
             self.completed_pipe_ids.add(self.plugin_id)
-            # Post-mortem: are any of our boundary 4-tuples still in
-            # TIME_WAIT? With SO_LINGER {1,0} on punch sockets the
-            # answer should always be 0. Any non-zero count points at
-            # a code path that closed without the linger sockopt.
-            try:
-                await log_time_wait_residue(getattr(puncher, "src_ip", None))
-            except Exception:
-                pass
 
     async def close(self):
         """Cancel any in-flight punch task and remove this plugin's shared state.
