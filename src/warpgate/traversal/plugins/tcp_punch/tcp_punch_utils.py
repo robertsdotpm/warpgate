@@ -275,6 +275,23 @@ def connect_on_tcp_sockets(
     iterates flat-out since the loopback path has no RTT slack.
 
     spray_duration: how long to keep spraying (seconds).
+
+    DO NOT add an early-exit on "first ESTABLISHED" here.  We tried
+    it (reverted in commit 0c4c2c7) and it raced the TCP simul-open
+    four-way handshake: the local socket transitions to ESTABLISHED
+    after our kernel sees the peer's SYN-ACK, but the peer may not
+    have observed *our* SYN-ACK yet, so the connection is only half-
+    confirmed.  Returning early at that point hands choose_winning a
+    socket whose peer-side state is still SYN_RECEIVED, which then
+    times out / RSTs as soon as we try to use it -- the cascade sees
+    `pipe=True` and the first real send fails.  Letting the spray
+    run the full window keeps re-firing connect_ex so both kernels
+    finish the handshake before socket_event_monitor confirms.  The
+    socket_event_monitor pass downstream has its own short
+    grace-after-first-success window (50ms, see its docstring) which
+    is the only safe spot for an early exit, because by then we've
+    already drained the selector events that confirm the handshake
+    completed bidirectionally.
     """
     start = time.monotonic()
     end = start + spray_duration
