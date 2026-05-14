@@ -298,7 +298,13 @@ class Nickname:
                         (offset, af, str(exc)),
                     ))
                     rejections.append((offset, af, str(exc)))
-                    return None
+                    # Fall through to the next AF.  v6 has its own
+                    # per-IP quota row on the server (V6_NAME_LIMIT)
+                    # entirely separate from v4's, so a v4 quota
+                    # rejection doesn't preclude a v6 put succeeding.
+                    # Previously we returned None here and v6's quota
+                    # went forever unused.
+                    continue
                 except (OSError, ConnectionError, asyncio.TimeoutError):
                     log_exception()
                     log(fstr(
@@ -499,6 +505,33 @@ class Nickname:
                 (attempt, retry_interval),
             ))
             await asyncio.sleep(retry_interval)
+
+    async def usage(self, timeout=NAMING_TIMEOUT):
+        """Return current per-IP quota usage from the first reachable
+        PNP server, as a dict::
+
+            {"af": int, "names_used": int, "name_limit": int}
+
+        Tries v4 first, falls back to v6.  Returns None if no client
+        responds within ``timeout``.
+        """
+        if not self.started:
+            raise AssertionError("Nickname client not started. Call start() first.")
+        for af in VALID_AFS:
+            for offset in sorted(self.clients[af].keys()):
+                client = self.clients[af][offset]
+                if client is None:
+                    continue
+                try:
+                    info = await asyncio.wait_for(
+                        client.usage(client.kp), timeout,
+                    )
+                    if info is not None:
+                        return info
+                except (OSError, ConnectionError, asyncio.TimeoutError):
+                    log_exception()
+                    continue
+        return None
 
     async def delete(self, name, timeout=NAMING_TIMEOUT):
         """Delete the record for name from all reachable PNP servers concurrently."""

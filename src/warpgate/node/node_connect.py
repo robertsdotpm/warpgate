@@ -6,6 +6,7 @@ from aionetiface import (
     IP4, IP6, NIC_BIND, EXT_BIND, LOOPBACK_BIND,
 )
 from .node_utils import enrich_addr_map_with_loopback
+from .nickname import pnp_unwrap_ts
 from ..traversal.traversal_address import get_updated_addr_from_mqtt, pnp_name_has_tld
 
 
@@ -31,14 +32,41 @@ async def resolve_pnp_addr(node, pnp_addr):
 
     source is "mqtt" if the address was refreshed via the MQTT router,
     or "nickname" if only the namebump record was available.
-    Returns (pnp_addr, None, None) unchanged if pnp_addr is not a TLD name."""
-    if not pnp_name_has_tld(pnp_addr):
+    Returns (pnp_addr, None, None) unchanged when pnp_addr is raw
+    serialised addr_bytes (no nickname lookup needed).
+
+    A plain string nickname without an explicit PNP TLD suffix gets
+    the default TLD auto-appended -- mirrors peer.find()'s behaviour
+    so callers can pass either "alice" or "alice.p2p" interchangeably.
+    """
+    # Raw addr_bytes from make_node_addr always start with '[' (the
+    # opening bracket of the first NIC slot's serialised tuple).
+    # Anything else is treated as a string nickname.
+    looks_like_addr_bytes = (
+        isinstance(pnp_addr, (bytes, bytearray))
+        and len(pnp_addr) >= 1
+        and bytes(pnp_addr[:1]) == b"["
+    ) or (
+        isinstance(pnp_addr, str)
+        and pnp_addr.startswith("[")
+    )
+    if looks_like_addr_bytes:
         return pnp_addr, None, None
+
+    if not pnp_name_has_tld(pnp_addr):
+        # Auto-append the active PNP TLD, same logic peer.find() uses.
+        from aionetiface import IP4, PNP_SERVERS
+        from .nickname import pnp_get_tld
+        tld = pnp_get_tld(list(range(len(PNP_SERVERS[IP4]))))
+        pnp_addr = pnp_addr + tld
 
     pkt = await node.nick_client.get(pnp_addr)
     if pkt is None or pkt.value is None:
         raise LookupError(fstr("Nickname '{0}' not found", (pnp_addr,)))
-    addr_bytes = pkt.value
+    # Strip the PNP1<ts>... staleness envelope that pnp_wrap_with_ts
+    # adds at put time.  Records written before that envelope existed
+    # are returned untouched (pnp_unwrap_ts is backwards-compatible).
+    _, addr_bytes = pnp_unwrap_ts(pkt.value)
     dest_vk = pkt.vkc
     pkt_age = time.time() - getattr(pkt, "pnp_ts", time.time())
     if pkt_age > 300:
@@ -120,6 +148,20 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
     """
     addr_bytes, dest_vk, _ = await resolve_pnp_addr(node, pnp_addr)
     dest_map = parse_node_addr(addr_bytes)
+    if dest_map is None:
+        # The PNP record exists but its value isn't a valid serialised
+        # node address.  This happens when the name has been
+        # registered as a placeholder / reservation (e.g. our squat
+        # names hold the string "reserved by ...") or by any peer
+        # that put() arbitrary bytes against it.  Surface a clear
+        # error instead of crashing inside enrich_addr_map_with_loopback
+        # with AttributeError on a None map.
+        raise ValueError(
+            "PNP record for {0!r} is not a valid node address "
+            "(value did not parse). The name may be reserved as a "
+            "placeholder by another party; pick a different "
+            "destination or contact the owner.".format(pnp_addr)
+        )
     enrich_addr_map_with_loopback(dest_map)
     # Pass dest's advertised broker hints so SmartPipe prefers them
     # over rendezvous discovery -- the dest GUARANTEED subscribed

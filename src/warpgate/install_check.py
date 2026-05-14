@@ -111,10 +111,18 @@ def verify_sibling_installs(strict=False):
     (e.g. the demo's stdout) without needing the aionetiface log
     plumbing.  That's the whole point of the check -- when an install
     is broken, the regular log might not even initialise.
+
+    On a healthy non-strict run (every sibling imports fine, no
+    errors detected) we stay silent -- the prints are only useful
+    when there's a problem to diagnose, and were spamming the demo's
+    happy-path output every startup.
     """
     info = collect_install_info()
-    for line in format_install_info(info):
-        print(line)
+
+    has_problem = any("error" in e for e in info.values())
+    if strict or has_problem:
+        for line in format_install_info(info):
+            print(line)
 
     if not strict:
         return info

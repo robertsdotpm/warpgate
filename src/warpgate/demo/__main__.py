@@ -19,20 +19,58 @@ import asyncio
 import time
 import signal
 import os
+import json as stdlib_json
+import os as stdlib_os
+import time as stdlib_time
 from aionetiface import (
     StartNodeNicknameFailed, TunnelFailed,
     allow_windows_firewall,
     async_run, async_wrap_errors, fstr,
+    get_aionetiface_install_root,
     log, log_exception,
     sock_has_data, sys, to_b, to_s,
 )
+
+
+def report_servers_json_age():
+    """Print how many days old the on-disk servers.json is, or note
+    that the file is missing.  Read directly from disk so the value
+    reflects what update_server_list last wrote, not whatever the
+    in-memory INFRA constant happens to say."""
+    try:
+        path = stdlib_os.path.join(
+            get_aionetiface_install_root(), "servers.json",
+        )
+        if not stdlib_os.path.exists(path):
+            cout("servers.json not on disk yet (will be created at next "
+                 "refresh)")
+            return
+        with open(path, "r", encoding="utf-8") as fp:
+            ts = stdlib_json.load(fp).get("timestamp", 0)
+        if not ts:
+            cout("servers.json present but has no timestamp field")
+            return
+        age_days = (stdlib_time.time() - ts) / 86400.0
+        cout(fstr("servers.json age = {0} days (last server-side change)",
+                  ("%.1f" % age_days,)))
+    except (OSError, ValueError):
+        # Stale / corrupted / unreadable -- non-fatal diag print.
+        cout("servers.json age = unreadable")
 from ..node.nickname import (
     FullNameFailure, PnpServerResourceLimit, PnpServerUnreachable,
 )
-from ..gate import Gate
+from ..gate import Gate, derive_default_pnp_digest
+from ..node.node_start import register_and_persist
 from . import stop_rw
 from .defs import MENU_BANNER, PROGRAM_BANNER, demo_node_conf
 from .cmd_arg_defs import args
+# Side-effect import: cmd_arg_proc reads args (see above) and mutates
+# demo_node_conf accordingly -- it's the bridge between argparse output
+# and the conf dict the Gate / Node actually reads.  Without this
+# import the file's top-level statements never execute, which silently
+# breaks --disable_upnp, --pnp, --mqtt, --install_path, and the
+# get_nickname subcommand's conf overrides.
+from . import cmd_arg_proc  # noqa: F401
 from .utils import (
     add_echo_support, ainput_interrupt_w, cout,
     display_ifs_loaded,
@@ -93,18 +131,78 @@ async def setup_node():
     cout()
     cout(fstr("Node started = {0}", (to_s(node.addr_bytes),)))
     cout(fstr("Node port = {0}", (node.listen_port,)))
+    report_servers_json_age()
 
-    nick = gate.full_name
+    # If the default noun_noun_NNN name was already taken by another
+    # peer (FullNameFailure on registration) and the caller didn't
+    # pass --id, fall back to the unambiguous hex form so the demo
+    # at least *works* instead of running nameless.  Quota / network
+    # errors aren't retried here -- the hex form would hit the same
+    # wall.
+    if (gate.full_name is None
+            and args.node_id is None
+            and isinstance(gate.nickname_error, FullNameFailure)
+            and not isinstance(
+                gate.nickname_error,
+                (PnpServerResourceLimit, PnpServerUnreachable),
+            )):
+        nic_macs = [getattr(nic, "mac", None) for nic in gate.node.ifs]
+        hex_name = derive_default_pnp_digest(
+            nic_macs, gate.node.listen_port,
+            listen_ips=gate.node.listen_ips,
+        )
+        cout(fstr(
+            "Default nickname '{0}' rejected (likely taken by another "
+            "peer); falling back to hex form '{1}'.",
+            (gate.node.pnp_name, hex_name),
+        ))
+        gate.node.pnp_name = hex_name
+        try:
+            await register_and_persist(gate.node, hex_name)
+        except FullNameFailure:
+            pass
+
+    # Display the bare PNP name without the .p2p TLD -- the TLD is
+    # an internal routing detail (peer.find / gate.connect append it
+    # transparently when needed), and showing it confuses readers
+    # into thinking they have to type it.
+    nick = getattr(gate.node, "pnp_name", None) or gate.full_name
     if nick is not None:
+        if nick.endswith(".p2p"):
+            nick = nick[:-4]
         cout(fstr("Node nickname = {0}", (nick,)))
+
+        # Ask the PNP server how much of our per-IP quota we're
+        # currently using.  Best-effort -- skipped silently if the
+        # server doesn't speak OP_USAGE (older deployments) or the
+        # round-trip fails.
+        try:
+            usage = await gate.node.nick_client.usage()
+            if isinstance(usage, dict):
+                cout(fstr(
+                    "PNP quota = {0}/{1} names used (AF={2})",
+                    (usage.get("names_used"), usage.get("name_limit"),
+                     usage.get("af")),
+                ))
+        except Exception:  # pylint: disable=broad-except
+            pass
         cout()
     else:
         err = gate.nickname_error
         if isinstance(err, PnpServerResourceLimit):
             cout("PNP nickname registration rejected: ResourceLimit.")
             cout("The PNP server's per-source-IP name quota is exhausted.")
-            cout("Old names will expire over time; bump the server-side")
-            cout("V4_NAME_LIMIT / V6_NAME_LIMIT or wait for pruning.")
+            # Offer the interactive keystore-cleanup flow so the user
+            # can free quota slots without having to wait for the
+            # 30-day server-side expiry to kick in.
+            try:
+                from .keystore_cleanup import prompt_keystore_cleanup
+                await prompt_keystore_cleanup(
+                    gate.node.ifs[0] if gate.node.ifs else None,
+                    gate.node.sys_clock if hasattr(gate.node, "sys_clock") else None,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                cout("keystore cleanup helper failed: " + repr(exc))
         elif isinstance(err, PnpServerUnreachable):
             cout("PNP servers unreachable -- registration could not be verified.")
             cout("Strict registration requires every configured server to respond.")
