@@ -13,6 +13,24 @@ import asyncio
 import time
 from aionetiface import log, to_s
 from ..traversal.plugins.direct_connect.con_id_frame import CON_ID_PREFIX
+
+
+# Liveness handshake used by auto_connect's winner-verification step.
+# Once a plugin reports a successful pipe to the cascade, auto_connect
+# fires WG-LIVENESS-PING:<nonce>\n at the pipe and expects
+# WG-LIVENESS-PONG:<nonce>\n back inside a short timeout (~500ms TCP,
+# slightly longer with retries for UDP).  If the PONG doesn't land the
+# pipe gets closed and the cascade falls through to the next phase,
+# catching the "engine declared ESTABLISHED but the connection is
+# actually broken" failure mode (NAT closed the mapping, RST,
+# multi-NIC route asymmetry, etc).
+#
+# node_protocol intercepts incoming PINGs here so the listener side
+# auto-responds without bothering user msg_cbs.  PONG bytes are NOT
+# peeled -- they flow through to subscribed queues so the initiator's
+# verify_pipe_alive can read them.
+WG_LIVENESS_PING_PREFIX = b"WG-LIVENESS-PING:"
+WG_LIVENESS_PONG_PREFIX = b"WG-LIVENESS-PONG:"
 from ..traversal.plugins.random_probe.random_probe_defs import (
     PROBE_LEN,
     PROBE_MAGIC,
@@ -94,6 +112,30 @@ async def node_protocol(node, msg, client_tup, pipe):
         pipe.con_id_seen = True
         if node.traversal is not None:
             node.traversal.resolve_inbound_by_plugin_id(plugin_id, pipe)
+        if not msg:
+            return
+
+    # Liveness PING peel.  Auto-responds with PONG carrying the same
+    # nonce and DOES NOT propagate the PING bytes to user msg_cbs.
+    # The PONG bytes are not intercepted on either side -- they need
+    # to reach the initiator's subscribed pipe.recv queue so the
+    # auto_connect verify_pipe_alive helper can detect them.
+    if msg.startswith(WG_LIVENESS_PING_PREFIX):
+        nl = msg.find(b"\n", len(WG_LIVENESS_PING_PREFIX))
+        if nl == -1:
+            nonce = msg[len(WG_LIVENESS_PING_PREFIX):]
+            msg = b""
+        else:
+            nonce = msg[len(WG_LIVENESS_PING_PREFIX):nl]
+            msg = msg[nl + 1:]
+        try:
+            await pipe.send(
+                WG_LIVENESS_PONG_PREFIX + nonce + b"\n", client_tup,
+            )
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            # Best-effort: if the pipe died between PING arrival and
+            # PONG send, the initiator's verify will time out anyway.
+            pass
         if not msg:
             return
 

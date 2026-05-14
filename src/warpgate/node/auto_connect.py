@@ -32,16 +32,84 @@ when none of its plugins are in the configured set.
 """
 import asyncio
 import ipaddress
+import os
 import time
 from aionetiface import (
-    IP4, IP6, IPRange, NIC_BIND, EXT_BIND, LOOPBACK_BIND, TCP, UDP,
+    IP4, IP6, IPRange, NIC_BIND, EXT_BIND, LOOPBACK_BIND, SUB_ALL, TCP, UDP,
     af_bitlen, fstr, log, log_exception, parse_node_addr,
 )
 from aionetiface.nic.nat.nat_defs import SYMMETRIC_NAT
 from .node_connect import resolve_pnp_addr
+from .node_protocol import WG_LIVENESS_PING_PREFIX, WG_LIVENESS_PONG_PREFIX
 from .node_utils import enrich_addr_map_with_loopback
 from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
+
+
+async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3):
+    """Round-trip a WG-LIVENESS-PING over *pipe* and return True iff the
+    matching PONG comes back within the budget.
+
+    Auto_connect calls this after a phase function returns a non-None
+    pipe and before committing the pipe as the cascade winner.  Catches
+    the "engine declared ESTABLISHED but the pipe doesn't actually
+    carry bytes" failure mode -- NAT closed the mapping, OS RST'd the
+    socket, multi-NIC route asymmetry, etc.
+
+    ``transport=TCP`` runs one PING with a ``per_try_timeout`` budget
+    (TCP retransmits handle datagram loss for us).  ``transport=UDP``
+    loops up to ``retries`` times, re-sending the PING with a fresh
+    timeout each iteration -- a UDP datagram lost in either direction
+    would otherwise false-negative this entire check on the first
+    attempt.  Per-try budget stays small (default 500ms) so even the
+    full retries=3 worst case only costs ~1.5s on a dead pipe.
+
+    Returns True on the first matching PONG, False on timeout or send
+    error.  The caller should ``close_plugin`` the pipe and continue
+    the cascade on False.
+    """
+    nonce = os.urandom(8).hex().encode("ascii")
+    expected = WG_LIVENESS_PONG_PREFIX + nonce
+    ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
+
+    # Subscribe BEFORE sending so the PONG can't race into a queue
+    # that doesn't exist yet.  Idempotent re-subscribe is fine; the
+    # caller may also subscribe later without conflict.
+    try:
+        pipe.subscribe(SUB_ALL)
+    except (AttributeError, TypeError):
+        # Some pipe shapes (raw selector_proxy wraps) may not expose
+        # subscribe; treat as best-effort and continue.
+        pass
+
+    attempts = retries if transport == UDP else 1
+    for attempt in range(attempts):
+        try:
+            await pipe.send(ping)
+        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
+            log(fstr(
+                "verify_pipe_alive: send failed attempt={0}/{1}: {2}: {3}",
+                (attempt + 1, attempts, type(exc).__name__, str(exc) or "(no message)"),
+            ))
+            return False
+
+        deadline = time.monotonic() + per_try_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                msg = await pipe.recv(SUB_ALL, timeout=remaining)
+            except (asyncio.TimeoutError, OSError):
+                msg = None
+            if msg is None:
+                break
+            if expected in msg:
+                return True
+            # Some other bytes arrived (probe traffic, late punch
+            # straggler, application data the peer eagerly sent).
+            # Discard and keep waiting within this attempt's deadline.
+    return False
 
 
 def plugins_for_phase(phase):
@@ -1022,8 +1090,28 @@ async def auto_connect(
                 except Exception:
                     pass
             if pipe is not None and winner_pipe is None:
-                winner_pipe = pipe
-                winner_plugin = plugin
+                # Liveness verify: punch engines occasionally declare
+                # ESTABLISHED for a pipe that the kernel then tears
+                # down before app bytes can flow (multi-NIC routing
+                # asymmetry, NAT mapping closing on the spray's
+                # trailing SYNs, XP-style 174ms post-handshake RST,
+                # etc).  Round-trip a PING and fall through to the
+                # next phase if no PONG comes back.
+                transport = getattr(plugin, "transport", TCP)
+                alive = await verify_pipe_alive(pipe, transport=transport)
+                if not alive:
+                    log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
+                        phase_fn.__name__,
+                    ))
+                    try:
+                        await close_plugin(
+                            plugin, node.traversal.plugins, node.traversal.inbound_pipes,
+                        )
+                    except (OSError, asyncio.TimeoutError):
+                        log_exception()
+                else:
+                    winner_pipe = pipe
+                    winner_plugin = plugin
             elif pipe is not None:
                 try:
                     await close_plugin(
@@ -1059,8 +1147,26 @@ async def auto_connect(
             node, src_map, dest_map, sig_pipe, plugin_set,
         )
         if pipe is not None:
-            winner_pipe = pipe
-            winner_plugin = plugin
-            break
+            # Same liveness check as the test_all_phases path above:
+            # only accept the pipe as the cascade winner if a PING
+            # actually round-trips through it.  Catches the "engine
+            # reported ESTABLISHED but the OS / NAT then RST'd the
+            # connection" failure mode.  On failure, close the
+            # plugin and let the next phase have a shot.
+            transport = getattr(plugin, "transport", TCP)
+            alive = await verify_pipe_alive(pipe, transport=transport)
+            if alive:
+                winner_pipe = pipe
+                winner_plugin = plugin
+                break
+            log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
+                phase_fn.__name__,
+            ))
+            try:
+                await close_plugin(
+                    plugin, node.traversal.plugins, node.traversal.inbound_pipes,
+                )
+            except (OSError, asyncio.TimeoutError):
+                log_exception()
 
     return winner_pipe, winner_plugin
