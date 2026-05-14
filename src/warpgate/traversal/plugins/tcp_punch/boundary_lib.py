@@ -39,8 +39,28 @@ BASE_PORT = 2024
 PORT_RANGE = 50000
 CONNECT_TIMEOUT = 5.0
 RETRY_INTERVAL = 0.05
-MAX_SLEEP = 10
+# Slack added on top of worst-case rendezvous wait (window +
+# max_clock_error) to produce the max_sleep cap.  max_sleep is the
+# upper bound on sleep_until()'s blocking wait -- it must sit above
+# the worst-case legitimate rendezvous wait, otherwise sleep_until
+# returns early and the punch fires before the peer is ready (see
+# punch_client.py for the "may fire before peer is ready" warning).
+# The 2 s slack covers OS scheduler jitter on top of the worst case.
+MAX_SLEEP_SLACK = 2
 LARGE_PRIME = 2654435761
+
+
+def derive_max_sleep(window, max_clock_error, slack=MAX_SLEEP_SLACK):
+    """Return the max_sleep cap derived from a profile's bucket params.
+
+    Keeping max_sleep tied to (window, max_clock_error) instead of a
+    free parameter prevents the silent class of bug where a profile
+    shrinks its bucket size without updating max_sleep -- the result
+    is a cap below the worst-case rendezvous wait, sleep_until fires
+    early, and punches misfire with the only visible signal being the
+    cap-fired log line.
+    """
+    return window + max_clock_error + slack
 
 # Ports that SIP-ALG and RTP helper modules on SOHO routers (Asus,
 # Linksys, MikroTik) may silently inspect, mangle, or redirect.
@@ -60,10 +80,12 @@ SIP_ALG_BLACKLIST = frozenset(
 #
 # FAST_PUNCH_PARAMS: Tight values for network-protocol usage where punch_time
 #   is communicated between peers so both sides use the exact same value.
-#   Constraint: window > 2 * max_clock_error  →  6 > 2*2 = 4  ✓
-#   - Rendezvous wait: 2–8 seconds.
-#   - max_sleep (8 s) is deliberately above the 8 s worst-case remaining wait
-#     so sleep_until() does NOT fire early — both sides synchronise exactly.
+#   Constraint: window > 2 * max_clock_error.
+#   - max_sleep is derived from derive_max_sleep(window, max_clock_error)
+#     post dict-build, so any profile that shrinks the bucket params
+#     automatically gets the correct cap (sleep_until needs max_sleep
+#     above the worst-case rendezvous wait or it returns early before
+#     the bucket boundary and the punch misfires).
 # --------------------------
 
 DEFAULT_PUNCH_PARAMS = {
@@ -75,8 +97,9 @@ DEFAULT_PUNCH_PARAMS = {
     "connect_timeout": CONNECT_TIMEOUT,  # 5.0 s spray window
     "monitor_timeout": CONNECT_TIMEOUT,  # 5.0 s monitor window
     "retry_interval": RETRY_INTERVAL,  # 0.05 s selector poll interval
-    # PunchClient / plugin timing
-    "max_sleep": MAX_SLEEP,  # 10 s cap for sleep_until
+    # PunchClient / plugin timing -- max_sleep is filled in below from
+    # derive_max_sleep(window, max_clock_error) so a profile change to
+    # the bucket params can't leave the cap behind.
     # Timeout (seconds) the plugin will wait for the peer's mapping
     # reply future to resolve before spawning the punch worker anyway.
     # Replaces an unconditional sleep -- the plugin now sets the future
@@ -88,6 +111,9 @@ DEFAULT_PUNCH_PARAMS = {
     # with whatever port_allocs are already in the puncher.
     "reply_delay": 2.0,
 }
+DEFAULT_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
+    DEFAULT_PUNCH_PARAMS["window"], DEFAULT_PUNCH_PARAMS["max_clock_error"],
+)
 
 FAST_PUNCH_PARAMS = {
     # Time rendezvous — sized for SysClock-quorum'd peers.  Both sides
@@ -103,8 +129,8 @@ FAST_PUNCH_PARAMS = {
     # window + max_clock_error = 14 s (down from 62 s).  If matrix
     # sweep flakes appear, bump max_clock_error first (5 or 6) and
     # widen window to 2*max+2.
-    "window": 10,
-    "max_clock_error": 4,
+    "window": 4,
+    "max_clock_error": 1,
     # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
     # sized it for *manual CLI* usage where a human types ssh commands
     # on two machines and needs ~10s of slack to start both sides.
@@ -133,16 +159,17 @@ FAST_PUNCH_PARAMS = {
     "connect_timeout": 3.0,  # 3.0 s spray window (5.0 caused regression)
     "monitor_timeout": 3.0,  # 3.0 s monitor window
     "retry_interval": 0.05,  # 0.05 s selector poll interval (unchanged)
-    # PunchClient / plugin timing
-    "max_sleep": 16,  # 16 s cap — above worst-case wait of 14 s
-    # (window + max_clock_error) so sleep_until reaches the actual
-    # rendezvous time without the cap firing early.
+    # PunchClient / plugin timing -- max_sleep is filled in below from
+    # derive_max_sleep(window, max_clock_error).
     # See DEFAULT_PUNCH_PARAMS above for the role of reply_delay; this
     # is the fast-profile fallback ceiling.  Mostly a guard against a
     # signal that never arrives -- on a healthy run the mapping-reply
     # future resolves well below this and the worker spawns immediately.
     "reply_delay": 2,
 }
+FAST_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
+    FAST_PUNCH_PARAMS["window"], FAST_PUNCH_PARAMS["max_clock_error"],
+)
 
 
 def now_from_network(network_timer, network_time):
