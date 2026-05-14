@@ -126,11 +126,19 @@ FAST_PUNCH_PARAMS = {
     # Constraint: window > 2 * max_clock_error  →  10 > 8 ✓; the +2 s
     # buffer above the strict minimum gives slack against sub-second
     # jitter at bucket boundaries.  Worst-case rendezvous wait =
-    # window + max_clock_error = 14 s (down from 62 s).  If matrix
-    # sweep flakes appear, bump max_clock_error first (5 or 6) and
-    # widen window to 2*max+2.
-    "window": 4,
-    "max_clock_error": 1,
+    # window + max_clock_error = 14 s (down from 62 s).
+    #
+    # NOTE: a tighter profile (window=4, max_clock_error=1) was
+    # tried and reverted -- it produced sub-2s pre-bucket bailouts
+    # on real MQTT signal-latency variance because the budget
+    # (our_unc + peer_unc + max_clock_error + SIGNAL_LATENCY_BUDGET)
+    # shrank below the observed skew on flaky pairs.  The 10/4
+    # values absorb that variance.  If you want to shrink rendezvous
+    # latency again, FIRST shrink SIGNAL_LATENCY_BUDGET (currently
+    # hard-coded 10s in each plugin's run()) so the budget tracks
+    # actual signal RTT, THEN shrink max_clock_error.
+    "window": 10,
+    "max_clock_error": 4,
     # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
     # sized it for *manual CLI* usage where a human types ssh commands
     # on two machines and needs ~10s of slack to start both sides.
