@@ -31,7 +31,7 @@ import asyncio
 import sys
 
 from aionetiface import (
-    log, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task,
+    log, fstr, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task,
     shutdown_proc_pool,
 )
 

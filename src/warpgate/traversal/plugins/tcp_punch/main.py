@@ -47,7 +47,7 @@ allocator).
 """
 import asyncio
 import time
-from aionetiface import log, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
+from aionetiface import log, fstr, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
 from ....protocol.proto_defs import P2P_PUNCH
 from .proto import PunchMsg
 from .boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
