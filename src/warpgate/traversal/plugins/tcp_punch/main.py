@@ -293,25 +293,36 @@ class PunchPlugin(Plugin):
             their_os=(self.dest_map.get("os") if self.dest_map else None),
         )
 
-        # Set coordinated time references.
-        timestamp = self.sys_clock.time()
-        puncher.set_timestamp(timestamp)
-
         # NTP-pinned future start.  The connector picks an absolute
         # punch moment (now + PLUGIN_PIN_OFFSET) and the listener reads
         # the value back out of the inbound PunchMsg's payload.ntp
         # field.  No bucket math, no compute_rendezvous, no two-bucket
         # secondary -- both sides agree on one wall-clock instant via
-        # the signal exchange itself.  The CLI standalone path in
-        # punch_client.py __main__ keeps compute_rendezvous because it
-        # has no PunchMsg channel to communicate the pin.
+        # the signal exchange itself.
+        #
+        # For boundary_port_alloc seeding both sides MUST use the same
+        # timestamp value, otherwise their bucket-derived port pools
+        # can diverge across a window boundary (signal RTT + Windows
+        # SYMMETRIC-NAT predict latency easily crosses a 3 s window).
+        # We solve this by always seeding from the connector's tx_unix:
+        # the connector uses its own local clock; the listener takes
+        # the connector's tx_unix out of the inbound PunchMsg and
+        # seeds boundary_port_alloc with that.  Identical bucket on
+        # both peers, port_alloc deterministic and matched.
+        #
+        # The CLI standalone path in punch_client.py __main__ keeps
+        # compute_rendezvous because it has no PunchMsg channel to
+        # communicate either the pin or the seed.
         if reply is not None and getattr(reply.payload, "ntp", 0):
-            # Listener: take the connector's pinned moment verbatim.
+            # Listener: take the connector's pinned moment + seed timestamp.
             punch_time = float(reply.payload.ntp)
+            timestamp = float(reply.payload.tx_unix or self.sys_clock.time())
         else:
             # Connector: pin a near-future absolute moment.
+            timestamp = self.sys_clock.time()
             punch_time = timestamp + PLUGIN_PIN_OFFSET
 
+        puncher.set_timestamp(timestamp)
         puncher.set_punch_time(punch_time)
 
         # Deterministic predictions based on boundary math.
