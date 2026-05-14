@@ -261,8 +261,10 @@ class PunchPlugin(Plugin):
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time
         # is communicated between peers via PunchMsg so we do not need the large
         # WINDOW / MAX_CLOCK_ERROR values used by the CLI standalone mode.  The
-        # tight window (6 s) and short coordinator_delay (0.5 s) cut total punch
-        # latency roughly in half compared to the conservative CLI defaults.
+        # tight window (6 s) and short reply_delay (0.5 s, plus the
+        # mapping_reply future short-circuiting it on healthy paths)
+        # cut total punch latency roughly in half compared to the
+        # conservative CLI defaults.
         puncher = PunchClient(
             dest_ip,
             src_ip,
@@ -322,7 +324,20 @@ class PunchPlugin(Plugin):
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
         self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
-        # Schedule the punching process with a short delay.
+        # Future the worker-spawn task waits on instead of sleeping a
+        # fixed interval.  advance_punching_protocol resolves it the
+        # moment the peer's mappings have been folded into
+        # puncher.port_allocs; the worker spawns as soon as that
+        # happens rather than at a pessimistic timer mark.  A
+        # wait_for(reply_delay) in delayed_start_punching_proc bounds
+        # the wait so a lost / late signal doesn't stall the worker
+        # indefinitely (LAN-mode short-circuit, which never folds in
+        # peer mappings, falls through the timeout and uses the
+        # boundary-aligned port_allocs that setup_puncher_client
+        # already populated).
+        self.mapping_reply = asyncio.get_event_loop().create_future()
+
+        # Schedule the punching process.
         if self.plugin_id not in self.punch_proc:
             self.punch_proc[self.plugin_id] = asyncio.create_task(
                 async_wrap_errors(self.delayed_start_punching_proc(self.nic, puncher))
@@ -371,6 +386,15 @@ class PunchPlugin(Plugin):
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
 
+        # Signal the worker-spawn task: the peer's mappings have been
+        # folded in and port_allocs is now valid.  Guarded by not done()
+        # because advance_punching_protocol may be re-entered across
+        # signal rounds (mapping refresh), and resolving an
+        # already-resolved future raises InvalidStateError.
+        reply_future = getattr(self, "mapping_reply", None)
+        if reply_future is not None and not reply_future.done():
+            reply_future.set_result(True)
+
         # End of protocol.
         if is_end == 1:
             return None
@@ -398,23 +422,31 @@ class PunchPlugin(Plugin):
     # SysClock so both peers agree on the same fire moment via their
     # respective clocks -- no RTT measurement, ACK-relative timing, or
     # other "let's get the peers in sync" scheme is needed or wanted at
-    # this layer. coordinator_delay below is a SETUP BUFFER only -- the
-    # time between "got peer's punch reply" and "spawn the worker
-    # process" -- so the worker has time to bind sockets before its
-    # internal sleep_until(punch_time) reaches the bucket boundary. Do
-    # NOT make it derive from RTT or anything else clock-adjacent; it's
-    # an OS-warmup nap, not a synchronisation primitive.
+    # this layer. reply_delay below is the timeout ceiling on the
+    # mapping_reply future -- normally the future resolves the moment
+    # advance_punching_protocol has folded the peer's mappings into
+    # puncher.port_allocs, and the worker spawns immediately.  Only the
+    # pathological "peer's signal never arrived" path actually consumes
+    # the full reply_delay before the worker proceeds anyway with
+    # whatever port_allocs are already set.  Do NOT make reply_delay
+    # derive from RTT or anything else clock-adjacent -- it's a
+    # fallback ceiling, not a synchronisation primitive.
     async def delayed_start_punching_proc(self, nic, puncher):
-        """Wait a short coordinator delay then launch the punching process and resolve the result."""
-        coordinator_delay = puncher.params.get("coordinator_delay", 2.0)
-        log("[PUNCH-DELAY] enter plugin_id={0} delay={1}s".format(
-            self.plugin_id, coordinator_delay,
+        """Wait for mapping_reply (or reply_delay timeout) then launch the punching process and resolve the result."""
+        reply_delay = puncher.params.get("reply_delay", 2.0)
+        log("[PUNCH-DELAY] enter plugin_id={0} reply_delay={1}s".format(
+            self.plugin_id, reply_delay,
         ))
         try:
-            await asyncio.sleep(coordinator_delay)
-            log("[PUNCH-DELAY] sleep done; calling start_punching_process plugin_id={0}".format(
-                self.plugin_id,
-            ))
+            try:
+                await asyncio.wait_for(self.mapping_reply, reply_delay)
+                log("[PUNCH-DELAY] mapping_reply resolved; calling start_punching_process plugin_id={0}".format(
+                    self.plugin_id,
+                ))
+            except asyncio.TimeoutError:
+                log("[PUNCH-DELAY] mapping_reply timed out after {0}s; proceeding plugin_id={1}".format(
+                    reply_delay, self.plugin_id,
+                ))
             pipe = await start_punching_process(
                 nic,
                 puncher,

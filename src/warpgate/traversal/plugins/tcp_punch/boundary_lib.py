@@ -77,7 +77,16 @@ DEFAULT_PUNCH_PARAMS = {
     "retry_interval": RETRY_INTERVAL,  # 0.05 s selector poll interval
     # PunchClient / plugin timing
     "max_sleep": MAX_SLEEP,  # 10 s cap for sleep_until
-    "coordinator_delay": 2.0,  # s delay before spawning punch process
+    # Timeout (seconds) the plugin will wait for the peer's mapping
+    # reply future to resolve before spawning the punch worker anyway.
+    # Replaces an unconditional sleep -- the plugin now sets the future
+    # the moment the peer's mappings arrive and advance_punching_protocol
+    # has folded them into puncher.port_allocs, so the worker normally
+    # starts the instant the mappings land.  reply_delay is the fallback
+    # ceiling for the pathological case where the peer's signal is
+    # dropped or delayed past this many seconds; the worker proceeds
+    # with whatever port_allocs are already in the puncher.
+    "reply_delay": 2.0,
 }
 
 FAST_PUNCH_PARAMS = {
@@ -128,9 +137,11 @@ FAST_PUNCH_PARAMS = {
     "max_sleep": 16,  # 16 s cap — above worst-case wait of 14 s
     # (window + max_clock_error) so sleep_until reaches the actual
     # rendezvous time without the cap firing early.
-    "coordinator_delay": 0.5,  # 0.5 s — sleep_until handles the actual
-    # rendezvous wait; this is just a setup buffer before spawning
-    # the punch worker, doesn't need to scale with window.
+    # See DEFAULT_PUNCH_PARAMS above for the role of reply_delay; this
+    # is the fast-profile fallback ceiling.  Mostly a guard against a
+    # signal that never arrives -- on a healthy run the mapping-reply
+    # future resolves well below this and the worker spawns immediately.
+    "reply_delay": 2,
 }
 
 

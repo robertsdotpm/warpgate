@@ -257,6 +257,15 @@ class UdpPunchPlugin(Plugin):
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
         self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
+        # Future the engine task waits on instead of sleeping a fixed
+        # interval.  advance_punching_protocol resolves it the moment
+        # the peer's mappings have been folded into puncher.port_allocs;
+        # the engine wakes up as soon as that happens rather than at a
+        # pessimistic timer mark.  A wait_for(reply_delay) in
+        # delayed_run_engine bounds the wait so a lost / late signal
+        # doesn't stall the engine indefinitely.
+        self.mapping_reply = asyncio.get_event_loop().create_future()
+
         if self.plugin_id not in self.punch_proc:
             self.punch_proc[self.plugin_id] = asyncio.create_task(
                 self.delayed_run_engine(puncher)
@@ -296,6 +305,16 @@ class UdpPunchPlugin(Plugin):
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
 
+        # Signal the engine task: the peer's mappings have been folded
+        # in and port_allocs is now valid for spawning the worker.
+        # Guarded by not done() because configure_puncher_process /
+        # advance_punching_protocol may be re-entered across signal
+        # rounds (mapping refresh), and resolving an already-resolved
+        # future raises InvalidStateError.
+        reply_future = getattr(self, "mapping_reply", None)
+        if reply_future is not None and not reply_future.done():
+            reply_future.set_result(True)
+
         if is_end == 1:
             return None
 
@@ -312,10 +331,32 @@ class UdpPunchPlugin(Plugin):
         return msg
 
     async def delayed_run_engine(self, puncher):
-        """Wait for coordinator delay, set up bridge, dispatch worker that runs engine + bridge."""
-        coordinator_delay = puncher.params.get("coordinator_delay", 2.0)
+        """Wait for the peer's mapping reply (or reply_delay timeout), set up bridge, dispatch worker that runs engine + bridge.
+
+        Previously slept ``coordinator_delay`` unconditionally on the
+        theory that the peer's reply would have arrived in that time.
+        That was racy on slow signal paths (worker started without
+        port_allocs populated) and wasteful on fast paths (worker
+        idled until the timer expired even though the mappings landed
+        in 50 ms).  Now we ``wait_for`` the ``mapping_reply`` future
+        that ``advance_punching_protocol`` resolves the instant the
+        peer's mappings have been folded into ``puncher.port_allocs``.
+        The ``reply_delay`` param caps the wait so a dropped signal
+        doesn't stall the engine indefinitely; on TimeoutError we
+        proceed with whatever ``port_allocs`` is already set
+        (LAN-mode short-circuit relies on this, as do single-side
+        mapping-only runs).
+        """
+        reply_delay = puncher.params.get("reply_delay", 2.0)
         try:
-            await asyncio.sleep(coordinator_delay)
+            try:
+                await asyncio.wait_for(self.mapping_reply, reply_delay)
+            except asyncio.TimeoutError:
+                log(fstr(
+                    "udp_punch.delayed_run_engine: mapping_reply timed "
+                    "out after {0}s; spawning worker with current port_allocs",
+                    (reply_delay,),
+                ))
 
             # ---- Bridge setup (main side) ----
             #
