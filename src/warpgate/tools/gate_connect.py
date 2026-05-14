@@ -51,15 +51,20 @@ async def main():
     timeout = float(os.environ.get("WG_TIMEOUT", "900"))
 
     afs = parse_afs(os.environ.get("WG_AFS"))
+    plugins_env = os.environ.get("WG_PLUGINS", "").strip()
+    plugins = None
+    if plugins_env:
+        plugins = [p.strip() for p in plugins_env.split(",") if p.strip()]
     async with (Gate(name=name) if name else Gate()) as gate:
-        print("WG_CONNECTOR_READY: {0} afs={1}".format(
-            gate.full_name or "?", afs,
+        print("WG_CONNECTOR_READY: {0} afs={1} plugins={2}".format(
+            gate.full_name or "?", afs, plugins,
         ), flush=True)
         link = await gate.connect(
             peer.find(target),
             test_all_phases=True,
             timeout=timeout,
             afs=afs,
+            plugins=plugins,
         )
         if link is None:
             print("OUTCOME winner_plugin=none", flush=True)
