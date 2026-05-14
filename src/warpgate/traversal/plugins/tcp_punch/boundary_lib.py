@@ -123,22 +123,16 @@ FAST_PUNCH_PARAMS = {
     # routed away (see XP RST CLAUDE note), so only intra-LAN XP-
     # punch passes through these params, where peer clocks usually
     # share an upstream and fall well inside max_clock_error=4.
-    # Constraint: window > 2 * max_clock_error  →  10 > 8 ✓; the +2 s
-    # buffer above the strict minimum gives slack against sub-second
-    # jitter at bucket boundaries.  Worst-case rendezvous wait =
-    # window + max_clock_error = 14 s (down from 62 s).
-    #
-    # NOTE: a tighter profile (window=4, max_clock_error=1) was
-    # tried and reverted -- it produced sub-2s pre-bucket bailouts
-    # on real MQTT signal-latency variance because the budget
-    # (our_unc + peer_unc + max_clock_error + SIGNAL_LATENCY_BUDGET)
-    # shrank below the observed skew on flaky pairs.  The 10/4
-    # values absorb that variance.  If you want to shrink rendezvous
-    # latency again, FIRST shrink SIGNAL_LATENCY_BUDGET (currently
-    # hard-coded 10s in each plugin's run()) so the budget tracks
-    # actual signal RTT, THEN shrink max_clock_error.
-    "window": 10,
-    "max_clock_error": 4,
+    # Constraint: window > 2 * max_clock_error  →  4 > 2 ✓; tight
+    # profile sized for SysClock-quorum'd peers where peer-to-peer
+    # skew is sub-second.  Worst-case rendezvous wait =
+    # window + max_clock_error = 5 s (down from 14 s).  Previously
+    # reverted to 10/4 when sub-2s pre-bucket bailouts were
+    # appearing -- those turned out to be a NameError in the
+    # re-entry guard (fstr not imported, fixed in edde6f3), not a
+    # genuine bailout firing, so this profile is safe again.
+    "window": 4,
+    "max_clock_error": 1,
     # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
     # sized it for *manual CLI* usage where a human types ssh commands
     # on two machines and needs ~10s of slack to start both sides.
