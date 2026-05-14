@@ -1,6 +1,7 @@
 """Sliding-window boundary analysis for port prediction."""
 import time
 import random
+from aionetiface.utility.utils import log
 
 # --- NTP Constants ---
 NTP_SERVER = "pool.ntp.org"
@@ -150,7 +151,13 @@ FAST_PUNCH_PARAMS = {
     # cause was NUM_PORTS dropping from 16 to 2 (db0c676 + 2a36880).
     # 3 s wins back the original sweep-flake reduction (bucket-fork
     # window 3/42 = 7% vs 10/42 = 24% per bucket transition).
-    "min_run_window": 3,
+    # Drop to 1 s with the smaller window=4 profile: skip path adds
+    # exactly window=4s every fire, and at min_run_window=3 the skip
+    # rate is 75% (3/4) -> avg rendezvous wait ~5.4s.  At
+    # min_run_window=1 skip rate drops to 25% (1/4) -> avg rendezvous
+    # wait drops by ~2.25s.  Safe given SysClock-NTP-quorum'd peers
+    # have sub-second skew well below 1s.
+    "min_run_window": 1,
     # Engine timing — bumped from 2.0 to 3.0 each after the matrix sweep
     # showed udp_punch flaking on busy hosts. With 18 sockets each spraying
     # at 50 Hz the connector saw only 1/18 of expected PROBEs back -- the
@@ -268,9 +275,11 @@ now,
     # The rendezvous time is the start of the (bucket + 1) window.
     rendezvous_time = (bucket + 1) * window + max_error
 
-    # 3. Check if there's enough time left for setup. If not, skip to the following bucket.
-    if rendezvous_time - now < min_run_window:
+    # 3. Check if there's enough time left for setup.
+    # If not, skip to the following bucket.
+    if (rendezvous_time - now) < min_run_window:
         bucket += 1
         rendezvous_time = (bucket + 1) * window + max_error
+        log("min run window being applied -- next bucket window")
 
     return bucket, rendezvous_time
