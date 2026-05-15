@@ -811,42 +811,14 @@ async def phase2_tcp_punch(
     # FULL_CONE-FULL_CONE pair could punch fine. Per-pair filtering
     # keeps the impossible (sym, *) and (*, sym) pairs out of the
     # combo list while preserving viable LAN-LAN and EXT-EXT combos.
-    # Asymmetric plugin selection based on OUR OS only:
-    #   - we are on Windows-XP / Windows-2000 cross-machine ->
-    #     route locally to tcp_punch_pcap (userspace pcap stack
-    #     bypasses XP's tcpip.sys simul-open RST -- see
-    #     /home/x/projects/warpgate/CLAUDE.md "Windows XP cross-NAT
-    #     tcp_punch is not fixable from user-space")
-    #   - we are on any other OS -> route locally to tcp_punch
-    #     (kernel stack, unchanged)
-    # The PEER independently picks its plugin from its own OS.  A
-    # non-XP peer's selection doesn't force us into tcp_punch_pcap
-    # and vice versa.  The two plugins share the same wire format
-    # (tcp_punch.PunchMsg) so the choices interoperate freely.
-    src_os = (src_map or {}).get("os") or ""
-    we_are_nt5 = (
-        src_os.startswith("Windows-XP")
-        or src_os.startswith("Windows-2000")
-    )
-    if we_are_nt5 and not is_same_machine(src_map, dest_map):
-        if "tcp_punch_pcap" in names:
-            log("phase2_tcp_punch: local OS is {0} cross-machine; "
-                "routing to tcp_punch_pcap (userspace pcap stack)".format(
-                    src_os,
-                ))
-            return await punch_phase(
-                node, src_map, dest_map, sig_pipe,
-                plugin_names=("tcp_punch_pcap",),
-                label="phase2_pcap",
-            )
-        log("phase2_tcp_punch: local OS is {0} cross-machine; "
-            "tcp_punch_pcap not installed -- skipping (legacy tcp_punch "
-            "would hit the tcpip.sys RST and waste 180 s)".format(src_os))
-        return None, None
-    # Not-NT5: strip tcp_punch_pcap from the plugin list -- the
-    # plugin's setup() already opts out on non-NT5 hosts as defence-
-    # in-depth, but if it somehow registered we still don't want to
-    # race against legacy tcp_punch.
+    # Windows-XP / Windows-2000 are NOT special-cased here any more.
+    # Previously an XP/2000 connector cross-machine was routed to
+    # tcp_punch_pcap or, if pcap wasn't installed, had phase2 skipped
+    # outright -- on the assumption legacy tcp_punch would always hit
+    # XP's tcpip.sys simul-open RST and waste the 180 s plugin
+    # timeout.  XP is now allowed through the normal tcp_punch path
+    # like every other OS; if a given XP pair genuinely can't punch,
+    # the cascade falls through to phase3/phase4 on its own.
     names = tuple(n for n in names if n != "tcp_punch_pcap")
     return await punch_phase(
         node, src_map, dest_map, sig_pipe,
