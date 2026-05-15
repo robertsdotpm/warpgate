@@ -44,7 +44,14 @@ async def emit_ready_when_registered(gate):
 
 async def main():
     name = os.environ.get("WG_LISTEN_NAME") or None
-    gate = Gate(name=name) if name else Gate()
+    # WG_NIC pins the listener to a single interface by display name so
+    # the matrix VMs' flaky IPv4-only mobile NIC is excluded -- without
+    # it gate_listen discovers every NIC and the punch can land its
+    # winning socket on the mobile path, where the handshake completes
+    # but bytes never flow (pipe=True / verify fails).
+    nic = os.environ.get("WG_NIC") or None
+    nic_names = [nic] if nic else None
+    gate = Gate(name=name, nic_names=nic_names)
     asyncio.ensure_future(emit_ready_when_registered(gate))
     try:
         await gate.listen(handle)

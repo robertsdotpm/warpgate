@@ -83,6 +83,16 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     error.  The caller should ``close_plugin`` the pipe and continue
     the cascade on False.
     """
+    # Diagnostic bypass: WG_SKIP_VERIFY=1 makes verify always pass so
+    # the cascade commits the pipe and the application echo gets a
+    # chance to run.  Used to split "pipe genuinely broken" from
+    # "pipe fine, liveness PING/PONG path broken" -- if the app echo
+    # succeeds under the bypass, the bug is in the liveness peel /
+    # per-nonce future, not the punch itself.
+    if os.environ.get("WG_SKIP_VERIFY") == "1":
+        log("[AC-VERIFY] WG_SKIP_VERIFY=1; skipping liveness check")
+        return True
+
     nonce = os.urandom(8).hex().encode("ascii")
     ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
 

@@ -55,7 +55,11 @@ async def main():
     plugins = None
     if plugins_env:
         plugins = [p.strip() for p in plugins_env.split(",") if p.strip()]
-    async with (Gate(name=name) if name else Gate()) as gate:
+    # WG_NIC pins the connector to a single interface (see gate_listen).
+    nic = os.environ.get("WG_NIC") or None
+    nic_names = [nic] if nic else None
+    async with (Gate(name=name, nic_names=nic_names) if name
+                else Gate(nic_names=nic_names)) as gate:
         print("WG_CONNECTOR_READY: {0} afs={1} plugins={2}".format(
             gate.full_name or "?", afs, plugins,
         ), flush=True)
