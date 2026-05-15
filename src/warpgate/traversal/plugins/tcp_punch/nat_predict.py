@@ -303,14 +303,15 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
         mode, src_nat, dest_nat, recv_mappings, test_no
     )
 
-    # Preload nat predictions: ONE STUN call instead of N. For
-    # EQUAL_DELTA / PRESERV_DELTA NATs (the matrix VMs and most SOHO
-    # consumer NATs) the delta is constant, so a single STUN reveals
-    # it and the remaining N-1 external ports are computed without
-    # extra round-trips. preload_mappings still returns a list; we
-    # rely on get_single_mapping's existing IndexError fallback to
-    # preloaded_mappings[0] for indices beyond the truncated list.
-    preloaded_mappings = await preload_mappings(1, stuns)
+    # Preload NAT predictions: 3 successive STUN samples.  This path
+    # carries the punch only when the boundary allocator was skipped
+    # -- i.e. at least one side has a non-deterministic delta
+    # (INDEPENDENT / DEPENDENT / RANDOM / PRESERV), where the external
+    # port genuinely has to be measured rather than derived from the
+    # time bucket.  3 successive samples are enough to pin the
+    # allocation pattern; get_single_mapping's IndexError fallback to
+    # preloaded_mappings[0] covers indices beyond 3.
+    preloaded_mappings = await preload_mappings(3, stuns)
     assert len(preloaded_mappings)
 
     # Use default ports for client if unknown

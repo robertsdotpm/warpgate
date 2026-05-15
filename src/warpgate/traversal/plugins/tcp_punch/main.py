@@ -53,6 +53,7 @@ from .proto import PunchMsg
 from .boundary_lib import FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, compute_rendezvous  # noqa: F401
 from .punch_client import PunchClient
 from .boundary_alloc import boundary_port_alloc
+from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from .nat_predict_alloc import NATPredictAlloc
 from .punch_defs import TCP_PUNCH_LAN
 from .punch_process import start_punching_process
@@ -340,13 +341,37 @@ class PunchPlugin(Plugin):
         puncher.set_timestamp(timestamp)
         puncher.set_punch_time(punch_time)
 
-        # Deterministic predictions based on boundary math.
-        # Seed boundary_port_alloc with punch_time -- since both peers
-        # take punch_time verbatim (connector picks, listener reads
-        # from PunchMsg) they derive the same bucket and produce the
-        # same port pool regardless of timestamp drift between
-        # create_puncher calls.
-        puncher.add_port_allocator(boundary_port_alloc, seed=punch_time)
+        # boundary_port_alloc derives the punch ports deterministically
+        # from the time bucket.  That only matches the peer's actual
+        # external ports when BOTH NATs allocate predictably:
+        #   - EQUAL_DELTA: external = local + constant offset
+        #   - NA_DELTA:    no NAT, external = local
+        # For INDEPENDENT / DEPENDENT / RANDOM / PRESERV deltas the
+        # external port cannot be derived from the bucket, so the
+        # boundary allocator would seed the spray with wrong ports.
+        # In that case skip it entirely and rely solely on the STUN-
+        # driven NAT predictor (advance_punching_protocol ->
+        # nat_alloc.port_alloc), which measures the live mapping.
+        src_delta = (self.src.get("nat") or {}).get("delta") or {}
+        dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
+        boundary_ok = (
+            src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+            and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+        )
+        if boundary_ok:
+            # Seed boundary_port_alloc with punch_time -- since both
+            # peers take punch_time verbatim (connector picks, listener
+            # reads from PunchMsg) they derive the same bucket and the
+            # same port pool regardless of timestamp drift between
+            # create_puncher calls.
+            puncher.add_port_allocator(boundary_port_alloc, seed=punch_time)
+        else:
+            log(fstr(
+                "[TCP-PUNCH] non-deterministic NAT delta "
+                "(src={0} dest={1}); skipping boundary_port_alloc, "
+                "using STUN NAT predictor only",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
 
         # Return the new puncher and the STUN clients
         return puncher, stuns
