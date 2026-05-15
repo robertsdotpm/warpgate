@@ -1,24 +1,23 @@
 """Traversal plugin for TCP hole punching via coordinated port prediction.
 
-Timeout budget (PLUGIN_CONF["timeout"] = 180):
-  180 s = max-rendezvous-wait (window=42 + max_clock_error=20 ≈ 62 s)
-        + primary spray (~3 s) + primary monitor (~3 s)
-        + secondary rendezvous wait (window=42 s) for two-bucket dual-fire
-        + secondary spray (~3 s) + secondary monitor (~3 s)
-        + worker dispatch / engine setup overhead (varies by host,
-          ~5-15 s on slow stacks)
-        + the post-punch reverse-bridge accept (typically <1 s)
-        + a safety margin for slow stacks (Vista / older BSDs) so the
-          run_plugin wait_for doesn't cancel the awaiting
-          reverse_server.accept before the worker has had a chance to
-          connect back.  The previous 80 s left only ~10 s margin
-          which the v13 sweep ate on slow pairs, manifesting as
-          WinError 10061 on the worker's connect-back to a listener
-          that had just been torn down by the cancellation
-          propagating from the timeout firing.  XP cross-NAT
-          tcp_punch is routed away to udp_punch / turn (see
-          project_xp_tcp_punch_simul_open_rst memory) so the budget
-          here doesn't need to accommodate XP specifically anymore.
+Timeout budget (PLUGIN_CONF["timeout"] = 120):
+  This is the per-phase ceiling: how long phase2 waits for the punch
+  before cancelling it and falling through to phase3.
+
+  The old budget was 180 s, sized for the bucket-rendezvous design
+  (window=42 + max_clock_error=20 ≈ 62 s rendezvous wait, plus a
+  second window=42 s wait for two-bucket dual-fire).  Both are gone:
+  NTP-pinned start replaced the rendezvous wait with PLUGIN_PIN_OFFSET
+  (~1 s, ~3 s on the predictor path) and the dual-fire was dropped.
+  A real punch now completes in ~3 s.
+
+  Realistic worst case is now: pin offset (≤3 s) + spray (~1.5 s) +
+  monitor (~1.5 s) + worker dispatch / engine setup (~5-15 s on slow
+  stacks) + post-punch reverse-bridge accept (<1 s) ≈ 25 s.  120 s is
+  a deliberately conservative ceiling -- well clear of that worst
+  case with margin for slow stacks (Vista / older BSDs), while still
+  cutting a failed phase2's fall-through to phase3 by a full minute
+  versus the old 180 s.  Can be lowered further once trusted.
 
 PROTO_MESSAGES is consumed by plugin_loader: it merges each entry into
 TraversalManager.sig_proto so PunchMsg dispatches without core
@@ -72,7 +71,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 180}
+    conf = {"timeout": 120}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
