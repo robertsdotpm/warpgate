@@ -84,6 +84,19 @@ class PunchPlugin(Plugin):
 
     async def run(self, reply=None):
         """Coordinate the hole-punch exchange and launch the background punching process."""
+        if getattr(self, "stage_t0", None) is None:
+            self.stage_t0 = time.monotonic()
+        def stamp(label, **extra):
+            t = time.time()
+            elapsed_ms = int((time.monotonic() - self.stage_t0) * 1000)
+            extras = " ".join("{0}={1}".format(k, v) for k, v in extra.items())
+            line = "[PUNCH-STAGE] wall={0:.3f} t={1}ms stage={2} plugin_id={3} {4}".format(
+                t, elapsed_ms, label, self.plugin_id, extras,
+            )
+            log(line)
+            print(line, flush=True)
+        self.stamp = stamp
+        stamp("run_enter", reply=(reply is not None))
         log("[PUNCH-RUN] enter plugin_id={0} reply={1} completed={2}".format(
             self.plugin_id,
             reply is not None,
@@ -146,6 +159,7 @@ class PunchPlugin(Plugin):
                 puncher, stuns = await self.setup_puncher_client(reply)
             except BaseException as exc:
                 raise
+            stamp("setup_done", puncher=(puncher is not None), stuns=len(stuns) if stuns else 0)
             if puncher is None:
                 log("[PUNCH-RUN] PunchPlugin: no STUN clients available; aborting punch.")
                 if not self.result.done():
@@ -163,6 +177,7 @@ class PunchPlugin(Plugin):
                     puncher = await self.configure_puncher_process(puncher, stuns)
                 except BaseException as exc:
                     raise
+                stamp("configure_done")
         else:
             log("[PUNCH-RUN] reusing existing puncher plugin_id={0}".format(
                 self.plugin_id,
@@ -177,6 +192,7 @@ class PunchPlugin(Plugin):
             )
         except BaseException as exc:
             raise
+        stamp("advance_done", have_outgoing=(outgoing_msg is not None))
 
         # Instrumentation: when a reply with mappings just landed, log
         # the round-trip from our outgoing send to this receipt.  The
@@ -201,7 +217,9 @@ class PunchPlugin(Plugin):
         # --- Send our port predictions to the peer ---
         log("[PUNCH-RUN] sending outgoing PunchMsg plugin_id={0}".format(self.plugin_id))
         self.outgoing_sent_at = time.time()
+        stamp("send_signal_start")
         await self.send_signal(outgoing_msg)
+        stamp("send_signal_done")
 
     async def setup_puncher_client(self, reply):
         """

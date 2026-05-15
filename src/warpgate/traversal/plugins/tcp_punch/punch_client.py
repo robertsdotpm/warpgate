@@ -153,6 +153,12 @@ self,
             "capped={3}".format(
                 self.timestamp, self.punch_time, sleep_time, capped,
             ))
+        try:
+            print("[PUNCH-STAGE] wall={0:.3f} stage=sleep_until ts={1} punch_time={2} sleep={3}s".format(
+                time.time(), self.timestamp, self.punch_time, sleep_time,
+            ), flush=True)
+        except Exception:
+            pass
 
         # No sleep needed if far behind.
         if sleep_time > 0:
@@ -228,6 +234,12 @@ self,
         log("[PUNCH-CLIENT] run_engine: primary punch_time={0} secondary={1}".format(
             self.punch_time, self.secondary_punch_time,
         ))
+        try:
+            print("[PUNCH-STAGE] wall={0:.3f} stage=run_engine_enter punch_time={1}".format(
+                time.time(), self.punch_time,
+            ), flush=True)
+        except Exception:
+            pass
         sock = f_engine(
             af=self.af,
             nic_id=self.nic_id,
