@@ -73,7 +73,7 @@ from .tcp_punch_engine import tcp_selector_punch_engine
 from aionetiface.net.selector_proxy import selector_proxy
 
 
-def punching_process(puncher, reverse_server_dest, stop_reader):
+def punching_process(puncher, reverse_server_dest, stop_reader, ready_writer=None):
     """Run the blocking punch engine and proxy the result back through a reverse connection.
 
     Despite the name, this currently runs in a ThreadPoolExecutor
@@ -107,7 +107,12 @@ def punching_process(puncher, reverse_server_dest, stop_reader):
 
         # Make reverse connect to listen server in main process.
         # Handles passing messages between the punch sock <--> reverse con.
-        selector_proxy(punched_sock, reverse_server_dest, stop_reader)
+        # ready_writer fires once selector_proxy's copy loop is live so
+        # start_punching_process can withhold the pipe until then.
+        selector_proxy(
+            punched_sock, reverse_server_dest, stop_reader,
+            ready_writer=ready_writer,
+        )
         log("[PUNCH-WORKER] selector_proxy returned; worker exiting")
     except KeyboardInterrupt:
         log("[PUNCH-WORKER] KeyboardInterrupt; exiting silently")
@@ -119,6 +124,15 @@ def punching_process(puncher, reverse_server_dest, stop_reader):
         # Prevent thread or process blow up.
         log_exception()
         raise e
+    finally:
+        # The ready signal is one-shot; close our end so the main side
+        # sees EOF if it is still waiting after we exit (e.g. punch
+        # failed before selector_proxy ran and sent the byte).
+        if ready_writer is not None:
+            try:
+                ready_writer.close()
+            except OSError:
+                pass
 
 
 async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node_msg_cb=None):
@@ -132,6 +146,8 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
     ))
     reverse_server = None
     worker_fut = None
+    ready_main = None
+    ready_worker = None
     try:
         # Create a listen server for receiving a connection back from
         # the punching process. The bridge from the punch worker to
@@ -210,7 +226,16 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
         # Start the punching in a new process.
         # Store the future so the caller can inspect / cancel it if needed.
         loop = get_running_loop()
-        args = (puncher, reverse_server_dest, stop_reader)
+        # Bridge-ready signal: a connected socketpair.  selector_proxy
+        # writes one byte to ready_worker the moment its copy loop is
+        # live; we block on ready_main below before handing the pipe
+        # back.  A raw socket, not an asyncio.Future -- a byte written
+        # to an fd is safe from the worker thread with no
+        # call_soon_threadsafe dance, and mirrors the existing
+        # stop_reader socket signalling selector_proxy already uses.
+        ready_main, ready_worker = socket.socketpair()
+        ready_main.setblocking(False)
+        args = (puncher, reverse_server_dest, stop_reader, ready_worker)
         log("[PUNCH-PROC] dispatching punching_process via run_in_executor "
             "(proc_pool={0})".format(type(proc_pool).__name__ if proc_pool else "None"))
         worker_fut = loop.run_in_executor(proc_pool, punching_process, *args)
@@ -247,6 +272,28 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
             punch_process_connection is not None,
         ))
 
+        # Withhold the pipe until the worker's selector_proxy copy loop
+        # is live.  accept() returns the instant the worker's loopback
+        # connect lands -- but the worker still has to register both
+        # legs with its selector and enter the poll loop before it can
+        # copy an inbound byte.  selector_proxy writes one byte to
+        # ready_worker at exactly that point; block on ready_main here
+        # so auto_connect's verify_pipe_alive can never fire its
+        # liveness PING into a pipe whose copy loop is not yet pumping
+        # (the race that rejected healthy Win7/10/11/Server punches:
+        # listener sent its PONG fine, connector's bridge had not
+        # started draining the socket, verify timed out).  On timeout
+        # -- worker crashed between connect and loop entry, rare --
+        # fall through and return the pipe anyway: a racy pipe still
+        # beats discarding a successful punch.
+        if punch_process_connection is not None and ready_main is not None:
+            try:
+                await asyncio.wait_for(loop.sock_recv(ready_main, 1), timeout=10)
+                log("[PUNCH-PROC] bridge copy loop confirmed live")
+            except asyncio.TimeoutError:
+                log("[PUNCH-PROC] bridge-ready signal timed out; "
+                    "returning pipe unconfirmed")
+
         return punch_process_connection
     except asyncio.CancelledError:
         log("[PUNCH-PROC] start_punching_process cancelled")
@@ -263,3 +310,18 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
             log("[PUNCH-PROC] worker_fut cancelled in finally")
         if reverse_server is not None:
             await async_wrap_errors(reverse_server.close(keep_clients=True))
+        # ready_main is ours to close.  ready_worker belongs to the
+        # worker thread once dispatched -- punching_process's own
+        # finally closes it; closing it here too would race that
+        # thread.  Only reclaim ready_worker on the early-error path
+        # where the worker was never dispatched (worker_fut is None).
+        if ready_main is not None:
+            try:
+                ready_main.close()
+            except OSError:
+                pass
+        if ready_worker is not None and worker_fut is None:
+            try:
+                ready_worker.close()
+            except OSError:
+                pass
