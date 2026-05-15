@@ -99,9 +99,10 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     loop = asyncio.get_event_loop()
     pong_fut = loop.create_future()
     register_liveness_pong_future(pipe, nonce, pong_fut)
-    log("[LIVENESS] verify registered nonce={0} pipe_id={1} pipe_type={2}".format(
-        nonce, id(pipe), type(pipe).__name__,
-    ))
+    log("[LIVENESS] mono={0:.4f} verify registered nonce={1} pipe_id={2} "
+        "pipe_type={3}".format(
+            time.monotonic(), nonce, id(pipe), type(pipe).__name__,
+        ))
 
     # TCP fires one PING (TCP retransmits handle datagram loss); UDP
     # retries.  The freshly-punched-pipe warm-up race -- verify firing
@@ -116,6 +117,9 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
         for attempt in range(attempts):
             try:
                 await pipe.send(ping)
+                log("[LIVENESS] mono={0:.4f} PING sent attempt={1}".format(
+                    time.monotonic(), attempt + 1,
+                ))
             except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 log(fstr(
                     "verify_pipe_alive: send failed attempt={0}/{1}: {2}: {3}",
@@ -132,6 +136,10 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
             except asyncio.TimeoutError:
                 if pong_fut.done():
                     return True
+                log("[LIVENESS] mono={0:.4f} PING attempt={1} timed out "
+                    "after {2}s".format(
+                        time.monotonic(), attempt + 1, per_try_timeout,
+                    ))
                 # Loop to next attempt (UDP) or fall through (TCP).
                 continue
         return False
