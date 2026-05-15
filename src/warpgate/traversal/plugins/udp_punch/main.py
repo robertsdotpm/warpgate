@@ -705,18 +705,15 @@ class UdpPunchPlugin(Plugin):
                         (stale_drained, stale_errors),
                     ))
 
-                # Hand off to selector_proxy.  Convergence is NOT
-                # signalled here -- selector_proxy fires ready_writer
-                # the moment its copy loop is live, and the main side's
-                # reader on the paired socket resolves convergence off
-                # that.  Signalling here (before the loop entered)
-                # raced: main resolved plugin.result and the demo's
-                # ECHO bytes queued in worker_sock with nobody draining
-                # them yet.  Mirrors tcp_punch's bridge-ready socketpair.
+                # Bridge is wired; let main resolve plugin.result so
+                # the demo can start sending ECHO and have it actually
+                # land on punched_sock.
                 log(fstr(
                     "[UDP-WORKER] bridging punched <-> worker_sock {0}",
                     (worker_addr,),
                 ))
+                loop.call_soon_threadsafe(signal_convergence, True)
+
                 try:
                     selector_proxy(
                         punched_sock,
@@ -724,34 +721,10 @@ class UdpPunchPlugin(Plugin):
                         stop_reader,
                         sock_proto=_socket.SOCK_DGRAM,
                         socket_r=worker_sock,
-                        ready_writer=ready_worker,
                     )
                 except Exception:  # pylint: disable=broad-except
                     log_exception()
                 log("[UDP-WORKER] selector_proxy returned; worker exiting")
-
-            # Bridge-ready socketpair (ported from tcp_punch).
-            # selector_proxy writes one byte to ready_worker the moment
-            # its copy loop is live; the reader below picks that up on
-            # the main thread and resolves convergence True -- so the
-            # plugin result is only handed back once the bridge is
-            # actually draining worker_sock.  Failure paths still
-            # resolve convergence False directly from the worker.
-            ready_main, ready_worker = _socket.socketpair()
-            ready_main.setblocking(False)
-
-            def bridge_ready_cb():
-                try:
-                    ready_main.recv(1)
-                except OSError:
-                    pass
-                try:
-                    loop.remove_reader(ready_main.fileno())
-                except (OSError, ValueError):
-                    pass
-                signal_convergence(True)
-
-            loop.add_reader(ready_main.fileno(), bridge_ready_cb)
 
             worker_fut = loop.run_in_executor(None, punch_and_bridge)
 
@@ -772,17 +745,6 @@ class UdpPunchPlugin(Plugin):
                 # gets a None instead of hanging on plugin timeout.
                 if not convergence.done():
                     convergence.set_result(False)
-                # The worker has exited -- selector_proxy is done with
-                # ready_worker.  Drop the reader and close both ends.
-                try:
-                    loop.remove_reader(ready_main.fileno())
-                except (OSError, ValueError):
-                    pass
-                for s in (ready_main, ready_worker):
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
             worker_fut.add_done_callback(worker_done)
 
             if pipe is not None:
