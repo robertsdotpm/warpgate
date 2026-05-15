@@ -103,7 +103,18 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
         nonce, id(pipe), type(pipe).__name__,
     ))
 
-    attempts = retries if transport == UDP else 1
+    # Both TCP and UDP retry.  TCP retries are NOT for datagram loss
+    # (TCP handles that) -- they cover the warm-up gap on a freshly
+    # punched pipe.  The punch bridges the raw socket through a
+    # loopback reverse_server; on slower hosts (Win7/10/11/Server) the
+    # inbound bridge isn't pumping bytes into node_protocol until a
+    # few hundred ms after the pipe is handed back.  A single 500ms
+    # PING shot fired the instant verify starts can land entirely
+    # inside that gap -- the listener sends its PONG fine, but the
+    # connector's bridge hasn't started delivering inbound yet, so the
+    # PONG future never resolves and a perfectly good pipe is rejected.
+    # Re-sending the PING across `retries` attempts spans the warm-up.
+    attempts = retries
     try:
         for attempt in range(attempts):
             try:
