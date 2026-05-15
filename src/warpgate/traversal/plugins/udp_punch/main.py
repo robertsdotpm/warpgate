@@ -24,7 +24,9 @@ from ....protocol.proto_defs import P2P_PUNCH
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
-from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
+from ..tcp_punch.boundary_lib import (
+    FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, compute_rendezvous,  # noqa: F401
+)
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
@@ -261,36 +263,35 @@ class UdpPunchPlugin(Plugin):
 
         timestamp = self.sys_clock.time()
         puncher.set_timestamp(timestamp)
-        p = puncher.params
-        _, punch_time = compute_rendezvous(
-            timestamp,
-            window=p["window"],
-            min_run_window=p["min_run_window"],
-            max_error=p["max_clock_error"],
-        )
-        # Two-bucket overlap dual-fire: a peer pair whose
-        # compute_rendezvous calls land on opposite sides of a bucket
-        # boundary picks adjacent buckets; their {primary, primary+1}
-        # candidate sets always overlap on exactly one common bucket.
-        # Firing at both rendezvous in sequence guarantees we hit the
-        # overlap regardless of which side forked.  Mirrors tcp_punch.
-        secondary_punch_time = punch_time + p["window"]
-        puncher.set_punch_time(punch_time, secondary_punch_time=secondary_punch_time)
-        # n=2 with n_per_bucket=1 (boundary_port_alloc's shape for
-        # n=2): one port from the primary bucket, one from primary+1,
-        # giving 2 sockets per side. Two peers whose
-        # compute_rendezvous calls land on opposite sides of the
-        # min_run_window cutoff pick adjacent buckets {B, B+1} and
-        # {B+1, B+2}; the sets overlap on exactly ONE bucket
-        # (B+1) -> exactly ONE matching port pair across both peers.
-        # All other sockets fire at non-existent peer ports and hear
-        # nothing, so watch_for_winner has only one candidate to
-        # converge on -- no first-CONFIRM-mismatch risk. The
-        # mismatch concern that justified n=1 historically only
-        # applies when n_per_bucket >= 2 (multiple matching pairs
-        # per bucket give an actual race); at 1 port per bucket the
-        # winner is deterministic on both sides.
-        puncher.add_port_allocator(boundary_port_alloc, n=2)
+
+        # NTP-pinned future start (ported from tcp_punch).  The
+        # connector picks ONE absolute punch moment and ships it in the
+        # outgoing PunchMsg; the listener reads it back out of
+        # payload.ntp and uses it verbatim.  This replaces
+        # compute_rendezvous bucket math, whose independent per-peer
+        # quantisation forked when two peers' calls straddled a bucket
+        # boundary -- the pair then fired seconds apart and zero
+        # sockets converged.  One shared punch_time = no fork.
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.
+            punch_time = timestamp + PLUGIN_PIN_OFFSET
+        puncher.set_punch_time(punch_time)
+
+        # n=1, single socket per side.  The old n=2 two-bucket overlap
+        # existed only to survive the bucket-fork: forked peers picked
+        # {B,B+1} and {B+1,B+2}, overlapping on exactly one bucket, so
+        # n=2 guaranteed one matching pair.  With NTP-pin there is no
+        # fork -- both peers derive identical buckets -- so n=2 would
+        # instead yield TWO matching pairs, and UDP's first-CONFIRM-
+        # wins race is only safe with exactly ONE candidate socket per
+        # side.  n=1 restores that single deterministic candidate.
+        # Seeded with punch_time so both peers (sharing punch_time
+        # verbatim) derive the same bucket regardless of local-clock
+        # skew between their create_puncher calls.
+        puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
 
         return puncher, stuns
 
