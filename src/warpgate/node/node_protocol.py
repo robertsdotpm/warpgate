@@ -155,6 +155,10 @@ async def node_protocol(node, msg, client_tup, pipe):
             nonce = msg[len(WG_LIVENESS_PONG_PREFIX):nl]
             msg = msg[nl + 1:]
         futures = getattr(pipe, "liveness_pong_futures", None)
+        reg = sorted(futures.keys()) if futures else None
+        log("[LIVENESS] PONG recv nonce={0} pipe_id={1} registered={2}".format(
+            nonce, id(pipe), reg,
+        ))
         if futures is not None:
             fut = futures.get(nonce)
             if fut is not None and not fut.done():
@@ -179,10 +183,15 @@ async def node_protocol(node, msg, client_tup, pipe):
             await pipe.send(
                 WG_LIVENESS_PONG_PREFIX + nonce + b"\n", client_tup,
             )
-        except (OSError, ConnectionError, asyncio.TimeoutError):
+            log("[LIVENESS] PING recv nonce={0} pipe_id={1}; PONG sent ok".format(
+                nonce, id(pipe),
+            ))
+        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
             # Best-effort: if the pipe died between PING arrival and
             # PONG send, the initiator's verify will time out anyway.
-            pass
+            log("[LIVENESS] PING recv nonce={0} pipe_id={1}; PONG send FAILED {2}".format(
+                nonce, id(pipe), repr(exc),
+            ))
         if not msg:
             return
 

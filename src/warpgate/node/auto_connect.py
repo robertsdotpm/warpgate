@@ -99,6 +99,9 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     loop = asyncio.get_event_loop()
     pong_fut = loop.create_future()
     register_liveness_pong_future(pipe, nonce, pong_fut)
+    log("[LIVENESS] verify registered nonce={0} pipe_id={1} pipe_type={2}".format(
+        nonce, id(pipe), type(pipe).__name__,
+    ))
 
     attempts = retries if transport == UDP else 1
     try:
