@@ -430,12 +430,22 @@ class PunchPlugin(Plugin):
         # the listener within seconds.  Each one re-enters run() and
         # lands here; nat_alloc.port_alloc() walks a state machine
         # that asserts on invalid progressions, so the second call
-        # raises AssertionError.  Drop duplicates once port_allocs is
-        # already populated.
-        if recv_mappings is not None and puncher.port_allocs:
+        # raises AssertionError.  Drop those duplicates.
+        #
+        # The discriminator MUST be "have we already folded the peer's
+        # mappings?" -- NOT "is puncher.port_allocs non-empty?".
+        # setup_puncher_client runs add_port_allocator(boundary_port_alloc)
+        # which fills port_allocs with 16 boundary entries BEFORE
+        # advance_punching_protocol is ever reached, so the old
+        # port_allocs check fired on the very first legitimate call,
+        # returned None without folding the peer mappings, and never
+        # resolved mapping_reply -- stalling the listener's worker for
+        # the full reply_delay (observed: 2 s wasted, punch fired
+        # unsynced, verify_pipe_alive failed on every Windows VM).
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
             log(fstr(
                 "[TCP-PUNCH] advance_punching_protocol: duplicate reply "
-                "ignored (port_allocs already populated, plugin_id={0})",
+                "ignored (peer mappings already folded, plugin_id={0})",
                 (self.plugin_id,),
             ))
             return None
@@ -443,6 +453,13 @@ class PunchPlugin(Plugin):
         # Compute the next round of port predictions.
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+
+        # Mark that the peer's mappings have now been folded.  The
+        # re-entry guard above keys off this so subsequent duplicate
+        # republishes are dropped without re-walking the nat_alloc
+        # state machine.
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
 
         # Signal the worker-spawn task: the peer's mappings have been
         # folded in and port_allocs is now valid.  Guarded by not done()
