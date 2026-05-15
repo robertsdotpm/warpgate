@@ -49,6 +49,21 @@ BASE_PORT = 2024
 # bucket math because there's no PunchMsg exchange to communicate a
 # pinned time -- both sides must derive it independently from NTP.
 PLUGIN_PIN_OFFSET = 1.0
+
+# Predictor-path NTP-pin offset.  PLUGIN_PIN_OFFSET above is sized for
+# the boundary-allocator fast path, where the listener does ZERO STUN
+# between receiving the PunchMsg and firing -- just build the
+# PunchClient and bind sockets (~few hundred ms).  When either NAT has
+# a non-deterministic delta (INDEPENDENT / DEPENDENT / RANDOM /
+# PRESERV) boundary_port_alloc is skipped and the punch relies on the
+# STUN NAT predictor: the listener must run preload_mappings (3 STUN
+# round trips) plus get_single_mapping before it can fire.  That work
+# does not fit inside PLUGIN_PIN_OFFSET, so the predictor path uses a
+# larger offset.  3.0 s covers signal RTT + 3 concurrent STUN RTTs +
+# prediction compute + socket binds with margin; tune from measured
+# [PUNCH-STAGE] run_enter -> run_engine_enter spans on real
+# predictor-path punches rather than guessing further.
+PLUGIN_PIN_OFFSET_PREDICT = 3.0
 # Wider sample space than the original 20000 -- combined with the lower
 # BASE_PORT this gives the allocator the full user-port range (~2k-52k),
 # which makes collisions across back-to-back runs in the same NTP bucket

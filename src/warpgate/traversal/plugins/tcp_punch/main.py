@@ -50,7 +50,10 @@ import time
 from aionetiface import log, fstr, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
 from ....protocol.proto_defs import P2P_PUNCH
 from .proto import PunchMsg
-from .boundary_lib import FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, compute_rendezvous  # noqa: F401
+from .boundary_lib import (
+    FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, PLUGIN_PIN_OFFSET_PREDICT,
+    compute_rendezvous,  # noqa: F401
+)
 from .punch_client import PunchClient
 from .boundary_alloc import boundary_port_alloc
 from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
@@ -330,17 +333,6 @@ class PunchPlugin(Plugin):
         # The CLI standalone path in punch_client.py __main__ keeps
         # compute_rendezvous because it has no PunchMsg channel to
         # communicate the pin.
-        timestamp = self.sys_clock.time()
-        if reply is not None and getattr(reply.payload, "ntp", 0):
-            # Listener: take the connector's pinned moment verbatim.
-            punch_time = float(reply.payload.ntp)
-        else:
-            # Connector: pin a near-future absolute moment.
-            punch_time = timestamp + PLUGIN_PIN_OFFSET
-
-        puncher.set_timestamp(timestamp)
-        puncher.set_punch_time(punch_time)
-
         # boundary_port_alloc derives the punch ports deterministically
         # from the time bucket.  That only matches the peer's actual
         # external ports when BOTH NATs allocate predictably:
@@ -352,12 +344,32 @@ class PunchPlugin(Plugin):
         # In that case skip it entirely and rely solely on the STUN-
         # driven NAT predictor (advance_punching_protocol ->
         # nat_alloc.port_alloc), which measures the live mapping.
+        #
+        # The same flag picks the NTP-pin offset: the predictor path
+        # makes the listener run 3 STUN round trips before it can fire,
+        # which does not fit inside the boundary path's PLUGIN_PIN_OFFSET
+        # -- so it gets the larger PLUGIN_PIN_OFFSET_PREDICT.
         src_delta = (self.src.get("nat") or {}).get("delta") or {}
         dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
         boundary_ok = (
             src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
             and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
         )
+        pin_offset = PLUGIN_PIN_OFFSET if boundary_ok else PLUGIN_PIN_OFFSET_PREDICT
+
+        timestamp = self.sys_clock.time()
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.  Offset is
+            # bigger on the predictor path so the listener's STUN
+            # predict finishes before punch_time.
+            punch_time = timestamp + pin_offset
+
+        puncher.set_timestamp(timestamp)
+        puncher.set_punch_time(punch_time)
+
         if boundary_ok:
             # Seed boundary_port_alloc with punch_time -- since both
             # peers take punch_time verbatim (connector picks, listener
