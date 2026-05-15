@@ -51,7 +51,7 @@ from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
 
 
-async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3):
+async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3):
     """Round-trip a WG-LIVENESS-PING over *pipe* and return True iff the
     matching PONG comes back within the budget.
 
@@ -76,8 +76,18 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=0.5, retries=3)
     loops up to ``retries`` times, re-sending the PING with a fresh
     timeout each iteration -- a UDP datagram lost in either direction
     would otherwise false-negative this entire check on the first
-    attempt.  Per-try budget stays small (default 500ms) so even the
-    full retries=3 worst case only costs ~1.5s on a dead pipe.
+    attempt.
+
+    per_try_timeout default is 3.0s.  It was 500ms, which false-negated
+    healthy tcp_punch pipes: timestamped logs measured the liveness
+    PING->PONG round trip at ~490ms on a freshly punched pipe -- not
+    network latency (LAN RTT is single-digit ms) but the post-punch
+    busy window, where both nodes are still tearing down the 18-socket
+    engine, running NAT classification, and processing MQTT signals,
+    so the PING queues behind that work before node_protocol peels it.
+    490ms sat right on the 500ms edge and flapped run to run.  3.0s
+    clears the post-punch window with margin while still rejecting a
+    genuinely dead pipe quickly enough for the cascade to fall through.
 
     Returns True on the first matching PONG, False on timeout or send
     error.  The caller should ``close_plugin`` the pipe and continue
