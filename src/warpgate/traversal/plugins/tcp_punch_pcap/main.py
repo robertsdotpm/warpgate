@@ -301,18 +301,25 @@ class PunchPcapPlugin(Plugin):
                 log("tcp_punch_pcap: peer sent empty mappings; dropping")
                 return None
 
-        # Re-entry guard: same as tcp_punch / udp_punch.  See those
-        # plugins for the full rationale.
-        if recv_mappings is not None and puncher.port_allocs:
+        # Re-entry guard: same as tcp_punch / udp_punch.  Keyed on a
+        # peer_mappings_folded flag, NOT puncher.port_allocs -- the
+        # allocator runs in setup before advance is ever reached, so a
+        # port_allocs check false-fires on the first legitimate call
+        # (returns None without folding the peer mappings, never
+        # resolves mapping_reply).  See tcp_punch for the full
+        # rationale.
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
             log(fstr(
                 "tcp_punch_pcap: duplicate reply ignored "
-                "(port_allocs already populated, plugin_id={0})",
+                "(peer mappings already folded, plugin_id={0})",
                 (self.plugin_id,),
             ))
             return None
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
 
         # Signal the pcap-engine task: peer's mappings have been folded
         # in and port_allocs is now valid.  Guarded by not done() so
