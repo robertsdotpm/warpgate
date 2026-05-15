@@ -17,6 +17,7 @@ so the orchestrator can grep a single stable shape per iteration.
 import asyncio
 import os
 import sys
+import time
 
 from aionetiface import aionetiface_setup_event_loop, IP4, IP6
 aionetiface_setup_event_loop()
@@ -82,6 +83,13 @@ async def main():
         print("OUTCOME winner_pipe={0}".format(winner), flush=True)
         ok = False
         msg = None
+        # WG_HOLD_SECONDS: after the first echo, keep ping/ponging over
+        # the same pipe for this many seconds and report exactly when
+        # (if) it dies.  A one-shot echo cannot tell a durable pipe
+        # from one that RSTs ~1s later -- this does.  Used to check
+        # whether XP's tcpip.sys delayed RST kills the pipe after the
+        # quick echo squeaks through.
+        hold_s = float(os.environ.get("WG_HOLD_SECONDS", "0") or "0")
         try:
             async with link:
                 await link.send(b"PING:gate_sweep")
@@ -92,6 +100,36 @@ async def main():
 
                 msg = await asyncio.wait_for(one(), timeout=10.0)
                 ok = msg is not None and msg.startswith(b"PONG:")
+
+                if ok and hold_s > 0:
+                    t0 = time.monotonic()
+                    rnd = 0
+                    last_ok = 0.0
+                    hold_err = None
+                    while time.monotonic() - t0 < hold_s:
+                        rnd += 1
+                        try:
+                            await link.send(
+                                b"PING:hold-" + str(rnd).encode("ascii")
+                            )
+                            hm = await asyncio.wait_for(one(), timeout=10.0)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # pylint: disable=broad-except
+                            hold_err = repr(exc)
+                            break
+                        if hm is None or not hm.startswith(b"PONG:"):
+                            hold_err = "bad-reply:{0}".format(hm)
+                            break
+                        last_ok = time.monotonic() - t0
+                        await asyncio.sleep(1.0)
+                    print(
+                        "OUTCOME hold_target={0}s hold_rounds={1} "
+                        "hold_last_ok={2:.1f}s hold_err={3}".format(
+                            hold_s, rnd, last_ok, hold_err,
+                        ),
+                        flush=True,
+                    )
         except asyncio.TimeoutError:
             pass
         except asyncio.CancelledError:
