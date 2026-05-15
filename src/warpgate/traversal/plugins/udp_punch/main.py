@@ -25,8 +25,10 @@ from ...traversal_plugin import Plugin
 from ...strategy_registry import register
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
 from ..tcp_punch.boundary_lib import (
-    FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, compute_rendezvous,  # noqa: F401
+    FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, PLUGIN_PIN_OFFSET_PREDICT,
+    compute_rendezvous,  # noqa: F401
 )
+from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
@@ -272,26 +274,56 @@ class UdpPunchPlugin(Plugin):
         # quantisation forked when two peers' calls straddled a bucket
         # boundary -- the pair then fired seconds apart and zero
         # sockets converged.  One shared punch_time = no fork.
+        #
+        # boundary_port_alloc derives ports deterministically from the
+        # time bucket; that only matches the peer's real external
+        # ports when BOTH NATs allocate predictably (EQUAL_DELTA, or
+        # NA_DELTA = no NAT).  For INDEPENDENT / DEPENDENT / RANDOM /
+        # PRESERV deltas the bucket-derived ports are wrong, so the
+        # boundary allocator is skipped and the punch relies solely on
+        # the STUN NAT predictor (advance_punching_protocol ->
+        # nat_alloc.port_alloc).  The same flag picks the pin offset:
+        # the predictor path runs 3 STUN round trips on the listener
+        # before it can fire, which does not fit in PLUGIN_PIN_OFFSET,
+        # so it gets the larger PLUGIN_PIN_OFFSET_PREDICT.  Mirrors
+        # tcp_punch.setup_puncher_client.
+        src_delta = (self.src.get("nat") or {}).get("delta") or {}
+        dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
+        boundary_ok = (
+            src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+            and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+        )
+        pin_offset = PLUGIN_PIN_OFFSET if boundary_ok else PLUGIN_PIN_OFFSET_PREDICT
+
         if reply is not None and getattr(reply.payload, "ntp", 0):
             # Listener: take the connector's pinned moment verbatim.
             punch_time = float(reply.payload.ntp)
         else:
             # Connector: pin a near-future absolute moment.
-            punch_time = timestamp + PLUGIN_PIN_OFFSET
+            punch_time = timestamp + pin_offset
         puncher.set_punch_time(punch_time)
 
-        # n=1, single socket per side.  The old n=2 two-bucket overlap
-        # existed only to survive the bucket-fork: forked peers picked
-        # {B,B+1} and {B+1,B+2}, overlapping on exactly one bucket, so
-        # n=2 guaranteed one matching pair.  With NTP-pin there is no
-        # fork -- both peers derive identical buckets -- so n=2 would
-        # instead yield TWO matching pairs, and UDP's first-CONFIRM-
-        # wins race is only safe with exactly ONE candidate socket per
-        # side.  n=1 restores that single deterministic candidate.
-        # Seeded with punch_time so both peers (sharing punch_time
-        # verbatim) derive the same bucket regardless of local-clock
-        # skew between their create_puncher calls.
-        puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        if boundary_ok:
+            # n=1, single socket per side.  The old n=2 two-bucket
+            # overlap existed only to survive the bucket-fork: forked
+            # peers picked {B,B+1} and {B+1,B+2}, overlapping on
+            # exactly one bucket, so n=2 guaranteed one matching pair.
+            # With NTP-pin there is no fork -- both peers derive
+            # identical buckets -- so n=2 would instead yield TWO
+            # matching pairs, and UDP's first-CONFIRM-wins race is
+            # only safe with exactly ONE candidate socket per side.
+            # n=1 restores that single deterministic candidate.
+            # Seeded with punch_time so both peers (sharing punch_time
+            # verbatim) derive the same bucket regardless of local-
+            # clock skew between their create_puncher calls.
+            puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        else:
+            log(fstr(
+                "[UDP-PUNCH] non-deterministic NAT delta "
+                "(src={0} dest={1}); skipping boundary_port_alloc, "
+                "using STUN NAT predictor only",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
 
         return puncher, stuns
 
@@ -364,20 +396,28 @@ class UdpPunchPlugin(Plugin):
         # is stateful (NATPredictAlloc walks a state machine that
         # asserts on invalid progressions) and a second call fires
         # `AssertionError("Invalid nat predict state progression.")`.
-        # By the time the second reply arrives we've already folded
-        # the first one's mappings into puncher.port_allocs and the
-        # engine task is in-flight; the duplicate has nothing to
-        # contribute, so drop it before it crashes the predictor.
-        if recv_mappings is not None and puncher.port_allocs:
+        # Drop the duplicate before it crashes the predictor.
+        #
+        # The discriminator MUST be "have we already folded the peer's
+        # mappings?" -- NOT "is puncher.port_allocs non-empty?".
+        # setup_puncher runs add_port_allocator(boundary_port_alloc)
+        # which fills port_allocs BEFORE advance_punching_protocol is
+        # ever reached, so the old port_allocs check fired on the very
+        # first legitimate call, returned None without folding the
+        # peer mappings, and never resolved mapping_reply.  Same bug
+        # fixed in tcp_punch.
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
             log(fstr(
                 "[UDP-PUNCH] advance_punching_protocol: duplicate reply "
-                "ignored (port_allocs already populated, plugin_id={0})",
+                "ignored (peer mappings already folded, plugin_id={0})",
                 (self.plugin_id,),
             ))
             return None
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
 
         # Signal the engine task: the peer's mappings have been folded
         # in and port_allocs is now valid for spawning the worker.
