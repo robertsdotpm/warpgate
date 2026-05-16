@@ -24,13 +24,13 @@ from ....protocol.proto_defs import P2P_PUNCH
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
-from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
+from ..tcp_punch.boundary_lib import compute_rendezvous
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
 from .proto import UdpPunchMsg
-from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN
+from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN, UDP_PUNCH_PARAMS
 from .udp_punch_engine import drain_punch_residue, udp_punch_engine
 
 
@@ -91,7 +91,7 @@ class UdpPunchPlugin(Plugin):
             if peer_tx:
                 peer_unc = float(getattr(reply.payload, "clock_uncertainty", 0.0))
                 our_unc = float(getattr(self.sys_clock, "uncertainty", 0.0))
-                max_err = FAST_PUNCH_PARAMS.get("max_clock_error", 4)
+                max_err = UDP_PUNCH_PARAMS.get("max_clock_error", 4)
                 our_now = int(self.sys_clock.time())
                 SIGNAL_LATENCY_BUDGET = 10
                 budget = our_unc + peer_unc + max_err + SIGNAL_LATENCY_BUDGET
@@ -237,7 +237,7 @@ class UdpPunchPlugin(Plugin):
             decider_ip,
             self.nic.get_nic_id(self.af),
             same_machine=self.same_machine,
-            params=FAST_PUNCH_PARAMS,
+            params=UDP_PUNCH_PARAMS,
             our_os=(self.src_map.get("os") if self.src_map else None),
             their_os=(self.dest_map.get("os") if self.dest_map else None),
         )
