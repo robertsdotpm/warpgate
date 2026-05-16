@@ -546,6 +546,15 @@ class UdpPunchPlugin(Plugin):
                     self.result.set_result(None)
                 return
 
+            # Hand the wrapped Pipe to close() so teardown can shut the
+            # asyncio UDP datagram transport down through its own
+            # .close() -- which unregisters the loop reader. Raw
+            # sock.close() on listener_sock (which the transport owns)
+            # leaves the transport registered and the connector's loop
+            # spins recvfrom -> EBADF every iteration, starving the
+            # tcp_punch winner pipe's reader.
+            self.bridge_pipe = pipe
+
             try:
                 wrapped_addr = pipe.sock.getsockname()
             except (OSError, AttributeError):
@@ -853,7 +862,31 @@ class UdpPunchPlugin(Plugin):
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Close the wrapped UDP Pipe through its own .close() so the
+        # asyncio datagram transport unregisters its event-loop reader.
+        # Raw-closing listener_sock (the transport's fd) instead leaves
+        # a dead fd registered and the connector's loop EBADF-storms
+        # recvfrom every iteration, starving the tcp_punch winner pipe.
+        pipe = getattr(self, "bridge_pipe", None)
+        wrapped_sock = getattr(pipe, "sock", None) if pipe is not None else None
+        if pipe is not None:
+            try:
+                await pipe.close()
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ConnectionError, asyncio.TimeoutError):
+                pass
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
+            self.bridge_pipe = None
+
+        # worker_sock is the genuinely-raw selector_proxy end -- no
+        # asyncio transport owns it, so a plain close() is correct.
+        # listener_sock is owned by the Pipe closed above and must NOT
+        # be raw-closed here.
         for sock in getattr(self, "bridge_socks", []):
+            if wrapped_sock is not None and sock is wrapped_sock:
+                continue
             try:
                 sock.close()
             except OSError:
