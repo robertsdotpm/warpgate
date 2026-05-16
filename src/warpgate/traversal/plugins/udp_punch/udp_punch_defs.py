@@ -35,30 +35,28 @@ UDP_PUNCH_FRAME_LEN = 4 + 1 + UDP_PUNCH_NONCE_LEN  # 21
 # other reads, and any retune of FAST_PUNCH_PARAMS for tcp_punch
 # silently changes udp_punch too.  A separate dict decouples them.
 #
-# Values are the PRE-tightening profile -- the timings udp_punch ran
-# the matrix on historically (full_sweep_v4 9/9):
-#   window=10 / max_clock_error=4 / min_run_window=3 -- the bucket
-#     rendezvous udp_punch's compute_rendezvous path was designed for;
-#     worst-case wait = window + max_clock_error = 14 s.
-#   connect_timeout / monitor_timeout = 3.0 -- udp_punch's 18-socket
-#     50 Hz spray flaked at 2.0 s on busy hosts (executor thread
-#     couldn't keep up under MQTT churn); 3.0 s was the fix.  The
-#     1.5 s tcp_punch tightened to is a tcp_punch-only profile.
-# tcp_punch's FAST_PUNCH_PARAMS stays tight; udp_punch stays on the
-# proven profile until its own optimisation pass is redone.
+# Values now mirror tcp_punch's tight FAST_PUNCH_PARAMS profile
+# (window=3 / max_clock_error=1 / min_run_window=1, connect_timeout
+# and monitor_timeout = 1.5).  The pre-tightening profile (10/4/3 +
+# 3.0s timeouts) was sized for udp_punch's old 18-socket 50 Hz spray,
+# whose executor thread couldn't keep up with a 2.0 s window under
+# MQTT churn.  The NTP-pin re-apply dropped the boundary allocator to
+# n=1 -- a single socket per side -- so that spray-load reason is
+# gone, and the tight 1.5 s timeouts apply.  The dict stays separate
+# from FAST_PUNCH_PARAMS purely for the by-reference mutation hazard
+# above; the values are intentionally kept in sync for now.
 from ..tcp_punch.boundary_lib import derive_max_sleep  # noqa: E402
 
 UDP_PUNCH_PARAMS = {
-    "window": 10,
-    "max_clock_error": 4,
-    "min_run_window": 3,
-    "connect_timeout": 3.0,
-    "monitor_timeout": 3.0,
+    "window": 3,
+    "max_clock_error": 1,
+    "min_run_window": 1,
+    "connect_timeout": 1.5,
+    "monitor_timeout": 1.5,
     "retry_interval": 0.05,
     "reply_delay": 2,
 }
-# derive_max_sleep(10, 4) = 10 + 4 + 2 slack = 16, matching the old
-# hard-coded max_sleep=16 in the pre-session FAST_PUNCH_PARAMS.
+# derive_max_sleep(3, 1) -- matches FAST_PUNCH_PARAMS's derived value.
 UDP_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
     UDP_PUNCH_PARAMS["window"], UDP_PUNCH_PARAMS["max_clock_error"],
 )
