@@ -24,7 +24,11 @@ from ....protocol.proto_defs import P2P_PUNCH
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
-from ..tcp_punch.boundary_lib import compute_rendezvous
+from ..tcp_punch.boundary_lib import (
+    PLUGIN_PIN_OFFSET, PLUGIN_PIN_OFFSET_PREDICT,
+    compute_rendezvous,  # noqa: F401
+)
+from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
@@ -261,36 +265,65 @@ class UdpPunchPlugin(Plugin):
 
         timestamp = self.sys_clock.time()
         puncher.set_timestamp(timestamp)
-        p = puncher.params
-        _, punch_time = compute_rendezvous(
-            timestamp,
-            window=p["window"],
-            min_run_window=p["min_run_window"],
-            max_error=p["max_clock_error"],
+
+        # NTP-pinned future start (ported from tcp_punch).  The
+        # connector picks ONE absolute punch moment and ships it in the
+        # outgoing PunchMsg; the listener reads it back out of
+        # payload.ntp and uses it verbatim.  This replaces
+        # compute_rendezvous bucket math, whose independent per-peer
+        # quantisation forked when two peers' calls straddled a bucket
+        # boundary -- the pair then fired seconds apart and zero
+        # sockets converged.  One shared punch_time = no fork.
+        #
+        # boundary_port_alloc derives ports deterministically from the
+        # time bucket; that only matches the peer's real external
+        # ports when BOTH NATs allocate predictably (EQUAL_DELTA, or
+        # NA_DELTA = no NAT).  For INDEPENDENT / DEPENDENT / RANDOM /
+        # PRESERV deltas the bucket-derived ports are wrong, so the
+        # boundary allocator is skipped and the punch relies solely on
+        # the STUN NAT predictor (advance_punching_protocol ->
+        # nat_alloc.port_alloc).  The same flag picks the pin offset:
+        # the predictor path runs 3 STUN round trips on the listener
+        # before it can fire, which does not fit in PLUGIN_PIN_OFFSET,
+        # so it gets the larger PLUGIN_PIN_OFFSET_PREDICT.  Mirrors
+        # tcp_punch.setup_puncher_client.
+        src_delta = (self.src.get("nat") or {}).get("delta") or {}
+        dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
+        boundary_ok = (
+            src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+            and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
         )
-        # Two-bucket overlap dual-fire: a peer pair whose
-        # compute_rendezvous calls land on opposite sides of a bucket
-        # boundary picks adjacent buckets; their {primary, primary+1}
-        # candidate sets always overlap on exactly one common bucket.
-        # Firing at both rendezvous in sequence guarantees we hit the
-        # overlap regardless of which side forked.  Mirrors tcp_punch.
-        secondary_punch_time = punch_time + p["window"]
-        puncher.set_punch_time(punch_time, secondary_punch_time=secondary_punch_time)
-        # n=2 with n_per_bucket=1 (boundary_port_alloc's shape for
-        # n=2): one port from the primary bucket, one from primary+1,
-        # giving 2 sockets per side. Two peers whose
-        # compute_rendezvous calls land on opposite sides of the
-        # min_run_window cutoff pick adjacent buckets {B, B+1} and
-        # {B+1, B+2}; the sets overlap on exactly ONE bucket
-        # (B+1) -> exactly ONE matching port pair across both peers.
-        # All other sockets fire at non-existent peer ports and hear
-        # nothing, so watch_for_winner has only one candidate to
-        # converge on -- no first-CONFIRM-mismatch risk. The
-        # mismatch concern that justified n=1 historically only
-        # applies when n_per_bucket >= 2 (multiple matching pairs
-        # per bucket give an actual race); at 1 port per bucket the
-        # winner is deterministic on both sides.
-        puncher.add_port_allocator(boundary_port_alloc, n=2)
+        pin_offset = PLUGIN_PIN_OFFSET if boundary_ok else PLUGIN_PIN_OFFSET_PREDICT
+
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.
+            punch_time = timestamp + pin_offset
+        puncher.set_punch_time(punch_time)
+
+        if boundary_ok:
+            # n=1, single socket per side.  The old n=2 two-bucket
+            # overlap existed only to survive the bucket-fork: forked
+            # peers picked {B,B+1} and {B+1,B+2}, overlapping on
+            # exactly one bucket, so n=2 guaranteed one matching pair.
+            # With NTP-pin there is no fork -- both peers derive
+            # identical buckets -- so n=2 would instead yield TWO
+            # matching pairs, and UDP's first-CONFIRM-wins race is
+            # only safe with exactly ONE candidate socket per side.
+            # n=1 restores that single deterministic candidate.
+            # Seeded with punch_time so both peers (sharing punch_time
+            # verbatim) derive the same bucket regardless of local-
+            # clock skew between their create_puncher calls.
+            puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        else:
+            log(fstr(
+                "[UDP-PUNCH] non-deterministic NAT delta "
+                "(src={0} dest={1}); skipping boundary_port_alloc, "
+                "using STUN NAT predictor only",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
 
         return puncher, stuns
 
@@ -363,20 +396,28 @@ class UdpPunchPlugin(Plugin):
         # is stateful (NATPredictAlloc walks a state machine that
         # asserts on invalid progressions) and a second call fires
         # `AssertionError("Invalid nat predict state progression.")`.
-        # By the time the second reply arrives we've already folded
-        # the first one's mappings into puncher.port_allocs and the
-        # engine task is in-flight; the duplicate has nothing to
-        # contribute, so drop it before it crashes the predictor.
-        if recv_mappings is not None and puncher.port_allocs:
+        # Drop the duplicate before it crashes the predictor.
+        #
+        # The discriminator MUST be "have we already folded the peer's
+        # mappings?" -- NOT "is puncher.port_allocs non-empty?".
+        # setup_puncher runs add_port_allocator(boundary_port_alloc)
+        # which fills port_allocs BEFORE advance_punching_protocol is
+        # ever reached, so the old port_allocs check fired on the very
+        # first legitimate call, returned None without folding the
+        # peer mappings, and never resolved mapping_reply.  Same bug
+        # fixed in tcp_punch.
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
             log(fstr(
                 "[UDP-PUNCH] advance_punching_protocol: duplicate reply "
-                "ignored (port_allocs already populated, plugin_id={0})",
+                "ignored (peer mappings already folded, plugin_id={0})",
                 (self.plugin_id,),
             ))
             return None
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
 
         # Signal the engine task: the peer's mappings have been folded
         # in and port_allocs is now valid for spawning the worker.
@@ -713,15 +754,18 @@ class UdpPunchPlugin(Plugin):
                         (stale_drained, stale_errors),
                     ))
 
-                # Bridge is wired; let main resolve plugin.result so
-                # the demo can start sending ECHO and have it actually
-                # land on punched_sock.
+                # Hand off to selector_proxy.  Convergence is NOT
+                # signalled here -- selector_proxy fires ready_writer
+                # the moment its copy loop is live, and the main side's
+                # reader on the paired socket resolves convergence off
+                # that.  Signalling here (before the loop entered)
+                # raced: main resolved plugin.result and the demo's
+                # ECHO bytes queued in worker_sock with nobody draining
+                # them yet.  Mirrors tcp_punch's bridge-ready socketpair.
                 log(fstr(
                     "[UDP-WORKER] bridging punched <-> worker_sock {0}",
                     (worker_addr,),
                 ))
-                loop.call_soon_threadsafe(signal_convergence, True)
-
                 try:
                     selector_proxy(
                         punched_sock,
@@ -729,10 +773,34 @@ class UdpPunchPlugin(Plugin):
                         stop_reader,
                         sock_proto=_socket.SOCK_DGRAM,
                         socket_r=worker_sock,
+                        ready_writer=ready_worker,
                     )
                 except Exception:  # pylint: disable=broad-except
                     log_exception()
                 log("[UDP-WORKER] selector_proxy returned; worker exiting")
+
+            # Bridge-ready socketpair (ported from tcp_punch).
+            # selector_proxy writes one byte to ready_worker the moment
+            # its copy loop is live; the reader below picks that up on
+            # the main thread and resolves convergence True -- so the
+            # plugin result is only handed back once the bridge is
+            # actually draining worker_sock.  Failure paths still
+            # resolve convergence False directly from the worker.
+            ready_main, ready_worker = _socket.socketpair()
+            ready_main.setblocking(False)
+
+            def bridge_ready_cb():
+                try:
+                    ready_main.recv(1)
+                except OSError:
+                    pass
+                try:
+                    loop.remove_reader(ready_main.fileno())
+                except (OSError, ValueError):
+                    pass
+                signal_convergence(True)
+
+            loop.add_reader(ready_main.fileno(), bridge_ready_cb)
 
             worker_fut = loop.run_in_executor(None, punch_and_bridge)
 
@@ -753,6 +821,17 @@ class UdpPunchPlugin(Plugin):
                 # gets a None instead of hanging on plugin timeout.
                 if not convergence.done():
                     convergence.set_result(False)
+                # The worker has exited -- selector_proxy is done with
+                # ready_worker.  Drop the reader and close both ends.
+                try:
+                    loop.remove_reader(ready_main.fileno())
+                except (OSError, ValueError):
+                    pass
+                for s in (ready_main, ready_worker):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
             worker_fut.add_done_callback(worker_done)
 
             if pipe is not None:
