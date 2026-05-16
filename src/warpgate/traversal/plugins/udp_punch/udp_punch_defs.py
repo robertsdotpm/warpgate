@@ -32,21 +32,33 @@ UDP_PUNCH_FRAME_LEN = 4 + 1 + UDP_PUNCH_NONCE_LEN  # 21
 # directly -- but PunchClient stores `self.params = params` by
 # reference, so a single module-level dict shared between the two
 # plugins means either plugin's PunchClient can mutate timing the
-# other reads.  A separate dict decouples them; the two plugins can
-# now be tuned -- and fail -- independently.  Values currently mirror
-# FAST_PUNCH_PARAMS exactly, so introducing this dict is a pure
-# decoupling with no behaviour change.
+# other reads, and any retune of FAST_PUNCH_PARAMS for tcp_punch
+# silently changes udp_punch too.  A separate dict decouples them.
+#
+# Values are the PRE-tightening profile -- the timings udp_punch ran
+# the matrix on historically (full_sweep_v4 9/9):
+#   window=10 / max_clock_error=4 / min_run_window=3 -- the bucket
+#     rendezvous udp_punch's compute_rendezvous path was designed for;
+#     worst-case wait = window + max_clock_error = 14 s.
+#   connect_timeout / monitor_timeout = 3.0 -- udp_punch's 18-socket
+#     50 Hz spray flaked at 2.0 s on busy hosts (executor thread
+#     couldn't keep up under MQTT churn); 3.0 s was the fix.  The
+#     1.5 s tcp_punch tightened to is a tcp_punch-only profile.
+# tcp_punch's FAST_PUNCH_PARAMS stays tight; udp_punch stays on the
+# proven profile until its own optimisation pass is redone.
 from ..tcp_punch.boundary_lib import derive_max_sleep  # noqa: E402
 
 UDP_PUNCH_PARAMS = {
-    "window": 3,
-    "max_clock_error": 1,
-    "min_run_window": 1,
-    "connect_timeout": 1.5,
-    "monitor_timeout": 1.5,
+    "window": 10,
+    "max_clock_error": 4,
+    "min_run_window": 3,
+    "connect_timeout": 3.0,
+    "monitor_timeout": 3.0,
     "retry_interval": 0.05,
     "reply_delay": 2,
 }
+# derive_max_sleep(10, 4) = 10 + 4 + 2 slack = 16, matching the old
+# hard-coded max_sleep=16 in the pre-session FAST_PUNCH_PARAMS.
 UDP_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
     UDP_PUNCH_PARAMS["window"], UDP_PUNCH_PARAMS["max_clock_error"],
 )
