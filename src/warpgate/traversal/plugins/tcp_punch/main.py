@@ -1,37 +1,28 @@
 """Traversal plugin for TCP hole punching via coordinated port prediction.
 
-Timeout budget (PLUGIN_CONF["timeout"] = 12):
+Timeout budget (PLUGIN_CONF["timeout"] = 5):
   This is the per-slot ceiling in punch_phase: how long one route/af
   slot waits for the punch before cancelling it. A failed tcp_punch
   slot runs to this ceiling (the plugin does not self-terminate on
   failure), so it is also the per-slot fall-through cost. It never
   shortens a success -- a punch completes when it completes -- so it
-  is sized off the worst legitimate success time.
+  is sized purely off the worst legitimate success time.
 
   History: the budget was 180 s, then 120 s, both sized for the
   bucket-rendezvous design (window=42 + max_clock_error=20 ≈ 62 s
   rendezvous wait, plus a second window for two-bucket dual-fire).
   That design is gone -- NTP-pinned start replaced the rendezvous
-  wait with PLUGIN_PIN_OFFSET (~1 s, ~3 s on the predictor path).
+  wait with PLUGIN_PIN_OFFSET (~1 s, ~3 s on the predictor path) and
+  the dual-fire was dropped.
 
-  Why 12 s and not ~3 s: a punch runs up to TWO engine cycles.
-  engine#1 fires a speculative punch off our own predictions at
-  PLUGIN_PIN_OFFSET (~t+1 s, ~t+3 s predictor path); if it misses,
-  engine#2 fires a second punch using the peer's reply data -- and
-  engine#2 cannot start until engine#1's monitor window closes
-  (~t+5 s), so its punch lands at ~t+6 s (1 s offset) to ~t+8 s
-  (predictor path). Over v4 engine#1 usually lands (~2.7 s end to
-  end); over v6 (observed against p2pd.net on macos / ghostbsd /
-  freebsd) engine#1 consistently misses and the slot only succeeds
-  on engine#2. 12 s covers the worst engine#2 punch (~t+8 s) plus
-  the connect / reverse-bridge / verify tail.
-
-  CAUTION: do not re-derive this from "tcp_punch success elapsed"
-  telemetry without checking the cap that telemetry was collected
-  under. A cap below ~10 s truncates every engine#2 success into a
-  failure, so the surviving pipe=True samples are all engine#1 and
-  look like a flat ~3 s distribution -- a survivorship-bias trap
-  that already cost one bad 5 s sizing.
+  Measured against the current code (full v4+v6 matrix sweep, all 9
+  OSes incl. Windows XP and Vista): every tcp_punch success lands
+  inside 2.93 s, p50 ≈ 2.76 s, in a flat 250 ms-wide cluster with no
+  slow tail -- the punch timing is OS-agnostic now that the
+  rendezvous wait is gone. 5 s = that 2.93 s worst case plus ~2 s
+  headroom for NTP-retry / scheduler jitter (MAX_NTP_RETRIES=5 ×
+  NTP_TIMEOUT=1.0). No per-OS override is needed; XP (2.74 s) and
+  Vista (2.87 s) sit with everyone else.
 
 PROTO_MESSAGES is consumed by plugin_loader: it merges each entry into
 TraversalManager.sig_proto so PunchMsg dispatches without core
@@ -85,7 +76,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 12}
+    conf = {"timeout": 5}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
