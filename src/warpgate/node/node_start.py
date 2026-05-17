@@ -104,11 +104,17 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
 
     # STUN clients + Router can run concurrently now that sys_clock
     # is established and can be passed into Router at construction.
+    # Each is wrapped so it marks when its own coroutine finishes --
+    # they still run concurrently, but the timeline shows which of the
+    # two dominates the parallel window.
+    async def timed_step(coro, label):
+        await coro
+        mark(label)
+
     await asyncio.gather(
-        load_p2p_stun_clients(node, out, cout),
-        setup_router_and_signal(node, kp, out, cout),
+        timed_step(load_p2p_stun_clients(node, out, cout), "stun"),
+        timed_step(setup_router_and_signal(node, kp, out, cout), "router"),
     )
-    mark("stun+router")
 
     await initialize_punch_coordination(node, out, cout)
     mark("punch_coord")
