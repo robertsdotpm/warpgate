@@ -10,7 +10,7 @@ from aionetiface import (
     fstr, log, log_exception, log_p2p, async_wrap_errors,
     IP4, IP6, OPEN_INTERNET, AFGroup, Interface, SysClock,
     list_interfaces, load_interfaces, parse_node_addr, make_node_addr,
-    field_wrap, dhash, create_task, Signing, os_id,
+    field_wrap, dhash, create_task, Signing, os_id, os_net_timeouts,
 )
 from aionetiface.nic.nat.nat_utils import nat_info
 from aionetiface.nic.nat.nat_cache import (
@@ -34,41 +34,10 @@ from ..traversal.plugin_loader import load_plugins
 from ..install_check import verify_sibling_installs
 
 
-# Per-OS timeouts (seconds) for the network-loading steps of node
-# startup. Windows XP and Vista have markedly slower TCP/IP stacks and
-# slower process shell-outs (netsh / wmic / ipconfig), so the modern
-# 4-10s budgets for interface enumeration and NAT classification
-# routinely starve there -- node_start never finishes and a connecting
-# peer sees READY_FAIL. Legacy Windows gets its own larger budgets.
-#
-#   interface_load -- passed as load_interfaces(timeout=); drives the
-#     per-NIC nic.start() enumeration cap.
-#   nat_load -- passed to nic.load_nat(); the STUN-driven NAT
-#     classification probe run by classify_nat_background.
-#
-# Values are deliberately generous -- a slow legacy host finishing
-# startup late beats one that never finishes. Retune once XP/Vista
-# startup has been measured directly.
-STARTUP_NET_TIMEOUTS = {
-    "default": {"interface_load": 4, "nat_load": 10},
-    "vista": {"interface_load": 10, "nat_load": 20},
-    "xp": {"interface_load": 16, "nat_load": 30},
-}
-
-
-def startup_net_timeouts():
-    """Return the {interface_load, nat_load} timeout profile for the local OS.
-
-    Keyed off os_id() of the host this node is running on -- XP/2000
-    and Vista get their own larger budgets; everything else uses the
-    modern default.
-    """
-    os_name = os_id() or ""
-    if "XP" in os_name or "2000" in os_name:
-        return STARTUP_NET_TIMEOUTS["xp"]
-    if "Vista" in os_name:
-        return STARTUP_NET_TIMEOUTS["vista"]
-    return STARTUP_NET_TIMEOUTS["default"]
+# Per-OS network-load timeouts come from aionetiface.os_net_timeouts()
+# -- one table (NET_TIMEOUTS) shared by node startup, STUN, and the
+# MQTT broker walk so XP/Vista get coherent budgets everywhere. Node
+# startup uses the interface_load and nat_load entries.
 
 
 # ==========================================
@@ -227,7 +196,7 @@ async def load_network_interfaces(node):
             # timeout scales up on XP/Vista (slow interface enum).
             node.ifs = await load_interfaces(
                 if_names, Interface, skip_nat=True,
-                timeout=startup_net_timeouts()["interface_load"],
+                timeout=os_net_timeouts()["interface_load"],
             )
         except asyncio.CancelledError:
             raise
@@ -298,7 +267,7 @@ async def classify_nat_background(node, out):
         before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
 
     # NAT classification timeout scales up on XP/Vista (slow stacks).
-    nat_timeout = startup_net_timeouts()["nat_load"]
+    nat_timeout = os_net_timeouts()["nat_load"]
     nat_by_nic = {}
     for nic in node.ifs:
         try:
