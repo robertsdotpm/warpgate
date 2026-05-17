@@ -327,38 +327,72 @@ async def close_idle_pipes(node):
         await asyncio.sleep(min(next_sleep, 5))
 
 
+# Cap on STUN probe sockets open at once across the whole interface
+# load.  Each (af, interface) job fires `pool` concurrent TCP probes;
+# with many dual-stack interfaces the naive all-at-once gather could
+# blow past the platform socket ceiling (the Windows selector event
+# loop tops out around 64, shared with broker + listen sockets).
+STUN_SOCKET_BUDGET = 32
+# Per-job pool ceiling -- the aggressive value used when there are few
+# interfaces and the budget comfortably covers them.
+STUN_POOL_MAX = 10
+
+
 async def load_stun_clients(ifs, limit=USE_MAP_NO):
-    """Concurrently load up to limit TCP STUN clients per AF per interface and return them indexed."""
+    """Load `limit` TCP STUN clients per AF per interface, indexed, within a socket budget.
+
+    Each (af, interface) job probes a pool of candidate STUN servers
+    concurrently.  To keep total concurrent sockets under
+    STUN_SOCKET_BUDGET: the per-job pool is divided down by the job
+    count (never below `limit`, since NAT-delta needs that many), and
+    the jobs themselves run in batches so concurrent pools never
+    exceed the budget.
+    """
     stun_clients = {IP4: {}, IP6: {}}
-    tasks = []
     stun_t0 = time.monotonic()
 
+    # Enumerate every (af, interface) job up front.
+    jobs = []
     for if_index in range(len(ifs)):
         interface = ifs[if_index]
         for af in interface.supported():
+            jobs.append((af, if_index, interface))
+    if not jobs:
+        return stun_clients
 
-            async def job(af=af, if_index=if_index, interface=interface):
-                """Fetch STUN clients for one (af, interface) pair and return them with their index."""
-                clients = await get_n_stun_clients(
-                    af=af,
-                    n=limit,
-                    mode=RFC5389,
-                    interface=interface,
-                    proto=TCP,
-                    conf=PUNCH_CONF,
-                )
-                log(fstr(
-                    "[STUN-TIME] af={0} if={1} t={2}ms found={3}",
-                    (af, if_index,
-                     int((time.monotonic() - stun_t0) * 1000), len(clients)),
-                ))
-                return (af, if_index, clients)
+    # Conservative per-job pool: split the budget across jobs, clamp to
+    # [limit, STUN_POOL_MAX].  Then size the job batch so concurrent
+    # sockets (jobs_per_batch * per_job_pool) stay within budget.
+    per_job_pool = min(STUN_POOL_MAX, max(limit, STUN_SOCKET_BUDGET // len(jobs)))
+    jobs_per_batch = max(1, STUN_SOCKET_BUDGET // per_job_pool)
 
-            tasks.append(asyncio.create_task(job()))
+    async def run_job(af, if_index, interface):
+        """Fetch STUN clients for one (af, interface) pair and return them with their index."""
+        clients = await get_n_stun_clients(
+            af=af,
+            n=limit,
+            mode=RFC5389,
+            interface=interface,
+            proto=TCP,
+            conf=PUNCH_CONF,
+            pool=per_job_pool,
+        )
+        log(fstr(
+            "[STUN-TIME] af={0} if={1} t={2}ms pool={3} found={4}",
+            (af, if_index,
+             int((time.monotonic() - stun_t0) * 1000),
+             per_job_pool, len(clients)),
+        ))
+        return (af, if_index, clients)
 
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-    for af, if_index, clients in results:
-        stun_clients[af][if_index] = clients
+    for i in range(0, len(jobs), jobs_per_batch):
+        batch = jobs[i:i + jobs_per_batch]
+        results = await asyncio.gather(
+            *[run_job(af, ix, iface) for af, ix, iface in batch],
+            return_exceptions=False,
+        )
+        for af, if_index, clients in results:
+            stun_clients[af][if_index] = clients
 
     return stun_clients
 
