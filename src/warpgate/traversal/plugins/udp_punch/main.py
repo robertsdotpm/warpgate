@@ -533,16 +533,15 @@ class UdpPunchPlugin(Plugin):
                 self.bridge_socks = [listener_sock, worker_sock]
 
                 # getsockname() returns a 2-tuple for v4 and a 4-tuple
-                # for v6 ((host, port, flowinfo, scope_id)). The Pipe
-                # constructor's resolve_dest does `ip, port = dest`
-                # which blows up on the v6 4-tuple. Keep the full
-                # tuple for socket.connect (v6 form is required there)
-                # but pass a flat (ip, port) to Pipe.
+                # for v6 (host, port, flowinfo, scope_id). Both the
+                # socket.connect() calls below and the wrapped Pipe
+                # take the full tuple as-is: resolve_dest accepts the
+                # v6 4-tuple (reads ip + port positionally, re-derives
+                # scope from the route), so no flattening is needed and
+                # both AFs go through the same path. The bridge binds
+                # ::1 loopback so scope_id/flowinfo are 0 regardless.
                 listener_addr = listener_sock.getsockname()
                 worker_addr = worker_sock.getsockname()
-                # Use full getsockname() address for both connect() and Pipe
-                # dest so the asyncio transport's self._address comparison
-                # never mismatches on IPv6 (4-tuple vs 2-tuple ValueError).
                 worker_addr_for_pipe = worker_addr
                 # UDP-connect both ends so recv/send default to the
                 # known peer and the kernel filters incoming.
