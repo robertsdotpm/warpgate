@@ -454,39 +454,24 @@ def build_node_address(node, out):
 
 
 async def finalize_port_forwarding(node, upnp_task, out, cout):
-    """Await the background UPnP task and log whether forwarding and reachability succeeded."""
+    """Hand the UPnP/PCP task off to background tracking; do not block startup on it.
+
+    Port forwarding only benefits the direct / reverse-connect path,
+    and its failure degrades gracefully -- reverse_connect still works
+    without a forwarded port. Awaiting it here used to add ~2-8s to
+    node startup: a router with no IGD/PCP just burns the SSDP/PCP
+    discovery timeout while the rest of the node sits idle waiting.
+
+    Instead, register the task with node.resources so it is cancelled
+    on shutdown, and return immediately. The mapping installs in the
+    background whenever discovery completes. The task uses a static
+    mapping description ("warpgate" -- see forward()), so a background
+    run never accumulates duplicate-named entries on the IGD.
+    """
     if upnp_task:
         if out:
-            cout("\tStarting UPnP forwarding...")
-
-        # Cap UPnP discovery / port-forward at 8s -- on XP the SSDP
-        # stack drags this out to 13-15s, which combined with the
-        # other startup phases blows past the 30s wait_for budget
-        # callers like asyncio.wait_for(Node().start(), timeout=30)
-        # use, making node startup look like a hard timeout when it's
-        # actually just slow UPnP. 8s is enough for a working router
-        # on every other platform; failures degrade gracefully (no
-        # forwarding -> reverse_connect fallback still works).
-        try:
-            upnp_ret = await asyncio.wait_for(upnp_task, timeout=8)
-        except asyncio.TimeoutError:
-            upnp_ret = None
-            if out:
-                cout("\t\tUPnP timed out after 8s; continuing without forwarding.")
-        if upnp_ret:
-            forward_success, reachable = upnp_ret
-        else:
-            forward_success = reachable = None
-
-        # Output AFs and NICs where UPnP succeeded on.
-        if forward_success or reachable:
-            if out:
-                cout("\t\tUPnP forwarded = ", forward_success)
-            if out:
-                cout("\t\tUPnP reachable = ", reachable)
-        else:
-            if out:
-                cout("\t\tUPnP failed: reverse connect won't work.")
+            cout("\tUPnP/PCP forwarding running in background...")
+        node.resources.add_task(upnp_task)
 
 
 # ==========================================

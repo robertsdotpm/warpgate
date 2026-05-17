@@ -331,6 +331,7 @@ async def load_stun_clients(ifs, limit=USE_MAP_NO):
     """Concurrently load up to limit TCP STUN clients per AF per interface and return them indexed."""
     stun_clients = {IP4: {}, IP6: {}}
     tasks = []
+    stun_t0 = time.monotonic()
 
     for if_index in range(len(ifs)):
         interface = ifs[if_index]
@@ -346,6 +347,11 @@ async def load_stun_clients(ifs, limit=USE_MAP_NO):
                     proto=TCP,
                     conf=PUNCH_CONF,
                 )
+                log(fstr(
+                    "[STUN-TIME] af={0} if={1} t={2}ms found={3}",
+                    (af, if_index,
+                     int((time.monotonic() - stun_t0) * 1000), len(clients)),
+                ))
                 return (af, if_index, clients)
 
             tasks.append(asyncio.create_task(job()))
@@ -626,6 +632,18 @@ async def forward(node, port, reachability):
     from ..traversal.plugins.upnp.main import port_forward as upnp_port_forward
     from .pcp_client import pcp_try_anycast_and_gateway, PROTOCOL_TCP
 
+    # Stage timeline for the port_forward breakdown: the UPnP/PCP
+    # mapping race vs the reachability probe vs the fixed connect-back
+    # wait.
+    fwd_t0 = time.monotonic()
+
+    def fwd_stage(name):
+        log(fstr(
+            "[FORWARD-TIME] t={0}ms stage={1}",
+            (int((time.monotonic() - fwd_t0) * 1000), name),
+        ))
+
+    fwd_stage("forward_enter")
     tasks = []
     for nic in node.ifs:
         for af in nic.supported():
@@ -646,8 +664,21 @@ async def forward(node, port, reachability):
                 src_ip = route.nic() if af == IP4 else route.ext()
                 src_tup = (src_ip, port)
 
+                # Per-method timing so the UPnP/PCP race breaks down
+                # into the individual cost of each path.
+                race_t0 = time.monotonic()
+
+                def race_mark(method, result):
+                    log(fstr(
+                        "[FORWARD-RACE] af={0} method={1} t={2}ms result={3}",
+                        (af, method,
+                         int((time.monotonic() - race_t0) * 1000), result),
+                    ))
+
                 async def via_upnp():
-                    return await upnp_port_forward(af, nic, port, src_tup, "warpgate")
+                    out = await upnp_port_forward(af, nic, port, src_tup, "warpgate")
+                    race_mark("upnp", out)
+                    return out
 
                 async def via_pcp():
                     gws = nic.netifaces.gateways()
@@ -662,7 +693,9 @@ async def forward(node, port, reachability):
                         sock_af, src_ip, gw, port, proto=PROTOCOL_TCP,
                         suggested_ext_port=port,
                     )
-                    return 1 if parsed and parsed.get("result_code") == 0 else 0
+                    out = 1 if parsed and parsed.get("result_code") == 0 else 0
+                    race_mark("pcp", out)
+                    return out
 
                 upnp_task = asyncio.ensure_future(via_upnp())
                 pcp_task = asyncio.ensure_future(via_pcp())
@@ -685,31 +718,42 @@ async def forward(node, port, reachability):
             tasks.append(do_forward())
 
     forward_success = strip_none(await asyncio.gather(*tasks, return_exceptions=True))
+    fwd_stage("forwards_done")
 
-    test_addr = {IP4: "158.69.27.176", IP6: "2607:5300:60:80b0::1"}
+    # Reachability probe: curl a remote server to trigger a connect-
+    # back, then wait for it to land.  This is diagnostic only --
+    # `reachable` is logged by finalize_port_forwarding, nothing
+    # functional gates on it -- and it costs a remote round trip plus
+    # a fixed 2s connect-back wait.  Gated off by default; set
+    # enable_reachability_test in node.conf to re-enable it.
+    reachable = []
+    if node.conf.get("enable_reachability_test", False):
+        test_addr = {IP4: "158.69.27.176", IP6: "2607:5300:60:80b0::1"}
 
-    async def reachability_test(af, nic):
-        """Trigger the remote warpgate probe server to connect back to us on the forwarded port."""
-        route = nic.route(af)
-        curl = WebCurl((test_addr[af], 80), route, do_close=0)
-        try:
-            await curl.vars({"action": "hello", "proto": "tcp", "port": str(port)}).get(
-                "/warpgate/net_debug.php"
-            )
-        except asyncio.TimeoutError:
-            return None
+        async def reachability_test(af, nic):
+            """Trigger the remote warpgate probe server to connect back to us on the forwarded port."""
+            route = nic.route(af)
+            curl = WebCurl((test_addr[af], 80), route, do_close=0)
+            try:
+                await curl.vars({"action": "hello", "proto": "tcp", "port": str(port)}).get(
+                    "/warpgate/net_debug.php"
+                )
+            except asyncio.TimeoutError:
+                return None
 
-    await asyncio.gather(
-        *[reachability_test(af, nic) for nic in node.ifs for af in nic.supported()],
-        return_exceptions=True,
-    )
+        await asyncio.gather(
+            *[reachability_test(af, nic) for nic in node.ifs for af in nic.supported()],
+            return_exceptions=True,
+        )
+        fwd_stage("reachability_done")
 
-    await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        fwd_stage("sleep_done")
 
-    reachable = [
-        (af, nic_id)
-        for af in (IP4, IP6)
-        for nic_id in reachability[af]
-        if reachability[af][nic_id].done()
-    ]
+        reachable = [
+            (af, nic_id)
+            for af in (IP4, IP6)
+            for nic_id in reachability[af]
+            if reachability[af][nic_id].done()
+        ]
     return forward_success, reachable
