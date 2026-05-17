@@ -38,18 +38,25 @@ af,
         msg_cb=msg_cb,
     )
 
-    await asyncio.wait_for(turn_client.start(), 10)
+    await asyncio.wait_for(turn_client.start(), 4)
 
     peer_tup = await turn_client.client_tup_future
     relay_tup = await turn_client.relay_tup_future
 
     if None not in [dest_peer, dest_relay]:
-        await asyncio.wait_for(turn_client.accept_peer(dest_peer, dest_relay), 6)
+        await asyncio.wait_for(turn_client.accept_peer(dest_peer, dest_relay), 4)
 
     return peer_tup, relay_tup, turn_client
 
 
-PER_SERVER_TIMEOUT = 6.0
+# One server's whole get_turn_client (start + relay futures + accept_peer)
+# must finish inside this. PER_SERVER_TIMEOUT is itself bounded by the
+# phase4_turn outer budget = the turn plugin conf timeout (5 s); keeping
+# it and the start()/accept_peer() sub-caps below 5 s keeps them live
+# rather than dead-on-arrival behind the outer cap. Matrix data: a
+# healthy TURN allocation completes end-to-end in ~2.6 s, so 4 s is
+# ~1.5x the observed success.
+PER_SERVER_TIMEOUT = 4.0
 
 
 RACE_BATCH_SIZE = 2
@@ -67,7 +74,7 @@ async def get_first_working_turn_client(
 
     The previous shape was a strictly-sequential walk, so a single slow
     server at the head of the rendezvous-rank ate per_server_timeout
-    (6 s default) before the next was tried. Public TURN endpoints
+    (4 s default) before the next was tried. Public TURN endpoints
     have observable per-attempt failure rates in the matrix data
     (cycle 3 win11 just showed turn=- with no obvious initiator-side
     fault); racing 2 candidates in parallel turns the wallclock
