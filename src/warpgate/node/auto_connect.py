@@ -1076,7 +1076,31 @@ async def auto_connect(
             phase4_turn,
         ):
             phase_t0 = time.monotonic()
-            pipe, plugin = await phase_fn(node, src_map, dest_map, sig_pipe, plugin_set)
+            # test_all_phases runs every phase for measurement even
+            # after one has won. A later phase raising must NOT abort
+            # the loop and discard an earlier phase's winner_pipe -- it
+            # is only bonus measurement at that point. Treat any phase
+            # error as "no pipe" and carry on. A CancelledError with no
+            # winner yet is a genuine teardown and is re-raised.
+            try:
+                pipe, plugin = await phase_fn(
+                    node, src_map, dest_map, sig_pipe, plugin_set,
+                )
+            except asyncio.CancelledError:
+                if winner_pipe is None:
+                    raise
+                log(fstr(
+                    "[AC-PHASE] {0} cancelled; keeping earlier winner",
+                    (phase_fn.__name__,),
+                ))
+                pipe, plugin = None, None
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
+                log(fstr(
+                    "[AC-PHASE] {0} raised; treating as no-pipe",
+                    (phase_fn.__name__,),
+                ))
+                pipe, plugin = None, None
             elapsed_ms = int((time.monotonic() - phase_t0) * 1000)
             src_nat = worst_nat(src_map)
             dest_nat = worst_nat(dest_map)
