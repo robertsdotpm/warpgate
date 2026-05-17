@@ -51,7 +51,14 @@ async def main():
     # but bytes never flow (pipe=True / verify fails).
     nic = os.environ.get("WG_NIC") or None
     nic_names = [nic] if nic else None
-    gate = Gate(name=name, nic_names=nic_names)
+    gate_kwargs = {"name": name, "nic_names": nic_names}
+    # WG_NO_UPNP=1 starts the listener with port forwarding disabled --
+    # used to test whether UPnP/PCP background activity destabilises a
+    # contended host (win11).
+    if os.environ.get("WG_NO_UPNP") == "1":
+        from warpgate.node.node_defs import NODE_CONF
+        gate_kwargs["conf"] = dict(NODE_CONF, enable_upnp=False)
+    gate = Gate(**gate_kwargs)
     asyncio.ensure_future(emit_ready_when_registered(gate))
     try:
         await gate.listen(handle)
