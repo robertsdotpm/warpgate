@@ -34,6 +34,43 @@ from ..traversal.plugin_loader import load_plugins
 from ..install_check import verify_sibling_installs
 
 
+# Per-OS timeouts (seconds) for the network-loading steps of node
+# startup. Windows XP and Vista have markedly slower TCP/IP stacks and
+# slower process shell-outs (netsh / wmic / ipconfig), so the modern
+# 4-10s budgets for interface enumeration and NAT classification
+# routinely starve there -- node_start never finishes and a connecting
+# peer sees READY_FAIL. Legacy Windows gets its own larger budgets.
+#
+#   interface_load -- passed as load_interfaces(timeout=); drives the
+#     per-NIC nic.start() enumeration cap.
+#   nat_load -- passed to nic.load_nat(); the STUN-driven NAT
+#     classification probe run by classify_nat_background.
+#
+# Values are deliberately generous -- a slow legacy host finishing
+# startup late beats one that never finishes. Retune once XP/Vista
+# startup has been measured directly.
+STARTUP_NET_TIMEOUTS = {
+    "default": {"interface_load": 4, "nat_load": 10},
+    "vista": {"interface_load": 10, "nat_load": 20},
+    "xp": {"interface_load": 16, "nat_load": 30},
+}
+
+
+def startup_net_timeouts():
+    """Return the {interface_load, nat_load} timeout profile for the local OS.
+
+    Keyed off os_id() of the host this node is running on -- XP/2000
+    and Vista get their own larger budgets; everything else uses the
+    modern default.
+    """
+    os_name = os_id() or ""
+    if "XP" in os_name or "2000" in os_name:
+        return STARTUP_NET_TIMEOUTS["xp"]
+    if "Vista" in os_name:
+        return STARTUP_NET_TIMEOUTS["vista"]
+    return STARTUP_NET_TIMEOUTS["default"]
+
+
 # ==========================================
 # Orchestrates the startup sequence for a P2P node.
 # ==========================================
@@ -187,8 +224,10 @@ async def load_network_interfaces(node):
             # is deferred off the startup path. apply_cached_or_
             # placeholder_nat seeds nic.nat below; classify_nat_
             # background does the real probe after the node is up.
+            # timeout scales up on XP/Vista (slow interface enum).
             node.ifs = await load_interfaces(
                 if_names, Interface, skip_nat=True,
+                timeout=startup_net_timeouts()["interface_load"],
             )
         except asyncio.CancelledError:
             raise
@@ -258,10 +297,15 @@ async def classify_nat_background(node, out):
     for nic in node.ifs:
         before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
 
+    # NAT classification timeout scales up on XP/Vista (slow stacks).
+    nat_timeout = startup_net_timeouts()["nat_load"]
     nat_by_nic = {}
     for nic in node.ifs:
         try:
-            await asyncio.wait_for(nic.load_nat(), timeout=10)
+            await asyncio.wait_for(
+                nic.load_nat(timeout=nat_timeout),
+                timeout=nat_timeout + 5,
+            )
         except asyncio.CancelledError:
             raise
         except (OSError, ConnectionError, asyncio.TimeoutError):
