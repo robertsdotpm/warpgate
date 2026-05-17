@@ -48,7 +48,7 @@ class UdpPunchPlugin(Plugin):
     # does no useful work over it. Symmetric NAT goes to random_probe,
     # not here.
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 10}
+    conf = {"timeout": 5}
     proto_messages = (
         (UdpPunchMsg, P2P_PUNCH, 20),
     )

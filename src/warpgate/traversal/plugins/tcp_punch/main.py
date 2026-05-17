@@ -1,10 +1,12 @@
 """Traversal plugin for TCP hole punching via coordinated port prediction.
 
-Timeout budget (PLUGIN_CONF["timeout"] = 10):
+Timeout budget (PLUGIN_CONF["timeout"] = 5):
   This is the per-slot ceiling in punch_phase: how long one route/af
   slot waits for the punch before cancelling it. A failed tcp_punch
   slot runs to this ceiling (the plugin does not self-terminate on
-  failure), so it is also the per-slot fall-through cost.
+  failure), so it is also the per-slot fall-through cost. It never
+  shortens a success -- a punch completes when it completes -- so it
+  is sized purely off the worst legitimate success time.
 
   History: the budget was 180 s, then 120 s, both sized for the
   bucket-rendezvous design (window=42 + max_clock_error=20 ≈ 62 s
@@ -15,10 +17,12 @@ Timeout budget (PLUGIN_CONF["timeout"] = 10):
 
   Measured against the current code (full v4+v6 matrix sweep, all 9
   OSes incl. Windows XP and Vista): every tcp_punch success lands
-  inside 2.93 s, p50 ≈ 2.76 s, with no slow tail -- the punch timing
-  is OS-agnostic now that the rendezvous wait is gone. 10 s is a flat
-  ceiling at ~3.4x the slowest observed success. No per-OS override
-  is needed; XP (2.74 s) and Vista (2.87 s) sit with everyone else.
+  inside 2.93 s, p50 ≈ 2.76 s, in a flat 250 ms-wide cluster with no
+  slow tail -- the punch timing is OS-agnostic now that the
+  rendezvous wait is gone. 5 s = that 2.93 s worst case plus ~2 s
+  headroom for NTP-retry / scheduler jitter (MAX_NTP_RETRIES=5 ×
+  NTP_TIMEOUT=1.0). No per-OS override is needed; XP (2.74 s) and
+  Vista (2.87 s) sit with everyone else.
 
 PROTO_MESSAGES is consumed by plugin_loader: it merges each entry into
 TraversalManager.sig_proto so PunchMsg dispatches without core
@@ -72,7 +76,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 10}
+    conf = {"timeout": 5}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
