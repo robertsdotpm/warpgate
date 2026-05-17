@@ -516,16 +516,37 @@ async def bind_nic_v4(node, nic_i, nic):
         return 0
 
     node.if_ports[(IP4, nic_i)] = {"ext": nic_port, "nic": nic_port}
-    node.if_ports.setdefault((IP6, nic_i), {})["nic"] = nic_port
     return nic_port
 
 
 async def bind_nic_v6_ext(node, nic_i, nic, label):
-    """Bind v6 ext on one NIC.  Returns bound port (0 = fail).  Non-critical."""
+    """Bind v6 ext (global) on one NIC.  Returns bound port (0 = fail)."""
     v6_route = nic.route(IP6)
     port = await soft_bind_and_listen(node, v6_route, label)
     if port > 0:
         node.if_ports.setdefault((IP6, nic_i), {})["ext"] = port
+    return port
+
+
+def fe80_iprs(nic):
+    """Return the NIC's IPv6 fe80 link-local IPRs (may be 0, 1, or more)."""
+    out = []
+    for ipr in nic:
+        if getattr(ipr, "af", None) == IP6 and str(ipr).lower().startswith("fe80"):
+            out.append(ipr)
+    return out
+
+
+async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
+    """Bind a v6 fe80 link-local listener on one NIC.  Returns port (0 = fail).
+
+    Part of the NIC's "nic" path -- the v6 NIC-local listener, mirror of
+    the v4 NIC IP. Sets if_ports[(IP6, nic_i)]["nic"] from the real bind
+    (it used to be faked from the v4 port).
+    """
+    port = await soft_bind_and_listen(node, fe80_ipr.route, label)
+    if port > 0:
+        node.if_ports.setdefault((IP6, nic_i), {})["nic"] = port
     return port
 
 
@@ -559,22 +580,26 @@ async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
 
 
 async def listen_on_ifs(node):
-    """Bind TCP listeners on every NIC, v6 ext per NIC, and per-node loopback
-    aliases -- all concurrently in a single gather.
+    """Bind TCP listeners for every NIC, plus the per-node loopback aliases.
+
+    Each NIC has two bind paths:
+      - "nic": the NIC-local listeners -- the v4 NIC IP and the v6 fe80
+        link-local(s).
+      - "ext": the v6 global listener.
+    A path counts as bound when at least one of its listeners came up.
 
     Failure semantics:
-      - ANY NIC listen_local that fails => OSError (no real inbound path).
-        node.listen_port-bound NIC binds are the only ones that serve real
-        peers; if zero of them succeeded, the node is unreachable.
-      - v6 ext bind failures           => log + continue (NIC v4 still works).
-      - Loopback alias failures        => log + continue (loopback is convenience).
+      - General NIC -> OSError only if BOTH paths fail (no inbound path).
+      - NIC named in --nic (node.nic_names) -> OSError if ANY applicable
+        path fails; an explicitly-requested NIC must come up fully.
+      - Every NIC failing both paths -> OSError regardless.
+      - --ip (node.listen_ips): every listed address must bind, else OSError.
+      - Loopback aliases: log + continue (convenience only).
 
     When node.listen_port is 0, a probe socket pre-resolves an OS-assigned
-    ephemeral port so every concurrent bind targets the same number -- this
-    is what lets the loopback aliases publish a stable port without waiting
-    on the NIC binds to latch one.  All binds run concurrently via
-    asyncio.gather(return_exceptions=True); one slow / hung NIC never blocks
-    any other.  No retries -- a failed bind is a failed bind, surface it.
+    ephemeral port so every concurrent bind targets the same number. All
+    binds run concurrently via asyncio.gather(return_exceptions=True); one
+    slow / hung NIC never blocks any other. No retries.
     """
     node.if_ports = {}
 
@@ -583,60 +608,111 @@ async def listen_on_ifs(node):
             probe.bind(("", 0))
             node.listen_port = probe.getsockname()[1]
 
-    nic_tasks = []  # critical: (label, coro)
-    aux_tasks = []  # non-critical: (label, coro)
-
+    # --- strict --ip path: every listed address must bind ----------------
     if node.listen_ips:
-        # Strict listen_ips path: bind only the IPs in listen_ips on the NICs that own them.
         listen_iprs = [IPR(ip) for ip in node.listen_ips]
+        ip_tasks = []  # (label, coro)
         for nic in node.ifs:
             for nic_ipr in nic:
                 if nic_ipr in listen_iprs:
                     label = fstr("listen_ip {0}", (nic_ipr,))
-                    nic_tasks.append((label, soft_bind_and_listen(node, nic_ipr.route, label)))
-    else:
-        for nic_i, nic in enumerate(node.ifs):
-            label = fstr("listen_local nic={0}", (nic.id,))
-            nic_tasks.append((label, bind_nic_v4(node, nic_i, nic)))
-            if IP6 in nic.supported():
-                v6_label = fstr("v6 ext nic={0}", (nic.id,))
-                aux_tasks.append((v6_label, bind_nic_v6_ext(node, nic_i, nic, v6_label)))
+                    ip_tasks.append((label, soft_bind_and_listen(node, nic_ipr.route, label)))
+        results = await asyncio.gather(
+            *(c for _, c in ip_tasks), return_exceptions=True,
+        )
+        failed = []
+        for (label, _), r in zip(ip_tasks, results):
+            if not (isinstance(r, int) and r > 0):
+                failed.append(label)
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                    log(fstr("listen_on_ifs: {0} raised: {1}", (label, r)))
+        if failed or not ip_tasks:
+            msg = fstr(
+                "listen_on_ifs: --ip address(es) failed to bind: {0}",
+                ("; ".join(failed) or "(no --ip address matched any NIC)",),
+            )
+            log(msg)
+            raise OSError(msg)
+        return
+
+    # --- default path: per-NIC "nic" + "ext" binds -----------------------
+    explicit = set(node.nic_names or [])
+    plan = []  # (nic_i, nic, path, label, coro)
+    for nic_i, nic in enumerate(node.ifs):
+        plan.append((
+            nic_i, nic, "nic", fstr("v4 nic={0}", (nic.id,)),
+            bind_nic_v4(node, nic_i, nic),
+        ))
+        if IP6 in nic.supported():
+            for fe80_ipr in fe80_iprs(nic):
+                lbl = fstr("v6 fe80 {0} nic={1}", (fe80_ipr, nic.id))
+                plan.append((nic_i, nic, "nic", lbl,
+                             bind_nic_v6_fe80(node, nic_i, fe80_ipr, lbl)))
+            elbl = fstr("v6 ext nic={0}", (nic.id,))
+            plan.append((nic_i, nic, "ext", elbl,
+                         bind_nic_v6_ext(node, nic_i, nic, elbl)))
 
     try:
         candidates = loopback_candidates_for(node.kp.public_key_hex, node.listen_port)
     except Exception as exc:  # pylint: disable=broad-except
         candidates = []
         log(fstr("listen_on_ifs: loopback candidates compute failed: {0}", (exc,)))
-
+    aux = []  # (label, coro) -- non-critical
     for cand_af, cand_ip, cand_port in candidates:
         cand_label = fstr("loopback {0}:{1}", (cand_ip, cand_port))
-        aux_tasks.append((cand_label, bind_loopback(node, cand_af, cand_ip, cand_port, cand_label)))
+        aux.append((cand_label, bind_loopback(node, cand_af, cand_ip, cand_port, cand_label)))
 
-    all_tasks = nic_tasks + aux_tasks
     results = await asyncio.gather(
-        *(c for _, c in all_tasks),
+        *([c for _, _, _, _, c in plan] + [c for _, c in aux]),
         return_exceptions=True,
     )
+    plan_results = results[: len(plan)]
+    aux_results = results[len(plan):]
 
-    nic_successes = 0
-    nic_failures = []
-    for (label, _), r in zip(nic_tasks, results[: len(nic_tasks)]):
-        if isinstance(r, int) and r > 0:
-            nic_successes += 1
-        else:
-            nic_failures.append(label)
-            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
-                log(fstr("listen_on_ifs: {0} raised: {1}", (label, r)))
-
-    for (label, _), r in zip(aux_tasks, results[len(nic_tasks):]):
+    for (label, _), r in zip(aux, aux_results):
         if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
             log(fstr("listen_on_ifs: aux {0} raised: {1}", (label, r)))
 
-    if nic_tasks and nic_successes == 0:
+    # Per-NIC path accounting: a path is bound if >=1 of its listeners came up.
+    acct = {}  # nic_i -> {"nic": bool, "ext": bool, "ext_applies": bool, "obj": nic}
+    for (nic_i, nic, path, label, _), r in zip(plan, plan_results):
+        a = acct.setdefault(nic_i, {
+            "nic": False, "ext": False,
+            "ext_applies": IP6 in nic.supported(), "obj": nic,
+        })
+        if isinstance(r, int) and r > 0:
+            a[path] = True
+        elif isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+            log(fstr("listen_on_ifs: {0} raised: {1}", (label, r)))
+
+    failed_nics = []
+    for nic_i, a in acct.items():
+        nic = a["obj"]
+        nic_ok, ext_ok, ext_applies = a["nic"], a["ext"], a["ext_applies"]
+
+        if getattr(nic, "name", None) in explicit:
+            # --nic NIC: every applicable path must bind.
+            missing = []
+            if not nic_ok:
+                missing.append("nic")
+            if ext_applies and not ext_ok:
+                missing.append("ext")
+            if missing:
+                msg = fstr(
+                    "listen_on_ifs: --nic '{0}' failed to bind path(s): {1}",
+                    (nic.name, ", ".join(missing)),
+                )
+                log(msg)
+                raise OSError(msg)
+
+        if not (nic_ok or ext_ok):
+            failed_nics.append(getattr(nic, "id", nic_i))
+
+    if acct and len(failed_nics) == len(acct):
         msg = fstr(
-            "listen_on_ifs: every NIC bind failed ({0}/{0}); "
-            "node has no real inbound path. Failures: {1}",
-            (len(nic_tasks), "; ".join(nic_failures) or "(no labels)"),
+            "listen_on_ifs: every NIC failed both bind paths ({0} NIC(s)); "
+            "node has no inbound path. Failed: {1}",
+            (len(acct), failed_nics),
         )
         log(msg)
         raise OSError(msg)
