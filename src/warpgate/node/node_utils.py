@@ -333,9 +333,11 @@ async def close_idle_pipes(node):
 # blow past the platform socket ceiling (the Windows selector event
 # loop tops out around 64, shared with broker + listen sockets).
 STUN_SOCKET_BUDGET = 32
-# Per-job pool ceiling -- the aggressive value used when there are few
-# interfaces and the budget comfortably covers them.
-STUN_POOL_MAX = 10
+# Per-job pool ceiling -- candidates probed concurrently per (af,
+# interface) job when the socket budget comfortably covers them.
+# 6 is 3x the needed count (USE_MAP_NO=2): enough to shrug off ~4 dead
+# servers in a run, without burning sockets a healthy node won't use.
+STUN_POOL_MAX = 6
 
 
 async def load_stun_clients(ifs, limit=USE_MAP_NO):
