@@ -9,7 +9,7 @@ from ecdsa import SigningKey, SECP256k1
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import pathlib
 from aionetiface import (
-    fstr, log, log_exception, ip_norm, get_aionetiface_install_root,
+    fstr, log, log_exception, ip_norm, ipr_norm, get_aionetiface_install_root,
     get_n_stun_clients, TCP, RFC5389, IP4, IP6, IPR,
     async_wrap_errors, strip_none, sock_has_data, hash160, to_h, to_b, to_s,
     h_to_b, WebCurl, get_default_iface, USE_MAP_NO,
@@ -463,16 +463,24 @@ async def load_machine_id(app_id, netifaces):
         return await fallback_machine_id(netifaces, app_id)
 
 
-async def soft_bind_and_listen(node, route, label):
+async def soft_bind_and_listen(node, route, label, ips=None):
     """Bind and add_listener for one route; log on failure, never raise.
 
     Returns the actual bound port on success, 0 on failure.
     When node.listen_port is non-zero (user-specified), a bind failure is
     a hard miss — no silent port=0 fallback — so the caller's nic_successes
     counter stays at zero and listen_on_ifs can raise loudly.
+
+    ``ips`` pins the bind to a specific address. It MUST be passed for any
+    v6 path: a v6 NIC's route has nic_ips[0] == ext_ips[0] == the global
+    address (there's no v6 NAT), so route.bind() with no ips resolves every
+    v6 path — fe80 link-local AND ext — to the SAME global. Two listeners
+    then race the same (global, port) tuple and the loser's add_listener
+    is_serv_listening probe hits the winner → a spurious "listen conflict".
+    v4 never hit this because each v4 NIC has a single, distinct nic IP.
     """
     try:
-        await route.bind(port=node.listen_port)
+        await route.bind(port=node.listen_port, ips=ips)
     except (OSError, ValueError, AssertionError) as exc:
         log(fstr("listen_on_ifs: bind failed for {0}: {1}", (label, exc)))
         return 0
@@ -493,26 +501,29 @@ async def soft_bind_and_listen(node, route, label):
 
 
 async def bind_nic_v4(node, nic_i, nic):
-    """Bind v4 listen_local on one NIC.  Returns bound port (0 = fail).
+    """Bind the v4 NIC-local listener on one NIC.  Returns bound port (0 = fail).
+
+    v4-only and pinned to the NIC's v4 address. This used to call
+    node.listen_local, which binds *every* AF the NIC supports -- so it
+    also bound each fe80 link-local, double-binding the very addresses
+    bind_nic_v6_fe80 owns. Two listeners then raced the same (fe80, port)
+    tuple. Keeping this v4-only leaves exactly one binder per address.
 
     Critical: a zero return contributes to the "every NIC bind failed"
     runtime error in listen_on_ifs.
     """
     try:
-        listed = await node.listen_local(TCP, node.listen_port, nic) or []
-    except (OSError, ValueError, AssertionError) as exc:
-        log(fstr("listen_on_ifs: listen_local nic={0} failed: {1}", (nic.id, exc)))
+        if IP4 not in nic.supported():
+            return 0
+        v4_route = nic.route(IP4)
+        nic_ip = v4_route.nic()
+    except (OSError, LookupError, IndexError, ValueError, AssertionError) as exc:
+        log(fstr("listen_on_ifs: v4 nic={0} no nic ip: {1}", (nic.id, exc)))
         return 0
 
-    if not listed:
-        return 0
-
-    first = next((x for x in listed if isinstance(x, tuple) and x[0]), None)
-    if not first:
-        return 0
-    nic_port = first[0]
-
-    if not any(x is not None for x in listed):
+    label = fstr("v4 nic={0}", (nic.id,))
+    nic_port = await soft_bind_and_listen(node, v4_route, label, ips=nic_ip)
+    if nic_port <= 0:
         return 0
 
     node.if_ports[(IP4, nic_i)] = {"ext": nic_port, "nic": nic_port}
@@ -520,9 +531,18 @@ async def bind_nic_v4(node, nic_i, nic):
 
 
 async def bind_nic_v6_ext(node, nic_i, nic, label):
-    """Bind v6 ext (global) on one NIC.  Returns bound port (0 = fail)."""
+    """Bind v6 ext (global) on one NIC.  Returns bound port (0 = fail).
+
+    The ext IP is pinned explicitly (route.ext()) so this path can never
+    collide with the fe80 path -- see soft_bind_and_listen's docstring.
+    """
     v6_route = nic.route(IP6)
-    port = await soft_bind_and_listen(node, v6_route, label)
+    try:
+        ext_ip = v6_route.ext()
+    except (LookupError, IndexError, ValueError) as exc:
+        log(fstr("listen_on_ifs: {0} no ext ip: {1}", (label, exc)))
+        return 0
+    port = await soft_bind_and_listen(node, v6_route, label, ips=ext_ip)
     if port > 0:
         node.if_ports.setdefault((IP6, nic_i), {})["ext"] = port
     return port
@@ -543,8 +563,21 @@ async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     Part of the NIC's "nic" path -- the v6 NIC-local listener, mirror of
     the v4 NIC IP. Sets if_ports[(IP6, nic_i)]["nic"] from the real bind
     (it used to be faked from the v4 port).
+
+    The fe80 address is pinned explicitly: fe80_ipr.route is the NIC's v6
+    route, whose unqualified bind resolves to the global -- not the
+    link-local -- so the address must be passed in. The bind layer adds
+    the %scope suffix for the link-local itself.
+
+    The route is deepcopied: fe80_ipr.route is the live route-pool object
+    and is shared by every IPR on that route, so two fe80s on one NIC
+    would otherwise bind/mutate the same object concurrently.
     """
-    port = await soft_bind_and_listen(node, fe80_ipr.route, label)
+    import copy as copy_mod
+    route = copy_mod.deepcopy(fe80_ipr.route)
+    port = await soft_bind_and_listen(
+        node, route, label, ips=ipr_norm(fe80_ipr),
+    )
     if port > 0:
         node.if_ports.setdefault((IP6, nic_i), {})["nic"] = port
     return port
