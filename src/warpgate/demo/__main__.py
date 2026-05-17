@@ -27,6 +27,7 @@ from aionetiface import (
     allow_windows_firewall,
     async_run, async_wrap_errors, fstr,
     get_aionetiface_install_root,
+    IP4, IP6,
     log, log_exception,
     sock_has_data, sys, to_b, to_s,
 )
@@ -165,14 +166,28 @@ async def setup_node():
         # currently using.  Best-effort -- skipped silently if the
         # server doesn't speak OP_USAGE (older deployments) or the
         # round-trip fails.
+        #
+        # Each AF has its own independent per-IP name quota, and
+        # Nickname.put auto-swaps from a full v4 quota onto v6 (see
+        # the worker() PutRejected fall-through in nickname.py). So a
+        # dual-stack node reports BOTH AFs here -- the spare AF's
+        # headroom is what the swap draws on, and is worth seeing even
+        # when it isn't the AF currently carrying the name. A
+        # single-stack node naturally reports just its one AF.
         try:
-            usage = await gate.node.nick_client.usage()
-            if isinstance(usage, dict):
-                cout(fstr(
-                    "Nickname quota = {0}/{1} names used for your IP (AF={2})",
-                    (usage.get("names_used"), usage.get("name_limit"),
-                     usage.get("af")),
-                ))
+            usage_by_af = await gate.node.nick_client.usage_all()
+            if isinstance(usage_by_af, dict) and usage_by_af:
+                for af in sorted(usage_by_af.keys()):
+                    info = usage_by_af[af]
+                    af_label = "IPv4" if af == IP4 else (
+                        "IPv6" if af == IP6 else fstr("AF={0}", (af,))
+                    )
+                    cout(fstr(
+                        "Nickname quota ({0}) = {1}/{2} names used for "
+                        "your IP",
+                        (af_label, info.get("names_used"),
+                         info.get("name_limit")),
+                    ))
         except Exception:  # pylint: disable=broad-except
             pass
         cout()

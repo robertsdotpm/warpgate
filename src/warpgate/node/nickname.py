@@ -533,6 +533,43 @@ class Nickname:
                     continue
         return None
 
+    async def usage_all(self, timeout=NAMING_TIMEOUT):
+        """Return per-AF quota usage, keyed by address family::
+
+            {IP4: {"af": int, "names_used": int, "name_limit": int},
+             IP6: {...}}
+
+        Each AF has its own independent per-IP name quota on the
+        server, so a dual-stack node has two separate budgets and
+        Nickname.put falls back from a full v4 quota onto the v6 one.
+        This reports both so the demo can show the spare AF's headroom
+        even when it isn't the AF currently in use.
+
+        Only AFs the node actually has PNP clients for appear: a
+        single-stack node yields one entry, a dual-stack node two.
+        Within an AF the first responding server's answer is used.
+        Returns an empty dict if no client responds within ``timeout``.
+        """
+        if not self.started:
+            raise AssertionError("Nickname client not started. Call start() first.")
+        out = {}
+        for af in VALID_AFS:
+            for offset in sorted(self.clients[af].keys()):
+                client = self.clients[af][offset]
+                if client is None:
+                    continue
+                try:
+                    info = await asyncio.wait_for(
+                        client.usage(client.kp), timeout,
+                    )
+                except (OSError, ConnectionError, asyncio.TimeoutError):
+                    log_exception()
+                    continue
+                if info is not None:
+                    out[af] = info
+                    break
+        return out
+
     async def delete(self, name, timeout=NAMING_TIMEOUT):
         """Delete the record for name from all reachable PNP servers concurrently."""
         if not self.started:
