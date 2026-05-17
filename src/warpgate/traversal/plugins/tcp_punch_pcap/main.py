@@ -92,7 +92,7 @@ class PunchPcapPlugin(Plugin):
     # converges in <2 s once both sides fire or it won't converge at
     # all (no NAT timer extension to play for, no XP reverse-bridge
     # accept tail to budget for).
-    conf = {"timeout": 5}
+    conf = {"timeout": 12}
     # DO NOT register PunchMsg here. tcp_punch already registers it
     # under wire name "tcp_punch.PunchMsg"; listing it here would
     # either collide or create a second wire name and break interop.

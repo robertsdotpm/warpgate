@@ -827,7 +827,7 @@ async def phase2_tcp_punch(
     # external port per (src,dst) tuple, so the predicted ports never
     # match the peer's actual mappings -- every spray returns
     # successful=0/N. Without this skip, phase2 burns its full plugin
-    # timeout (5 s per slot) on a punch that's mathematically
+    # timeout (12 s per slot) on a punch that's mathematically
     # impossible.
     # Going straight to phase3 (where random_probe handles symmetric)
     # is strictly faster with no loss in success.
