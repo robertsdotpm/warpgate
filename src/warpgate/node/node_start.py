@@ -12,6 +12,10 @@ from aionetiface import (
     list_interfaces, load_interfaces, parse_node_addr, make_node_addr,
     field_wrap, dhash, create_task, Signing, os_id,
 )
+from aionetiface.nic.nat.nat_utils import nat_info
+from aionetiface.nic.nat.nat_cache import (
+    network_fingerprint, nat_cache_get, nat_cache_put,
+)
 from sidewire import Router
 from .node_utils import (
     load_machine_id,
@@ -130,6 +134,16 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     build_node_address(node, out)
     upnp_task = start_background_port_forwarding(node)
 
+    # Real NAT classification runs here, off the startup path. The
+    # address was just built with cached-or-placeholder NAT; this task
+    # probes the real values, caches them, and republishes if they
+    # differ. node.nat_classify_task is exposed so callers can await
+    # it if they need a definitely-classified NAT.
+    node.nat_classify_task = create_task(
+        async_wrap_errors(classify_nat_background(node, out))
+    )
+    node.resources.add_task(node.nat_classify_task)
+
     # High-Level Services
     await setup_nickname_service(node)
     mark("nickname")
@@ -158,39 +172,134 @@ async def load_network_interfaces(node):
     """
     if not node.ifs:
         nic_names = getattr(node, "nic_names", [])
-        for attempt in range(3):
-            try:
-                if_names = await list_interfaces()
-                if nic_names:
-                    filtered = [n for n in if_names if n in nic_names]
-                    if not filtered:
-                        raise ValueError(
-                            "nic_names {0!r} matched no available interfaces {1!r}".format(
-                                nic_names, if_names
-                            )
+        try:
+            if_names = await list_interfaces()
+            if nic_names:
+                filtered = [n for n in if_names if n in nic_names]
+                if not filtered:
+                    raise ValueError(
+                        "nic_names {0!r} matched no available interfaces {1!r}".format(
+                            nic_names, if_names
                         )
-                    if_names = filtered
-                node.ifs = await load_interfaces(if_names, Interface)
-            except asyncio.CancelledError:
-                raise
-            except ValueError:
-                raise
-            except (OSError, asyncio.TimeoutError):
-                log_exception()
-                node.ifs = []
-
-            if node.ifs:
-                break
-            if attempt < 2:
-                log("load_network_interfaces: no interfaces loaded (attempt {0}/3); retrying in 5s".format(
-                    attempt + 1
-                ))
-                await asyncio.sleep(5)
+                    )
+                if_names = filtered
+            # skip_nat=True: NAT classification (~2s of STUN probing)
+            # is deferred off the startup path. apply_cached_or_
+            # placeholder_nat seeds nic.nat below; classify_nat_
+            # background does the real probe after the node is up.
+            node.ifs = await load_interfaces(
+                if_names, Interface, skip_nat=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ValueError:
+            raise
+        except (OSError, asyncio.TimeoutError):
+            log_exception()
+            node.ifs = []
 
     node.ifs = sorted(node.ifs, key=lambda x: x.name)
 
     if not node.ifs:
-        raise AssertionError("p2p node could not load ifs.")
+        raise RuntimeError("p2p node could not load ifs.")
+
+    # Seed nic.nat from the network-fingerprint cache (or an optimistic
+    # placeholder) so the address can be built and published without
+    # waiting on NAT classification. Idempotent via the nat_fingerprint
+    # guard -- whichever of Gate pre-start / node_start runs first does
+    # the work, the other is a no-op.
+    if not getattr(node, "nat_fingerprint", None):
+        apply_cached_or_placeholder_nat(node)
+
+def apply_cached_or_placeholder_nat(node):
+    """Seed every nic.nat from the NAT cache, or an optimistic placeholder.
+
+    NAT classification proper is deferred to classify_nat_background;
+    this just makes nic.nat non-None so node_start can build and
+    publish the address straight away. A network-fingerprint cache hit
+    seeds the real previously-measured values (rebuilt via nat_info to
+    avoid trusting the raw JSON blob); a miss seeds nat_info()'s
+    optimistic default. Either way the background task overwrites it
+    with a fresh probe and republishes if it differs.
+    """
+    fingerprint = network_fingerprint(node.ifs)
+    node.nat_fingerprint = fingerprint
+    cached = nat_cache_get(fingerprint) or {}
+    for nic in node.ifs:
+        name = getattr(nic, "name", None)
+        entry = cached.get(name)
+        if entry and "type" in entry and "delta" in entry:
+            try:
+                nic.set_nat(nat_info(entry["type"], entry["delta"]))
+                continue
+            except (ValueError, KeyError, TypeError):
+                log_exception()
+        if getattr(nic, "nat", None) is None:
+            nic.set_nat(nat_info())
+
+
+async def classify_nat_background(node, out):
+    """Run real NAT classification off the startup path, then cache + republish.
+
+    node_start publishes the node address seeded with cached-or-
+    placeholder NAT so startup never blocks on the ~2s STUN
+    classification probe. This task does the real probe, stores the
+    result in the network-fingerprint cache, and -- only if the
+    measured NAT differs from what was published -- rebuilds and
+    re-publishes the address. Re-publishing the same PNP name is an
+    UPDATE and does not consume nickname quota.
+
+    The ~2s classify + republish completes well inside the ~8s
+    connector settling window, so a peer never resolves the
+    placeholder addr in practice.
+    """
+    classify_t0 = time.monotonic()
+    before = {}
+    for nic in node.ifs:
+        before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
+
+    nat_by_nic = {}
+    for nic in node.ifs:
+        try:
+            await asyncio.wait_for(nic.load_nat(), timeout=10)
+        except asyncio.CancelledError:
+            raise
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            log_exception()
+        except Exception:  # pylint: disable=broad-except
+            log_exception()
+        nat = getattr(nic, "nat", None)
+        if nat is not None:
+            nat_by_nic[getattr(nic, "name", None)] = nat
+
+    log(fstr(
+        "[NAT-CLASSIFY] t={0}ms done nics={1}",
+        (int((time.monotonic() - classify_t0) * 1000), len(nat_by_nic)),
+    ))
+
+    fingerprint = getattr(node, "nat_fingerprint", None)
+    if fingerprint:
+        nat_cache_put(fingerprint, nat_by_nic)
+
+    # Republish only if the measured NAT differs from what the address
+    # was built with.
+    changed = any(
+        before.get(getattr(nic, "name", None)) != getattr(nic, "nat", None)
+        for nic in node.ifs
+    )
+    if not changed:
+        log("[NAT-CLASSIFY] measured NAT matches published addr; no republish")
+        return
+
+    log("[NAT-CLASSIFY] measured NAT differs; rebuilding + republishing addr")
+    build_node_address(node, out)
+    register_name = getattr(node, "pnp_name", None) or node.node_id
+    try:
+        await register_and_persist(node, register_name)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        log_exception()
 
 
 def start_background_port_forwarding(node):
@@ -516,13 +625,23 @@ async def register_and_persist(node, name):
     """
     node.nickname_error = None
     node.full_name = None
+    register_t0 = time.monotonic()
+    log("[REGISTER-TIME] t=0ms step=put_start")
     try:
         node.full_name = await node.nickname(name)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pylint: disable=broad-except
         node.nickname_error = exc
+        log(fstr(
+            "[REGISTER-TIME] t={0}ms step=put_failed {1}",
+            (int((time.monotonic() - register_t0) * 1000), repr(exc)),
+        ))
         raise
+    log(fstr(
+        "[REGISTER-TIME] t={0}ms step=put_done",
+        (int((time.monotonic() - register_t0) * 1000),),
+    ))
 
 
 async def setup_traversal_plugins(node):

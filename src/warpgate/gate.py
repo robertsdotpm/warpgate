@@ -18,8 +18,9 @@ while different hosts get distinct identities without coordination.
 """
 import asyncio
 import hashlib
+import time
 
-from aionetiface import TCP, log
+from aionetiface import TCP, log, fstr
 
 from .node.node import Node
 from .node.node_start import load_network_interfaces, load_machine_identity
@@ -135,6 +136,18 @@ class Gate(object):
         self.node.add_msg_cb(cb)
 
     async def __aenter__(self):
+        # Startup timeline outside node_start: the pre-start interface
+        # load + name derivation, node.start() itself, and the await on
+        # the PNP nickname registration task. [NODE-START] only covers
+        # node_start; this fills the rest of the demo black-screen.
+        gate_t0 = time.monotonic()
+
+        def gate_mark(step):
+            log(fstr(
+                "[GATE-START] t={0}ms step={1}",
+                (int((time.monotonic() - gate_t0) * 1000), step),
+            ))
+
         if self.node is None:
             self.node = Node(**{k: v for k, v in self.node_kwargs.items() if v is not None})
 
@@ -172,6 +185,8 @@ class Gate(object):
         else:
             self.node.pnp_name = self.requested_name
 
+        gate_mark("prestart")
+
         # Build SysClock from ntp_addr after interfaces are known, if the
         # caller supplied an NTP address but not a pre-built SysClock.
         sys_clock = self.sys_clock
@@ -180,6 +195,7 @@ class Gate(object):
             sys_clock = SysClock(interface=self.node.ifs[0], ntp_addr=self.ntp_addr)
 
         await self.node.start(sys_clock=sys_clock)
+        gate_mark("node_start")
 
         # Wait for the in-flight nickname registration task so the
         # keystore entry (and therefore self.full_name) is populated
@@ -191,6 +207,7 @@ class Gate(object):
                 await register_task
             except (OSError, asyncio.TimeoutError, FullNameFailure):
                 pass
+        gate_mark("register")
 
         return self
 
