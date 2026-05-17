@@ -1,0 +1,201 @@
+concurrent auto_connect -- experimental capability-gated variant
+================================================================
+
+status: design sketch, deferred. not started.
+date: 2026-05-18
+
+idea
+----
+an experimental second auto_connect path that, when BOTH peers are known
+to be capable (recent windows + recent python), drops the strict-serial
+cascade and instead schedules plugins concurrently -- bounded by an fd /
+flow budget -- and picks which combos to run instead of walking them all.
+
+the production cascade stays exactly as it is: strict-serial, no phase
+interleaving. that rule does not change. this is a SEPARATE entry point
+that only engages when it has proven it is safe to. anything unknown or
+legacy falls straight back to the serial cascade.
+
+
+why gate on recent windows + recent python
+-------------------------------------------
+concurrency on the punch path is constrained by the PEER, not just by us:
+
+  - windows xp: 10 concurrent half-open TCP connect attempts (tcpip
+    event 4226). vista sp1: 50. win7+: cap removed.
+  - older python / select() on windows has its own fd ceiling.
+
+so a concurrent scheduler can only safely fan out when both ends are
+modern. legacy peers must never see this path.
+
+
+the capability handshake -- it is an AND of both peers
+------------------------------------------------------
+we cannot decide this locally. the peer's punch behaviour is what bites
+us. the node addr / signaling needs a capability token:
+
+  - os_token already exists (used for the xp tcp_punch routing logic).
+  - extend with python version + a "concurrent-capable" bit.
+  - experimental path runs only when local-capable AND remote-capable.
+  - unknown / legacy / missing token -> serial cascade. fail safe.
+
+
+the hard part is NOT fd counting
+--------------------------------
+the cascade is not serial because of fds. it is serial because of
+contention classes the code learned the hard way. see the comment in
+phase3_udp_probe: running udp_punch + random_probe concurrently causes
+
+  (a) local ephemeral-port bind contention
+  (b) peer recv-buffer pressure
+  (c) cross-plugin magic-frame confusion (each plugin's filter has to
+      discard the other's frames)
+  (d) NAT-mapping churn
+
+an fd-counting scheduler that ignores these reintroduces exactly those
+bugs. the scheduler's model must be richer than "sum of fds <= budget".
+it needs NON-INTERFERENCE CLASSES:
+
+  - plugins spraying the SAME dest nic must stay serialized
+  - plugins using the SAME local port range must stay serialized
+  - plugins the peer cannot disambiguate at the wire level must stay
+    serialized
+
+concurrency is safe across DISJOINT (dest nic, local port range) tuples,
+not globally. fd budget is a necessary ceiling, not the whole model.
+
+
+the budget is min of three caps
+-------------------------------
+  budget = min(
+      local fd headroom,
+      ~256 simultaneous v6 udp flows,   # consumer routers silently
+                                        # drop bursts above this
+      peer's concurrent-SYN cap,        # from the capability token
+  )
+
+each plugin declares its footprint: random_probe ~256 ports, udp_punch
+~16 boundary buckets, tcp_punch NUM_PORTS=8 SYNs. the scheduler packs
+plugins up to the budget, respecting the non-interference classes above.
+
+
+combo selection -- a separate, independently useful problem
+-----------------------------------------------------------
+"choose the combos to run" = rank (plugin, af, route_type, src, dest) by
+predicted success instead of enumerating + racing all of them.
+
+  - node.telemetry already records per-phase outcome + NAT pair +
+    elapsed. that is the training signal.
+  - rank combos by predicted success (NAT-type pairing, route type,
+    prior telemetry for this peer / this NAT shape).
+
+NOTE: this half does NOT need the concurrency gate. a smarter combo
+ranker would speed up the serial cascade too. it could land first, on
+its own, as a lower-risk change.
+
+
+expected win
+------------
+punches are now ~3s each (NTP-pinned, see tcp_punch docstring). cascade
+is strict-serial. realistic upside:
+
+  - collapse phase2 + phase3 from ~6s serial to ~3s concurrent
+  - combo ranking cuts wasted slots in both paths
+
+modest against a ~3s baseline. the combo ranker is probably the
+higher-leverage half of the two.
+
+
+open questions
+--------------
+  - where does the capability token live in the wire format, and how
+    does it survive an old peer that does not send one (default to
+    "not capable")?
+  - does the experimental path share punch_phase / race_combos, or get
+    its own scheduler? sharing risks the no-interleave rule leaking
+    back into the serial path.
+  - how is the non-interference model expressed -- per-plugin declared
+    metadata, or derived from route_type + transport + dest nic?
+  - measurement: the experimental path needs its own [AC-PHASE]-style
+    telemetry so it can be compared against the serial baseline on the
+    matrix.
+
+
+REFRAME (2026-05-18): per-path, not per-plugin
+==============================================
+the better fit is concurrency across DISCRETE GATEWAY PATHS, not a
+clusterfuck of plugins racing against the same gateway.
+
+why this is cleaner: contention classes (a)-(d) above are all
+SHARED-RESOURCE problems -- same ephemeral port space, same peer NIC
+recv buffer, same NAT, same wire for the filters to disambiguate on.
+fan out across physically disjoint paths (LAN router vs mobile carrier)
+and none of those are shared. non-interference becomes STRUCTURAL
+instead of something a scheduler has to model. the hard part of the
+original sketch -- the non-interference scheduler -- mostly evaporates.
+
+baseline correction -- what is already concurrent:
+  - punch_phase builds round_robin_slots(src_nics, dest_nics), which
+    guarantees no two pairs in a slot share a src or dest nic.
+  - race_combos then runs every combo in that slot concurrently
+    (asyncio.as_completed).
+  - => disjoint nic pairs are ALREADY raced within a slot.
+  - the serial axes that remain: route_type (NIC_BIND -> EXT_BIND),
+    af (IP4 -> IP6), slot index, and the phases.
+
+so the new thing is not "race plugins". it is "race cascades down
+separate physical egress paths" -- each path runs its OWN internally
+strict-serial cascade (phase1->2->3->4).
+
+against the no-interleave rule: racing CASCADES is not racing PHASES.
+each cascade stays strict-serial internally; you just run N of them,
+one per gateway. structurally different from the banned happy-eyeballs
+phase-racing -- but adjacent enough that this needs an explicit ruling
+before anyone builds it.
+
+what the reframe changes:
+  - the capability gate SHRINKS. contention is handled by physical
+    disjointness, not by OS. what is left is mostly the peer SYN-cap
+    budget (N paths x NUM_PORTS SYNs still land on the peer's one
+    stack). "recent windows" may not be the bar -- "recent enough to
+    not have the 10-SYN cap" might be the whole bar.
+  - the NON-INTERFERENCE MODEL (the hard, stateful scheduler that
+    reasons about port ranges / dest nic / wire disambiguation) drops
+    to "the harder, lower-value alternative" for the single-gateway
+    case. disjoint paths make it unnecessary.
+  - test bed already exists: every matrix VM is dual-NIC (NIC0 LAN
+    dual-stack, NIC1 mobile IPv4) -- a real two-gateway node.
+
+what the reframe does NOT change -- fd management still required:
+  interference is a per-RESOURCE problem -> disjoint gateways kill it.
+  fd exhaustion is a per-PROCESS problem -> disjoint gateways do NOT
+  kill it. every path's sockets draw from the same process fd table.
+  two paths both in phase3 => random_probe sprays ~256 sockets each
+  => ~512 concurrent, into windows select() / python selector ceilings.
+
+  so the fd budget survives -- but only as a flat GLOBAL ADMISSION
+  COUNTER, not as part of the non-interference model:
+      sum(socket footprint of all concurrent paths) <= fd ceiling
+  before a path opens its spray sockets, check global headroom; if
+  short, that path waits or serializes. a counter, not a model.
+
+  the three budgets are different shapes -- do not conflate:
+    - local fd ceiling : per-process, GLOBAL. shared, must be rationed.
+                         does NOT scale with paths.
+    - ~256 v6 udp flows: per-GATEWAY (router). disjoint routers each
+                         get their own. scales with paths.
+    - peer SYN cap     : peer's one stack. N paths' SYNs all land
+                         there. does NOT scale with paths.
+
+new open questions:
+  - path identity: what counts as a "discrete gateway path"? distinct
+    src nic is obvious. is v4-vs-v6 on the same nic a separate path
+    (separate sockets / separate NAT) or the same wire? probably same
+    wire -- do not split on af.
+  - does each path get the full plugin set, or is the plugin chosen
+    per path by that path's NAT shape?
+  - result handling: first path to produce a verified pipe wins; the
+    others get cancelled + closed. same close_plugin teardown the
+    serial cascade uses.
+  - still want per-path [AC-PHASE]-style telemetry to compare against
+    the serial baseline.
