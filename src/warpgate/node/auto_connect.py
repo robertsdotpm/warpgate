@@ -286,6 +286,26 @@ def is_transition_v6(ip_str):
     return False
 
 
+def path_bound(if_info, route_type):
+    """True if this route_type's bind path has a listener on this if_info.
+
+    Per-path ports come from the node address: NIC_BIND uses nic_port,
+    EXT_BIND uses ext_port. A port of 0 is the "no listener bound on
+    that path" sentinel (make_node_addr / listen_on_ifs). A missing
+    nic_port/ext_port key -- an older 9-field addr -- falls back to the
+    shared "port" field, so legacy peers are unaffected.
+    """
+    if route_type == NIC_BIND:
+        p = if_info.get("nic_port")
+    elif route_type == EXT_BIND:
+        p = if_info.get("ext_port")
+    else:
+        p = if_info.get("port")
+    if p is None:
+        p = if_info.get("port")
+    return bool(p)
+
+
 def viable_pairs_for_arc(
     af,
     route_type,
@@ -311,6 +331,13 @@ def viable_pairs_for_arc(
 
     def viable(src, dest):
         if not pair_distinct(route_type, src, dest):
+            return False
+        # Skip a combo whose route_type path has no bound listener on
+        # one side. Port 0 = "this path was not bound" (see
+        # make_node_addr / listen_on_ifs per-NIC bind paths) -- e.g. a
+        # NIC whose v6 fe80 failed to bind has nic_port 0, so NIC_BIND
+        # to it can't work and would otherwise burn a slot.
+        if not (path_bound(src, route_type) and path_bound(dest, route_type)):
             return False
         # NIC_BIND combos for cross-internet peers fire SYNs at peer's
         # private RFC1918 LAN IP, which isn't routable. Gate on same_lan
