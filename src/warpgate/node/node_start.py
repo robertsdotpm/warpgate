@@ -63,8 +63,21 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # so library / PyPI users aren't forced into the dev layout.
     verify_sibling_installs(strict=False)
 
+    # Startup timeline instrumentation. node_start is a flat sequence
+    # of awaits, each a wall-clock-bound step (network round trips,
+    # timeouts) -- one [NODE-START] line per step with a monotonic
+    # delta gives the whole startup breakdown from a single launch.
+    start_t = time.monotonic()
+
+    def mark(step):
+        log(fstr(
+            "[NODE-START] t={0}ms step={1}",
+            (int((time.monotonic() - start_t) * 1000), step),
+        ))
+
     # Hardware & Network Setup
     await load_network_interfaces(node)
+    mark("interfaces")
 
     # Validate --ip / listen_ips against the now-loaded NIC set.
     # Deferred from Node.__init__ because the Gate path doesn't
@@ -76,6 +89,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # Identity & Security
     await load_machine_identity(node)
     kp = load_cryptography_and_auth(node)
+    mark("identity")
 
     # Time & Synchronization
     # Must complete BEFORE the Router (and its MQTTClient instances) is
@@ -86,6 +100,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # fallback that hid a multi-hour clock-skew bug between
     # XP/Vista (BIOS clock drift) and modern VMs (NTP-synced).
     await initialize_system_clock(node, sys_clock, out, cout)
+    mark("sys_clock")
 
     # STUN clients + Router can run concurrently now that sys_clock
     # is established and can be passed into Router at construction.
@@ -93,12 +108,15 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
         load_p2p_stun_clients(node, out, cout),
         setup_router_and_signal(node, kp, out, cout),
     )
+    mark("stun+router")
 
     await initialize_punch_coordination(node, out, cout)
+    mark("punch_coord")
 
     # Start Servers
     start_maintenance_tasks(node)
     await listen_on_ifs(node)
+    mark("listen")
 
     # Finalize Connectivity — start UPnP only after the node is listening and
     # the listen port is known; await it after high-level setup so UPnP runs
@@ -108,9 +126,12 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
 
     # High-Level Services
     await setup_nickname_service(node)
+    mark("nickname")
     await setup_traversal_plugins(node)
+    mark("plugins")
 
     await finalize_port_forwarding(node, upnp_task, out, cout)
+    mark("port_forward")
 
     return node
 
