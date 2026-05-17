@@ -24,7 +24,7 @@ class TURNPlugin(Plugin):
     # in turn_utils.py); ~8 server attempts (48 s) leaves ~12 s for
     # CreatePermission + relay-tup futures + post-allocate signaling
     # tail latency on slower OSes / network paths.
-    conf = {"timeout": 60}
+    conf = {"timeout": 10}
     proto_messages = (
         (TURNMsg, P2P_RELAY, 10),
     )

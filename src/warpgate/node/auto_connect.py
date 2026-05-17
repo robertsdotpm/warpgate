@@ -827,7 +827,8 @@ async def phase2_tcp_punch(
     # external port per (src,dst) tuple, so the predicted ports never
     # match the peer's actual mappings -- every spray returns
     # successful=0/N. Without this skip, phase2 burns its full plugin
-    # timeout (180 s) on a punch that's mathematically impossible.
+    # timeout (10 s per slot) on a punch that's mathematically
+    # impossible.
     # Going straight to phase3 (where random_probe handles symmetric)
     # is strictly faster with no loss in success.
     # Symmetric-NAT skipping is now per-pair inside punch_phase via
@@ -842,8 +843,8 @@ async def phase2_tcp_punch(
     # Previously an XP/2000 connector cross-machine was routed to
     # tcp_punch_pcap or, if pcap wasn't installed, had phase2 skipped
     # outright -- on the assumption legacy tcp_punch would always hit
-    # XP's tcpip.sys simul-open RST and waste the 180 s plugin
-    # timeout.  XP is now allowed through the normal tcp_punch path
+    # XP's tcpip.sys simul-open RST and waste the plugin timeout.
+    # XP is now allowed through the normal tcp_punch path
     # like every other OS; if a given XP pair genuinely can't punch,
     # the cascade falls through to phase3/phase4 on its own.
     names = tuple(n for n in names if n != "tcp_punch_pcap")
