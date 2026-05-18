@@ -61,6 +61,7 @@ from ..node.nickname import (
     FullNameFailure, PnpServerResourceLimit, PnpServerUnreachable,
 )
 from ..gate import Gate, derive_default_pnp_digest
+from .. import __version__ as warpgate_version
 from ..node.node_start import register_and_persist
 from . import stop_rw
 from .defs import MENU_BANNER, PROGRAM_BANNER, demo_node_conf
@@ -86,6 +87,7 @@ async def setup_node():
     allow_windows_firewall("warpgate-demo")
 
     # Display program banner.
+    cout(fstr("warpgate {0}", (warpgate_version,)))
     cout(PROGRAM_BANNER)
     cout("pid = " + str(os.getpid()))
 
