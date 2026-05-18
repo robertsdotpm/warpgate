@@ -32,16 +32,129 @@ when none of its plugins are in the configured set.
 """
 import asyncio
 import ipaddress
+import os
 import time
 from aionetiface import (
-    IP4, IP6, IPRange, NIC_BIND, EXT_BIND, LOOPBACK_BIND, TCP, UDP,
+    IP4, IP6, IPRange, NIC_BIND, EXT_BIND, LOOPBACK_BIND, SUB_ALL, TCP, UDP,
     af_bitlen, fstr, log, log_exception, parse_node_addr,
 )
 from aionetiface.nic.nat.nat_defs import SYMMETRIC_NAT
 from .node_connect import resolve_pnp_addr
+from .node_protocol import (
+    WG_LIVENESS_PING_PREFIX,
+    WG_LIVENESS_PONG_PREFIX,
+    register_liveness_pong_future,
+    unregister_liveness_pong_future,
+)
 from .node_utils import enrich_addr_map_with_loopback
 from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
+
+
+async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3):
+    """Round-trip a WG-LIVENESS-PING over *pipe* and return True iff the
+    matching PONG comes back within the budget.
+
+    Auto_connect calls this after a phase function returns a non-None
+    pipe and before committing the pipe as the cascade winner.  Catches
+    the "engine declared ESTABLISHED but the pipe doesn't actually
+    carry bytes" failure mode -- NAT closed the mapping, OS RST'd the
+    socket, multi-NIC route asymmetry, etc.
+
+    PONG delivery uses a per-nonce future registered on the pipe
+    (register_liveness_pong_future).  node_protocol peels incoming
+    PONG bytes off and resolves the matching future, so PONG content
+    never enters the pipe's SUB_ALL subscription queue and can't
+    pollute the application's first recv() call.  This replaces an
+    earlier design where verify drained SUB_ALL until it found the
+    matching PONG -- duplicate PONGs from listener-side multi-broker
+    fan-out remained queued and surfaced as echo_msg=b'WG-LIVENESS-...'
+    in the application echo (observed on macOS and Win10).
+
+    ``transport=TCP`` runs one PING with a ``per_try_timeout`` budget
+    (TCP retransmits handle datagram loss for us).  ``transport=UDP``
+    loops up to ``retries`` times, re-sending the PING with a fresh
+    timeout each iteration -- a UDP datagram lost in either direction
+    would otherwise false-negative this entire check on the first
+    attempt.
+
+    per_try_timeout default is 3.0s.  It was 500ms, which false-negated
+    healthy tcp_punch pipes: timestamped logs measured the liveness
+    PING->PONG round trip at ~490ms on a freshly punched pipe -- not
+    network latency (LAN RTT is single-digit ms) but the post-punch
+    busy window, where both nodes are still tearing down the 18-socket
+    engine, running NAT classification, and processing MQTT signals,
+    so the PING queues behind that work before node_protocol peels it.
+    490ms sat right on the 500ms edge and flapped run to run.  3.0s
+    clears the post-punch window with margin while still rejecting a
+    genuinely dead pipe quickly enough for the cascade to fall through.
+
+    Returns True on the first matching PONG, False on timeout or send
+    error.  The caller should ``close_plugin`` the pipe and continue
+    the cascade on False.
+    """
+    # Diagnostic bypass: WG_SKIP_VERIFY=1 makes verify always pass so
+    # the cascade commits the pipe and the application echo gets a
+    # chance to run.  Used to split "pipe genuinely broken" from
+    # "pipe fine, liveness PING/PONG path broken" -- if the app echo
+    # succeeds under the bypass, the bug is in the liveness peel /
+    # per-nonce future, not the punch itself.
+    if os.environ.get("WG_SKIP_VERIFY") == "1":
+        log("[AC-VERIFY] WG_SKIP_VERIFY=1; skipping liveness check")
+        return True
+
+    nonce = os.urandom(8).hex().encode("ascii")
+    ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
+
+    loop = asyncio.get_event_loop()
+    pong_fut = loop.create_future()
+    register_liveness_pong_future(pipe, nonce, pong_fut)
+    log("[LIVENESS] mono={0:.4f} verify registered nonce={1} pipe_id={2} "
+        "pipe_type={3}".format(
+            time.monotonic(), nonce, id(pipe), type(pipe).__name__,
+        ))
+
+    # TCP fires one PING (TCP retransmits handle datagram loss); UDP
+    # retries.  The freshly-punched-pipe warm-up race -- verify firing
+    # before the worker's selector_proxy copy loop is pumping -- is
+    # NOT handled here: start_punching_process now withholds the pipe
+    # until the bridge signals ready (its ready socketpair), so by the
+    # time verify runs the copy loop is guaranteed live.  Retrying the
+    # PING on TCP only re-introduced duplicate PONGs that leaked into
+    # the application recv queue, so it stays UDP-only.
+    attempts = retries if transport == UDP else 1
+    try:
+        for attempt in range(attempts):
+            try:
+                await pipe.send(ping)
+                log("[LIVENESS] mono={0:.4f} PING sent attempt={1}".format(
+                    time.monotonic(), attempt + 1,
+                ))
+            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
+                log(fstr(
+                    "verify_pipe_alive: send failed attempt={0}/{1}: {2}: {3}",
+                    (attempt + 1, attempts, type(exc).__name__,
+                     str(exc) or "(no message)"),
+                ))
+                return False
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pong_fut), per_try_timeout,
+                )
+                return True
+            except asyncio.TimeoutError:
+                if pong_fut.done():
+                    return True
+                log("[LIVENESS] mono={0:.4f} PING attempt={1} timed out "
+                    "after {2}s".format(
+                        time.monotonic(), attempt + 1, per_try_timeout,
+                    ))
+                # Loop to next attempt (UDP) or fall through (TCP).
+                continue
+        return False
+    finally:
+        unregister_liveness_pong_future(pipe, nonce)
 
 
 def plugins_for_phase(phase):
@@ -173,6 +286,26 @@ def is_transition_v6(ip_str):
     return False
 
 
+def path_bound(if_info, route_type):
+    """True if this route_type's bind path has a listener on this if_info.
+
+    Per-path ports come from the node address: NIC_BIND uses nic_port,
+    EXT_BIND uses ext_port. A port of 0 is the "no listener bound on
+    that path" sentinel (make_node_addr / listen_on_ifs). A missing
+    nic_port/ext_port key -- an older 9-field addr -- falls back to the
+    shared "port" field, so legacy peers are unaffected.
+    """
+    if route_type == NIC_BIND:
+        p = if_info.get("nic_port")
+    elif route_type == EXT_BIND:
+        p = if_info.get("ext_port")
+    else:
+        p = if_info.get("port")
+    if p is None:
+        p = if_info.get("port")
+    return bool(p)
+
+
 def viable_pairs_for_arc(
     af,
     route_type,
@@ -198,6 +331,13 @@ def viable_pairs_for_arc(
 
     def viable(src, dest):
         if not pair_distinct(route_type, src, dest):
+            return False
+        # Skip a combo whose route_type path has no bound listener on
+        # one side. Port 0 = "this path was not bound" (see
+        # make_node_addr / listen_on_ifs per-NIC bind paths) -- e.g. a
+        # NIC whose v6 fe80 failed to bind has nic_port 0, so NIC_BIND
+        # to it can't work and would otherwise burn a slot.
+        if not (path_bound(src, route_type) and path_bound(dest, route_type)):
             return False
         # NIC_BIND combos for cross-internet peers fire SYNs at peer's
         # private RFC1918 LAN IP, which isn't routable. Gate on same_lan
@@ -687,7 +827,8 @@ async def phase2_tcp_punch(
     # external port per (src,dst) tuple, so the predicted ports never
     # match the peer's actual mappings -- every spray returns
     # successful=0/N. Without this skip, phase2 burns its full plugin
-    # timeout (180 s) on a punch that's mathematically impossible.
+    # timeout (5 s per slot) on a punch that's mathematically
+    # impossible.
     # Going straight to phase3 (where random_probe handles symmetric)
     # is strictly faster with no loss in success.
     # Symmetric-NAT skipping is now per-pair inside punch_phase via
@@ -698,42 +839,14 @@ async def phase2_tcp_punch(
     # FULL_CONE-FULL_CONE pair could punch fine. Per-pair filtering
     # keeps the impossible (sym, *) and (*, sym) pairs out of the
     # combo list while preserving viable LAN-LAN and EXT-EXT combos.
-    # Asymmetric plugin selection based on OUR OS only:
-    #   - we are on Windows-XP / Windows-2000 cross-machine ->
-    #     route locally to tcp_punch_pcap (userspace pcap stack
-    #     bypasses XP's tcpip.sys simul-open RST -- see
-    #     /home/x/projects/warpgate/CLAUDE.md "Windows XP cross-NAT
-    #     tcp_punch is not fixable from user-space")
-    #   - we are on any other OS -> route locally to tcp_punch
-    #     (kernel stack, unchanged)
-    # The PEER independently picks its plugin from its own OS.  A
-    # non-XP peer's selection doesn't force us into tcp_punch_pcap
-    # and vice versa.  The two plugins share the same wire format
-    # (tcp_punch.PunchMsg) so the choices interoperate freely.
-    src_os = (src_map or {}).get("os") or ""
-    we_are_nt5 = (
-        src_os.startswith("Windows-XP")
-        or src_os.startswith("Windows-2000")
-    )
-    if we_are_nt5 and not is_same_machine(src_map, dest_map):
-        if "tcp_punch_pcap" in names:
-            log("phase2_tcp_punch: local OS is {0} cross-machine; "
-                "routing to tcp_punch_pcap (userspace pcap stack)".format(
-                    src_os,
-                ))
-            return await punch_phase(
-                node, src_map, dest_map, sig_pipe,
-                plugin_names=("tcp_punch_pcap",),
-                label="phase2_pcap",
-            )
-        log("phase2_tcp_punch: local OS is {0} cross-machine; "
-            "tcp_punch_pcap not installed -- skipping (legacy tcp_punch "
-            "would hit the tcpip.sys RST and waste 180 s)".format(src_os))
-        return None, None
-    # Not-NT5: strip tcp_punch_pcap from the plugin list -- the
-    # plugin's setup() already opts out on non-NT5 hosts as defence-
-    # in-depth, but if it somehow registered we still don't want to
-    # race against legacy tcp_punch.
+    # Windows-XP / Windows-2000 are NOT special-cased here any more.
+    # Previously an XP/2000 connector cross-machine was routed to
+    # tcp_punch_pcap or, if pcap wasn't installed, had phase2 skipped
+    # outright -- on the assumption legacy tcp_punch would always hit
+    # XP's tcpip.sys simul-open RST and waste the plugin timeout.
+    # XP is now allowed through the normal tcp_punch path
+    # like every other OS; if a given XP pair genuinely can't punch,
+    # the cascade falls through to phase3/phase4 on its own.
     names = tuple(n for n in names if n != "tcp_punch_pcap")
     return await punch_phase(
         node, src_map, dest_map, sig_pipe,
@@ -991,7 +1104,31 @@ async def auto_connect(
             phase4_turn,
         ):
             phase_t0 = time.monotonic()
-            pipe, plugin = await phase_fn(node, src_map, dest_map, sig_pipe, plugin_set)
+            # test_all_phases runs every phase for measurement even
+            # after one has won. A later phase raising must NOT abort
+            # the loop and discard an earlier phase's winner_pipe -- it
+            # is only bonus measurement at that point. Treat any phase
+            # error as "no pipe" and carry on. A CancelledError with no
+            # winner yet is a genuine teardown and is re-raised.
+            try:
+                pipe, plugin = await phase_fn(
+                    node, src_map, dest_map, sig_pipe, plugin_set,
+                )
+            except asyncio.CancelledError:
+                if winner_pipe is None:
+                    raise
+                log(fstr(
+                    "[AC-PHASE] {0} cancelled; keeping earlier winner",
+                    (phase_fn.__name__,),
+                ))
+                pipe, plugin = None, None
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
+                log(fstr(
+                    "[AC-PHASE] {0} raised; treating as no-pipe",
+                    (phase_fn.__name__,),
+                ))
+                pipe, plugin = None, None
             elapsed_ms = int((time.monotonic() - phase_t0) * 1000)
             src_nat = worst_nat(src_map)
             dest_nat = worst_nat(dest_map)
@@ -1008,6 +1145,7 @@ async def auto_connect(
                 dest_cgnat,
             )
             log(line)
+            print(line, flush=True)
             tel = getattr(node, "telemetry", None)
             if tel is not None:
                 try:
@@ -1022,8 +1160,28 @@ async def auto_connect(
                 except Exception:
                     pass
             if pipe is not None and winner_pipe is None:
-                winner_pipe = pipe
-                winner_plugin = plugin
+                # Liveness verify: punch engines occasionally declare
+                # ESTABLISHED for a pipe that the kernel then tears
+                # down before app bytes can flow (multi-NIC routing
+                # asymmetry, NAT mapping closing on the spray's
+                # trailing SYNs, XP-style 174ms post-handshake RST,
+                # etc).  Round-trip a PING and fall through to the
+                # next phase if no PONG comes back.
+                transport = getattr(plugin, "transport", TCP)
+                alive = await verify_pipe_alive(pipe, transport=transport)
+                if not alive:
+                    log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
+                        phase_fn.__name__,
+                    ))
+                    try:
+                        await close_plugin(
+                            plugin, node.traversal.plugins, node.traversal.inbound_pipes,
+                        )
+                    except (OSError, asyncio.TimeoutError):
+                        log_exception()
+                else:
+                    winner_pipe = pipe
+                    winner_plugin = plugin
             elif pipe is not None:
                 try:
                     await close_plugin(
@@ -1059,8 +1217,26 @@ async def auto_connect(
             node, src_map, dest_map, sig_pipe, plugin_set,
         )
         if pipe is not None:
-            winner_pipe = pipe
-            winner_plugin = plugin
-            break
+            # Same liveness check as the test_all_phases path above:
+            # only accept the pipe as the cascade winner if a PING
+            # actually round-trips through it.  Catches the "engine
+            # reported ESTABLISHED but the OS / NAT then RST'd the
+            # connection" failure mode.  On failure, close the
+            # plugin and let the next phase have a shot.
+            transport = getattr(plugin, "transport", TCP)
+            alive = await verify_pipe_alive(pipe, transport=transport)
+            if alive:
+                winner_pipe = pipe
+                winner_plugin = plugin
+                break
+            log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
+                phase_fn.__name__,
+            ))
+            try:
+                await close_plugin(
+                    plugin, node.traversal.plugins, node.traversal.inbound_pipes,
+                )
+            except (OSError, asyncio.TimeoutError):
+                log_exception()
 
     return winner_pipe, winner_plugin

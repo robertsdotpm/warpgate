@@ -303,9 +303,15 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
         mode, src_nat, dest_nat, recv_mappings, test_no
     )
 
-    # Preload nat predictions then
-    # mock single mapping can be a function.
-    preloaded_mappings = await preload_mappings(len(recv_mappings), stuns)
+    # Preload NAT predictions: 3 successive STUN samples.  This path
+    # carries the punch only when the boundary allocator was skipped
+    # -- i.e. at least one side has a non-deterministic delta
+    # (INDEPENDENT / DEPENDENT / RANDOM / PRESERV), where the external
+    # port genuinely has to be measured rather than derived from the
+    # time bucket.  3 successive samples are enough to pin the
+    # allocation pattern; get_single_mapping's IndexError fallback to
+    # preloaded_mappings[0] covers indices beyond 3.
+    preloaded_mappings = await preload_mappings(3, stuns)
     assert len(preloaded_mappings)
 
     # Use default ports for client if unknown

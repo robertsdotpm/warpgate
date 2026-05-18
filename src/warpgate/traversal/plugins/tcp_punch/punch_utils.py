@@ -123,51 +123,7 @@ async def setup_punch_coordination(node, sys_clock=None):
     node.sys_clock = sys_clock
 
 
-def wait_for_one_remaining(sockets, timeout=5.0):
-    """
-    Waits up to 5 seconds for all but one socket to close.
-    Does NOT close the sockets locally.
-    """
-    sel = selectors.DefaultSelector()
-    remaining = set(sockets)
-
-    for s in sockets:
-        s.setblocking(False)
-        sel.register(s, selectors.EVENT_READ)
-
-    deadline = time.monotonic() + timeout
-    while len(remaining) > 1:
-        wait_time = deadline - time.monotonic()
-        if wait_time <= 0:
-            break  # Hard stop at 5 seconds
-
-        events = sel.select(timeout=wait_time)
-        for key, _ in events:
-            s = key.fileobj
-            try:
-                # recv() returning b"" is the canonical EOF signal
-                data = s.recv(4096)
-                if data == b"":
-                    remaining.discard(s)
-                    try:
-                        sel.unregister(s)
-                    except OSError:
-                        pass
-            except OSError:
-                # Any error (connection reset, etc) counts as "gone"
-                remaining.discard(s)
-                try:
-                    sel.unregister(s)
-                except OSError:
-                    pass
-
-    sel.close()
-
-    # Return the winner, or None if everyone died/timed out
-    return list(remaining)[0] if remaining else None
-
-
-def wait_for_first_with_data(sockets, timeout=5.0):
+def wait_for_first_with_data(sockets, timeout):
     """
     Wait until one of the sockets has data, then read and return it.
     Returns (socket, data) or (None, None) if timed out.
@@ -227,7 +183,7 @@ def peer_symmetric_4tuple_key(sock):
 
 
 # In a LAN = lan ip, or for WAN targets = wan IPs.
-def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None):
+def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None, sentinel_wait=None):
     """Select one winning socket from a punched connection set,
     closing the rest.
 
@@ -241,6 +197,13 @@ def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None):
     which produced a non-deterministic winner depending on which
     sockets happened to reach ESTABLISHED first in the punch monitor
     window.
+
+    ``sentinel_wait`` is the timeout (seconds) the non-master side
+    waits for the master's ``b"$"`` sentinel byte to land on one of
+    the candidate sockets.  Callers should pass the engine's
+    ``monitor_timeout`` (from FAST_PUNCH_PARAMS) so the wait scales
+    with the configured punch profile instead of carrying a stale
+    hardcoded value.
     """
     # No open sockets.
     if not sock_list:
@@ -268,8 +231,13 @@ def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None):
 
             loser.close()
     else:
-        # Non-master side waits for the first completed connection
-        winner = wait_for_first_with_data(sock_list)
+        # Non-master side waits for the first completed connection.
+        # sentinel_wait=None preserves the legacy 5.0s default for
+        # callers that haven't been updated to pass the configured
+        # value, but engine callers should always pass monitor_timeout.
+        if sentinel_wait is None:
+            sentinel_wait = 5.0
+        winner = wait_for_first_with_data(sock_list, sentinel_wait)
         for loser in sock_list:
             if loser is not winner:
                 try:

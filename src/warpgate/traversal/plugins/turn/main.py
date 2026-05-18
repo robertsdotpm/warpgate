@@ -19,12 +19,18 @@ class TURNPlugin(Plugin):
     # for us. The historical "if route_type == NIC_BIND: return"
     # guard at the top of run() is no longer needed.
     route_types = (EXT_BIND,)
-    # 60 s budget: get_first_working_turn_client walks the rendezvous-
-    # ranked server list with a 6 s per-server cap (PER_SERVER_TIMEOUT
-    # in turn_utils.py); ~8 server attempts (48 s) leaves ~12 s for
-    # CreatePermission + relay-tup futures + post-allocate signaling
-    # tail latency on slower OSes / network paths.
-    conf = {"timeout": 60}
+    # 10 s budget (per phase4_turn attempt; phase4 retries up to
+    # TURN_TOTAL_CAP times). Unlike the punch plugins -- one NTP-pinned
+    # shot, ~3 s -- turn is a two-round-trip cross-node protocol:
+    # initiator allocates, signals the peer, the responder allocates +
+    # accepts, signals back, the initiator's self.ready resolves.
+    # Critical path = initiator_alloc + signal_RTT + responder_alloc +
+    # accept + signal_RTT. Matrix best-case is ~2.6 s (fast local MQTT);
+    # structural worst legit case ~8 s. 10 s nests the internal caps:
+    # 10 (outer) > 8 (self.ready) > 4 (PER_SERVER_TIMEOUT / start() /
+    # accept_peer()) -- every inner timeout strictly inside its
+    # encloser so none is dead behind the outer cap.
+    conf = {"timeout": 10}
     proto_messages = (
         (TURNMsg, P2P_RELAY, 10),
     )
@@ -277,7 +283,7 @@ class TURNPlugin(Plugin):
             dest_relay = reply.payload.relay_tup
             try:
                 already_accepted = await asyncio.wait_for(
-                    client.accept_peer(dest_peer, dest_relay), 30,
+                    client.accept_peer(dest_peer, dest_relay), 4,
                 )
             except asyncio.TimeoutError:
                 await self.send_rejection("accept_peer_timeout")
@@ -332,13 +338,15 @@ class TURNPlugin(Plugin):
         await self.send_signal(msg)
 
         # --- Wait for the peer to whitelist our relay ---
-        # self.ready is resolved by a second run() call when the peer's reply
-        # arrives. Cap at 40s: peer allocation + accept_peer takes at most
-        # ~35s (6s alloc + 25s accept_peer max), plus signaling overhead.
-        # Without this cap, a non-responding peer makes us burn the full
-        # 60s plugin timeout at the initiator side.
+        # self.ready is resolved by a second run() call when the peer's
+        # reply arrives. Cap at 8s: it covers the peer's full round-trip
+        # -- responder alloc (<=4s) + accept_peer (<=4s) + two signaling
+        # hops -- and sits inside the 10s plugin conf timeout with room
+        # for the initiator's own pre-work (its alloc + outgoing signal).
+        # Without this cap a non-responding peer would burn the whole
+        # plugin timeout at the initiator side.
         try:
-            pipe = await asyncio.wait_for(self.ready, 40)
+            pipe = await asyncio.wait_for(self.ready, 8)
         except asyncio.TimeoutError:
             if not self.result.done():
                 self.result.set_result(None)

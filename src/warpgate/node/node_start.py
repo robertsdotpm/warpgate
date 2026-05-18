@@ -10,7 +10,11 @@ from aionetiface import (
     fstr, log, log_exception, log_p2p, async_wrap_errors,
     IP4, IP6, OPEN_INTERNET, AFGroup, Interface, SysClock,
     list_interfaces, load_interfaces, parse_node_addr, make_node_addr,
-    field_wrap, dhash, create_task, Signing, os_id,
+    field_wrap, dhash, create_task, Signing, os_id, os_net_timeouts,
+)
+from aionetiface.nic.nat.nat_utils import nat_info
+from aionetiface.nic.nat.nat_cache import (
+    network_fingerprint, nat_cache_get, nat_cache_put,
 )
 from sidewire import Router
 from .node_utils import (
@@ -28,6 +32,12 @@ from .nickname import Nickname
 from ..traversal.traversal_manager import TraversalManager
 from ..traversal.plugin_loader import load_plugins
 from ..install_check import verify_sibling_installs
+
+
+# Per-OS network-load timeouts come from aionetiface.os_net_timeouts()
+# -- one table (NET_TIMEOUTS) shared by node startup, STUN, and the
+# MQTT broker walk so XP/Vista get coherent budgets everywhere. Node
+# startup uses the interface_load and nat_load entries.
 
 
 # ==========================================
@@ -63,8 +73,21 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # so library / PyPI users aren't forced into the dev layout.
     verify_sibling_installs(strict=False)
 
+    # Startup timeline instrumentation. node_start is a flat sequence
+    # of awaits, each a wall-clock-bound step (network round trips,
+    # timeouts) -- one [NODE-START] line per step with a monotonic
+    # delta gives the whole startup breakdown from a single launch.
+    start_t = time.monotonic()
+
+    def mark(step):
+        log(fstr(
+            "[NODE-START] t={0}ms step={1}",
+            (int((time.monotonic() - start_t) * 1000), step),
+        ))
+
     # Hardware & Network Setup
     await load_network_interfaces(node)
+    mark("interfaces")
 
     # Validate --ip / listen_ips against the now-loaded NIC set.
     # Deferred from Node.__init__ because the Gate path doesn't
@@ -76,6 +99,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # Identity & Security
     await load_machine_identity(node)
     kp = load_cryptography_and_auth(node)
+    mark("identity")
 
     # Time & Synchronization
     # Must complete BEFORE the Router (and its MQTTClient instances) is
@@ -86,19 +110,29 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # fallback that hid a multi-hour clock-skew bug between
     # XP/Vista (BIOS clock drift) and modern VMs (NTP-synced).
     await initialize_system_clock(node, sys_clock, out, cout)
+    mark("sys_clock")
 
     # STUN clients + Router can run concurrently now that sys_clock
     # is established and can be passed into Router at construction.
+    # Each is wrapped so it marks when its own coroutine finishes --
+    # they still run concurrently, but the timeline shows which of the
+    # two dominates the parallel window.
+    async def timed_step(coro, label):
+        await coro
+        mark(label)
+
     await asyncio.gather(
-        load_p2p_stun_clients(node, out, cout),
-        setup_router_and_signal(node, kp, out, cout),
+        timed_step(load_p2p_stun_clients(node, out, cout), "stun"),
+        timed_step(setup_router_and_signal(node, kp, out, cout), "router"),
     )
 
     await initialize_punch_coordination(node, out, cout)
+    mark("punch_coord")
 
     # Start Servers
     start_maintenance_tasks(node)
     await listen_on_ifs(node)
+    mark("listen")
 
     # Finalize Connectivity — start UPnP only after the node is listening and
     # the listen port is known; await it after high-level setup so UPnP runs
@@ -106,11 +140,24 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     build_node_address(node, out)
     upnp_task = start_background_port_forwarding(node)
 
+    # Real NAT classification runs here, off the startup path. The
+    # address was just built with cached-or-placeholder NAT; this task
+    # probes the real values, caches them, and republishes if they
+    # differ. node.nat_classify_task is exposed so callers can await
+    # it if they need a definitely-classified NAT.
+    node.nat_classify_task = create_task(
+        async_wrap_errors(classify_nat_background(node, out))
+    )
+    node.resources.add_task(node.nat_classify_task)
+
     # High-Level Services
     await setup_nickname_service(node)
+    mark("nickname")
     await setup_traversal_plugins(node)
+    mark("plugins")
 
     await finalize_port_forwarding(node, upnp_task, out, cout)
+    mark("port_forward")
 
     return node
 
@@ -131,39 +178,141 @@ async def load_network_interfaces(node):
     """
     if not node.ifs:
         nic_names = getattr(node, "nic_names", [])
-        for attempt in range(3):
-            try:
-                if_names = await list_interfaces()
-                if nic_names:
-                    filtered = [n for n in if_names if n in nic_names]
-                    if not filtered:
-                        raise ValueError(
-                            "nic_names {0!r} matched no available interfaces {1!r}".format(
-                                nic_names, if_names
-                            )
+        try:
+            if_names = await list_interfaces()
+            if nic_names:
+                filtered = [n for n in if_names if n in nic_names]
+                if not filtered:
+                    raise ValueError(
+                        "nic_names {0!r} matched no available interfaces {1!r}".format(
+                            nic_names, if_names
                         )
-                    if_names = filtered
-                node.ifs = await load_interfaces(if_names, Interface)
-            except asyncio.CancelledError:
-                raise
-            except ValueError:
-                raise
-            except (OSError, asyncio.TimeoutError):
-                log_exception()
-                node.ifs = []
-
-            if node.ifs:
-                break
-            if attempt < 2:
-                log("load_network_interfaces: no interfaces loaded (attempt {0}/3); retrying in 5s".format(
-                    attempt + 1
-                ))
-                await asyncio.sleep(5)
+                    )
+                if_names = filtered
+            # skip_nat=True: NAT classification (~2s of STUN probing)
+            # is deferred off the startup path. apply_cached_or_
+            # placeholder_nat seeds nic.nat below; classify_nat_
+            # background does the real probe after the node is up.
+            # timeout scales up on XP/Vista (slow interface enum).
+            node.ifs = await load_interfaces(
+                if_names, Interface, skip_nat=True,
+                timeout=os_net_timeouts()["interface_load"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except ValueError:
+            raise
+        except (OSError, asyncio.TimeoutError):
+            log_exception()
+            node.ifs = []
 
     node.ifs = sorted(node.ifs, key=lambda x: x.name)
 
     if not node.ifs:
-        raise AssertionError("p2p node could not load ifs.")
+        raise RuntimeError("p2p node could not load ifs.")
+
+    # Seed nic.nat from the network-fingerprint cache (or an optimistic
+    # placeholder) so the address can be built and published without
+    # waiting on NAT classification. Idempotent via the nat_fingerprint
+    # guard -- whichever of Gate pre-start / node_start runs first does
+    # the work, the other is a no-op.
+    if not getattr(node, "nat_fingerprint", None):
+        apply_cached_or_placeholder_nat(node)
+
+def apply_cached_or_placeholder_nat(node):
+    """Seed every nic.nat from the NAT cache, or an optimistic placeholder.
+
+    NAT classification proper is deferred to classify_nat_background;
+    this just makes nic.nat non-None so node_start can build and
+    publish the address straight away. A network-fingerprint cache hit
+    seeds the real previously-measured values (rebuilt via nat_info to
+    avoid trusting the raw JSON blob); a miss seeds nat_info()'s
+    optimistic default. Either way the background task overwrites it
+    with a fresh probe and republishes if it differs.
+    """
+    fingerprint = network_fingerprint(node.ifs)
+    node.nat_fingerprint = fingerprint
+    cached = nat_cache_get(fingerprint) or {}
+    for nic in node.ifs:
+        name = getattr(nic, "name", None)
+        entry = cached.get(name)
+        if entry and "type" in entry and "delta" in entry:
+            try:
+                nic.set_nat(nat_info(entry["type"], entry["delta"]))
+                continue
+            except (ValueError, KeyError, TypeError):
+                log_exception()
+        if getattr(nic, "nat", None) is None:
+            nic.set_nat(nat_info())
+
+
+async def classify_nat_background(node, out):
+    """Run real NAT classification off the startup path, then cache + republish.
+
+    node_start publishes the node address seeded with cached-or-
+    placeholder NAT so startup never blocks on the ~2s STUN
+    classification probe. This task does the real probe, stores the
+    result in the network-fingerprint cache, and -- only if the
+    measured NAT differs from what was published -- rebuilds and
+    re-publishes the address. Re-publishing the same PNP name is an
+    UPDATE and does not consume nickname quota.
+
+    The ~2s classify + republish completes well inside the ~8s
+    connector settling window, so a peer never resolves the
+    placeholder addr in practice.
+    """
+    classify_t0 = time.monotonic()
+    before = {}
+    for nic in node.ifs:
+        before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
+
+    # NAT classification timeout scales up on XP/Vista (slow stacks).
+    nat_timeout = os_net_timeouts()["nat_load"]
+    nat_by_nic = {}
+    for nic in node.ifs:
+        try:
+            await asyncio.wait_for(
+                nic.load_nat(timeout=nat_timeout),
+                timeout=nat_timeout + 5,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            log_exception()
+        except Exception:  # pylint: disable=broad-except
+            log_exception()
+        nat = getattr(nic, "nat", None)
+        if nat is not None:
+            nat_by_nic[getattr(nic, "name", None)] = nat
+
+    log(fstr(
+        "[NAT-CLASSIFY] t={0}ms done nics={1}",
+        (int((time.monotonic() - classify_t0) * 1000), len(nat_by_nic)),
+    ))
+
+    fingerprint = getattr(node, "nat_fingerprint", None)
+    if fingerprint:
+        nat_cache_put(fingerprint, nat_by_nic)
+
+    # Republish only if the measured NAT differs from what the address
+    # was built with.
+    changed = any(
+        before.get(getattr(nic, "name", None)) != getattr(nic, "nat", None)
+        for nic in node.ifs
+    )
+    if not changed:
+        log("[NAT-CLASSIFY] measured NAT matches published addr; no republish")
+        return
+
+    log("[NAT-CLASSIFY] measured NAT differs; rebuilding + republishing addr")
+    build_node_address(node, out)
+    register_name = getattr(node, "pnp_name", None) or node.node_id
+    try:
+        await register_and_persist(node, register_name)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        log_exception()
 
 
 def start_background_port_forwarding(node):
@@ -427,39 +576,24 @@ def build_node_address(node, out):
 
 
 async def finalize_port_forwarding(node, upnp_task, out, cout):
-    """Await the background UPnP task and log whether forwarding and reachability succeeded."""
+    """Hand the UPnP/PCP task off to background tracking; do not block startup on it.
+
+    Port forwarding only benefits the direct / reverse-connect path,
+    and its failure degrades gracefully -- reverse_connect still works
+    without a forwarded port. Awaiting it here used to add ~2-8s to
+    node startup: a router with no IGD/PCP just burns the SSDP/PCP
+    discovery timeout while the rest of the node sits idle waiting.
+
+    Instead, register the task with node.resources so it is cancelled
+    on shutdown, and return immediately. The mapping installs in the
+    background whenever discovery completes. The task uses a static
+    mapping description ("warpgate" -- see forward()), so a background
+    run never accumulates duplicate-named entries on the IGD.
+    """
     if upnp_task:
         if out:
-            cout("\tStarting UPnP forwarding...")
-
-        # Cap UPnP discovery / port-forward at 8s -- on XP the SSDP
-        # stack drags this out to 13-15s, which combined with the
-        # other startup phases blows past the 30s wait_for budget
-        # callers like asyncio.wait_for(Node().start(), timeout=30)
-        # use, making node startup look like a hard timeout when it's
-        # actually just slow UPnP. 8s is enough for a working router
-        # on every other platform; failures degrade gracefully (no
-        # forwarding -> reverse_connect fallback still works).
-        try:
-            upnp_ret = await asyncio.wait_for(upnp_task, timeout=8)
-        except asyncio.TimeoutError:
-            upnp_ret = None
-            if out:
-                cout("\t\tUPnP timed out after 8s; continuing without forwarding.")
-        if upnp_ret:
-            forward_success, reachable = upnp_ret
-        else:
-            forward_success = reachable = None
-
-        # Output AFs and NICs where UPnP succeeded on.
-        if forward_success or reachable:
-            if out:
-                cout("\t\tUPnP forwarded = ", forward_success)
-            if out:
-                cout("\t\tUPnP reachable = ", reachable)
-        else:
-            if out:
-                cout("\t\tUPnP failed: reverse connect won't work.")
+            cout("\tUPnP/PCP forwarding running in background...")
+        node.resources.add_task(upnp_task)
 
 
 # ==========================================
@@ -504,13 +638,23 @@ async def register_and_persist(node, name):
     """
     node.nickname_error = None
     node.full_name = None
+    register_t0 = time.monotonic()
+    log("[REGISTER-TIME] t=0ms step=put_start")
     try:
         node.full_name = await node.nickname(name)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pylint: disable=broad-except
         node.nickname_error = exc
+        log(fstr(
+            "[REGISTER-TIME] t={0}ms step=put_failed {1}",
+            (int((time.monotonic() - register_t0) * 1000), repr(exc)),
+        ))
         raise
+    log(fstr(
+        "[REGISTER-TIME] t={0}ms step=put_done",
+        (int((time.monotonic() - register_t0) * 1000),),
+    ))
 
 
 async def setup_traversal_plugins(node):

@@ -62,18 +62,18 @@ def select_remote_dial(af, route_type, src, dest):
         ip = dest.get("loopback")
         port = dest.get("nic_port", dest.get("port"))
     elif route_type == NIC_BIND:
-        # v6 mirror of the local-bind logic: dest["nic"] is the peer's
-        # fe80 link-local when any v6 link-local exists on their route.
-        # That's only reachable on a shared L2 segment; for cross-link
-        # we want their global v6 -- which lives in dest["ext"].
-        if af == IP6:
-            dest_nic = dest.get("nic")
-            if dest_nic is None or str(dest_nic).lower().startswith("fe80"):
-                ip = dest.get("ext") or dest_nic
-            else:
-                ip = dest_nic
-        else:
-            ip = dest["nic"]
+        # Dial the peer's nic IP directly -- the mirror of
+        # select_local_bind's src["nic"]. NIC_BIND is only ever paired
+        # for same-machine / same-LAN peers (auto_connect's viable()
+        # gates it on same_machine or same_lan), so the peer's nic IP
+        # is always L2-reachable, including a v6 fe80 link-local: its
+        # scope is the interface the punch socket binds to.
+        #
+        # Do NOT swap a v6 fe80 dest for dest["ext"] (global): src
+        # binds the link-local nic IP, so a global dest is a scope
+        # mismatch and the connection cannot form. Cross-link peers
+        # never reach NIC_BIND -- they use EXT_BIND.
+        ip = dest["nic"]
         port = dest.get("nic_port", dest.get("port"))
     elif route_type == EXT_BIND:
         ip = dest["ext"]

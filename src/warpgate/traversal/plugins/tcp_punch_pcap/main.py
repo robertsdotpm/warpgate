@@ -31,7 +31,7 @@ import asyncio
 import sys
 
 from aionetiface import (
-    log, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task,
+    log, fstr, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task,
     shutdown_proc_pool,
 )
 
@@ -92,7 +92,7 @@ class PunchPcapPlugin(Plugin):
     # converges in <2 s once both sides fire or it won't converge at
     # all (no NAT timer extension to play for, no XP reverse-bridge
     # accept tail to budget for).
-    conf = {"timeout": 60}
+    conf = {"timeout": 5}
     # DO NOT register PunchMsg here. tcp_punch already registers it
     # under wire name "tcp_punch.PunchMsg"; listing it here would
     # either collide or create a second wire name and break interop.
@@ -261,6 +261,11 @@ class PunchPcapPlugin(Plugin):
         self.nat_alloc = NATPredictAlloc(stuns)
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
         self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
+        # Future the pcap-engine task waits on instead of sleeping a
+        # fixed interval -- resolved by advance_punching_protocol the
+        # moment the peer's mappings have been folded into
+        # puncher.port_allocs.  Same pattern as tcp_punch and udp_punch.
+        self.mapping_reply = asyncio.get_event_loop().create_future()
         if self.plugin_id not in self.punch_proc:
             self.punch_proc[self.plugin_id] = asyncio.ensure_future(
                 async_wrap_errors(self.delayed_start_punching_proc(
@@ -296,8 +301,32 @@ class PunchPcapPlugin(Plugin):
                 log("tcp_punch_pcap: peer sent empty mappings; dropping")
                 return None
 
+        # Re-entry guard: same as tcp_punch / udp_punch.  Keyed on a
+        # peer_mappings_folded flag, NOT puncher.port_allocs -- the
+        # allocator runs in setup before advance is ever reached, so a
+        # port_allocs check false-fires on the first legitimate call
+        # (returns None without folding the peer mappings, never
+        # resolves mapping_reply).  See tcp_punch for the full
+        # rationale.
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
+            log(fstr(
+                "tcp_punch_pcap: duplicate reply ignored "
+                "(peer mappings already folded, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
+
+        # Signal the pcap-engine task: peer's mappings have been folded
+        # in and port_allocs is now valid.  Guarded by not done() so
+        # re-entries across signal rounds don't InvalidStateError.
+        reply_future = getattr(self, "mapping_reply", None)
+        if reply_future is not None and not reply_future.done():
+            reply_future.set_result(True)
 
         if is_end == 1:
             return None
@@ -316,7 +345,7 @@ class PunchPcapPlugin(Plugin):
         return msg
 
     async def delayed_start_punching_proc(self, nic, puncher):
-        """Wait coordinator delay then fire the pcap engine.
+        """Wait for the peer's mapping reply (or reply_delay timeout) then fire the pcap engine.
 
         On a winner, wrap the userspace ``Connection`` in a
         :class:`PipeShim` so downstream code (gate.Link, demo,
@@ -329,12 +358,21 @@ class PunchPcapPlugin(Plugin):
         """
         from aionetiface.net.pcap.tcp.pipe_shim import PipeShim
 
-        coordinator_delay = puncher.params.get("coordinator_delay", 0.5)
+        # Same mapping_reply-future pattern as tcp_punch / udp_punch:
+        # wait for the peer's mappings to land via
+        # advance_punching_protocol, or fall through after reply_delay
+        # seconds for the dropped-signal case (LAN-mode short-circuit
+        # also relies on the fallback since it never sets the future).
+        reply_delay = puncher.params.get("reply_delay", 0.5)
         firewall_ports = []
         winner_conn = None
         shim_wrapped = False
         try:
-            await asyncio.sleep(coordinator_delay)
+            try:
+                await asyncio.wait_for(self.mapping_reply, reply_delay)
+            except asyncio.TimeoutError:
+                log("[PCAP-PUNCH-DELAY] mapping_reply timed out after "
+                    "{0}s; proceeding".format(reply_delay))
             # Install per-OS firewall blocks on every predicted local
             # port BEFORE the punch fires. tcpip.sys / Linux kernel
             # must NOT see the SYN as "no socket listening" and emit

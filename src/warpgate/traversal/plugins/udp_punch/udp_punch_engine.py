@@ -458,8 +458,16 @@ def udp_punch_engine(
     if not is_master:
         sock_family = bound_socks[0][1].family if bound_socks else socket.AF_INET
         if sock_family == socket.AF_INET6:
-            ttl_level = socket.IPPROTO_IPV6
-            ttl_opt = socket.IPV6_UNICAST_HOPS
+            # socket.IPPROTO_IPV6 / IPV6_UNICAST_HOPS are not always
+            # exposed as attributes of the socket module on Windows --
+            # they are missing on the Vista Python 3.7 build. Without a
+            # fallback the v6 spray's TTL setup raises AttributeError
+            # and the whole udp_punch engine aborts, which is exactly
+            # why udp_punch was v6-0/5 on vista. Fall back to the fixed
+            # IANA protocol/option numbers (IPPROTO_IPV6=41,
+            # IPV6_UNICAST_HOPS=4).
+            ttl_level = getattr(socket, "IPPROTO_IPV6", 41)
+            ttl_opt = getattr(socket, "IPV6_UNICAST_HOPS", 4)
         else:
             ttl_level = socket.IPPROTO_IP
             ttl_opt = socket.IP_TTL

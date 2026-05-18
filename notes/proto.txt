@@ -1,0 +1,18 @@
+might be kewel to build protocols as some kind of declarative state machine
+that could be viewed as a diagram
+
+
+@sender({receiver: recv_mappings, timeout: something})
+def init_mappings():
+    pass
+
+@receiver(sender: recv_predictions)
+def return_predictions():
+    pass
+
+@sender
+def recv_predictions():
+    pass
+
+yeahhhhh still sketching out these thoughts. maybe something to make protos
+clearer to read.

@@ -9,74 +9,6 @@ from aionetiface import fstr, log, log_exception
 from aionetiface.net.bind.bind_rules import binder_sync
 from aionetiface.net.net_utils import ip_strip_if
 from aionetiface.net.socket import apply_nic_pin_sockopts
-from aionetiface.utility.cmd_tools import cmd as run_shell_cmd
-
-
-# Same gate the aionetiface log() helper uses: ~/aionetiface/logs/.
-# When it doesn't exist, log() is a no-op and the user has opted out
-# of file-logging entirely -- so the diagnostic shellouts below
-# should opt out too instead of spamming "/bin/sh: 1: netstat: not
-# found" on stripped-down hosts where neither the dir nor the tools
-# are present.
-WARPGATE_DIAG_LOGS_DIR = os.path.join(
-    os.path.expanduser("~"), "aionetiface", "logs",
-)
-
-
-def diag_enabled():
-    """True iff the user has opted into diagnostic logging."""
-    return os.path.isdir(WARPGATE_DIAG_LOGS_DIR)
-
-
-async def log_time_wait_residue(src_ip):
-    """Run `netstat -an` and log TIME_WAIT entries whose local IP matches src_ip.
-
-    Best-effort post-mortem after a punch attempt. SO_LINGER {1,0} on
-    punch sockets should make this count 0; anything else means some
-    code path is closing one of our 4-tuples without the linger sockopt
-    or that another socket on the same NIC/port leaked residue.
-
-    Uses aionetiface.utility.cmd_tools.cmd which wraps
-    create_subprocess_shell and falls back to a blocking
-    subprocess.run in a thread-pool executor on event loops that
-    don't support subprocess (SelectorEventLoop on Windows). That
-    way the diag works on every platform we run on.
-    """
-    if not src_ip:
-        return
-    if not diag_enabled():
-        # No ~/aionetiface/logs/ -> user hasn't opted into diagnostic
-        # logging. Skip the netstat shellout entirely so we don't
-        # spam "command not found" on hosts (containers, minimal
-        # FreeBSD installs, embedded boxes) that lack the tool.
-        return
-    try:
-        text = await run_shell_cmd("netstat -an", timeout=10)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # pylint: disable=broad-except
-        # Diag is best-effort. Never let it kill the punch finally.
-        log("[POST-PUNCH-DIAG] netstat failed: " + repr(exc))
-        return
-
-    if not text:
-        log("[POST-PUNCH-DIAG] netstat returned empty output")
-        return
-    matches = []
-    for ln in text.splitlines():
-        if "TIME_WAIT" not in ln:
-            continue
-        # netstat shows the local endpoint in the second whitespace
-        # column on Windows and (after the proto column) on Linux.
-        # Cheap substring filter: just look for our src_ip as ip:port.
-        if (src_ip + ":") in ln or (src_ip + ".") in ln:
-            matches.append(ln.strip())
-    log("[POST-PUNCH-DIAG] TIME_WAIT entries for src_ip={0}: count={1}".format(
-        src_ip, len(matches),
-    ))
-    for m in matches[:16]:
-        log("[POST-PUNCH-DIAG]   " + m)
-
 """
 These magic sock options are required for TCP hole punching on
 different operating systems.
@@ -191,6 +123,22 @@ def bind_punch_sockets(
                 )
             except OSError:
                 pass
+        # Windows UDP: a sendto to a closed port draws an ICMP
+        # port-unreachable, and Windows then makes the *next* recvfrom
+        # on that socket raise WSAECONNRESET (WinError 10054). The punch
+        # spray fires at many predicted ports -- most closed -- so this
+        # fires constantly and aborts the engine's recvfrom loop before
+        # the one converging probe is read. SIO_UDP_CONNRESET=False
+        # turns the behaviour off so recvfrom only returns real
+        # datagrams. v4 punch mostly escaped it (v4 ICMP unreachables
+        # are widely rate-limited / filtered in transit); v6 did not
+        # (ICMPv6 unreachables come back reliably), which is why
+        # udp_punch was v6-0/5 on the Windows matrix VMs.
+        if sock_type == socket.SOCK_DGRAM and hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                s.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except OSError:
+                pass
         bind_tup = binder_sync(af, ip_strip_if(bind_ip), p.src_port, nic_id)
         bound = False
         for retry in range(4):
@@ -275,6 +223,23 @@ def connect_on_tcp_sockets(
     iterates flat-out since the loopback path has no RTT slack.
 
     spray_duration: how long to keep spraying (seconds).
+
+    DO NOT add an early-exit on "first ESTABLISHED" here.  We tried
+    it (reverted in commit 0c4c2c7) and it raced the TCP simul-open
+    four-way handshake: the local socket transitions to ESTABLISHED
+    after our kernel sees the peer's SYN-ACK, but the peer may not
+    have observed *our* SYN-ACK yet, so the connection is only half-
+    confirmed.  Returning early at that point hands choose_winning a
+    socket whose peer-side state is still SYN_RECEIVED, which then
+    times out / RSTs as soon as we try to use it -- the cascade sees
+    `pipe=True` and the first real send fails.  Letting the spray
+    run the full window keeps re-firing connect_ex so both kernels
+    finish the handshake before socket_event_monitor confirms.  The
+    socket_event_monitor pass downstream has its own short
+    grace-after-first-success window (50ms, see its docstring) which
+    is the only safe spot for an early exit, because by then we've
+    already drained the selector events that confirm the handshake
+    completed bidirectionally.
     """
     start = time.monotonic()
     end = start + spray_duration
@@ -294,16 +259,3 @@ def connect_on_tcp_sockets(
 
         if not same_machine:
             time.sleep(0.005)
-
-
-def sleep_until(punch_time, f_timer, max_sleep=10):
-    """Block until punch_time (from f_timer()), sleeping at most max_sleep seconds."""
-    now = f_timer()
-    sleep_time = max(0, punch_time - now)
-
-    # Cap sleep time to avoid large blocks if the host clock is far behind
-    if sleep_time > max_sleep:
-        sleep_time = max_sleep
-
-    if sleep_time > 0:
-        time.sleep(sleep_time)

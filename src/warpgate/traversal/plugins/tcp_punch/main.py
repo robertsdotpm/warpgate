@@ -1,20 +1,28 @@
 """Traversal plugin for TCP hole punching via coordinated port prediction.
 
-Timeout budget (PLUGIN_CONF["timeout"] = 180):
-  180 s = max-rendezvous-wait (window=42 + max_clock_error=20 ≈ 62 s)
-        + primary spray (~3 s) + primary monitor (~3 s)
-        + secondary rendezvous wait (window=42 s) for two-bucket dual-fire
-        + secondary spray (~3 s) + secondary monitor (~3 s)
-        + worker dispatch / engine setup overhead (varies by host,
-          ~5-15 s on slow stacks)
-        + the post-punch reverse-bridge accept (typically <1 s)
-        + a safety margin for slow stacks (XP/Vista) so the run_plugin
-          wait_for doesn't cancel the awaiting reverse_server.accept
-          before the worker has had a chance to connect back. The
-          previous 80 s left only ~10 s margin which v13's vista-from-xp
-          ate, manifesting as WinError 10061 on the worker's connect-
-          back to a listener that had just been torn down by the
-          cancellation propagating from the timeout firing.
+Timeout budget (PLUGIN_CONF["timeout"] = 5):
+  This is the per-slot ceiling in punch_phase: how long one route/af
+  slot waits for the punch before cancelling it. A failed tcp_punch
+  slot runs to this ceiling (the plugin does not self-terminate on
+  failure), so it is also the per-slot fall-through cost. It never
+  shortens a success -- a punch completes when it completes -- so it
+  is sized purely off the worst legitimate success time.
+
+  History: the budget was 180 s, then 120 s, both sized for the
+  bucket-rendezvous design (window=42 + max_clock_error=20 ≈ 62 s
+  rendezvous wait, plus a second window for two-bucket dual-fire).
+  That design is gone -- NTP-pinned start replaced the rendezvous
+  wait with PLUGIN_PIN_OFFSET (~1 s, ~3 s on the predictor path) and
+  the dual-fire was dropped.
+
+  Measured against the current code (full v4+v6 matrix sweep, all 9
+  OSes incl. Windows XP and Vista): every tcp_punch success lands
+  inside 2.93 s, p50 ≈ 2.76 s, in a flat 250 ms-wide cluster with no
+  slow tail -- the punch timing is OS-agnostic now that the
+  rendezvous wait is gone. 5 s = that 2.93 s worst case plus ~2 s
+  headroom for NTP-retry / scheduler jitter (MAX_NTP_RETRIES=5 ×
+  NTP_TIMEOUT=1.0). No per-OS override is needed; XP (2.74 s) and
+  Vista (2.87 s) sit with everyone else.
 
 PROTO_MESSAGES is consumed by plugin_loader: it merges each entry into
 TraversalManager.sig_proto so PunchMsg dispatches without core
@@ -43,16 +51,19 @@ allocator).
 """
 import asyncio
 import time
-from aionetiface import log, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
+from aionetiface import log, fstr, NIC_BIND, EXT_BIND, TCP, SysClock, async_wrap_errors, cancel_task, get_running_loop, shutdown_proc_pool
 from ....protocol.proto_defs import P2P_PUNCH
 from .proto import PunchMsg
-from .boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
+from .boundary_lib import (
+    FAST_PUNCH_PARAMS, PLUGIN_PIN_OFFSET, PLUGIN_PIN_OFFSET_PREDICT,
+    compute_rendezvous,  # noqa: F401
+)
 from .punch_client import PunchClient
 from .boundary_alloc import boundary_port_alloc
+from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from .nat_predict_alloc import NATPredictAlloc
 from .punch_defs import TCP_PUNCH_LAN
 from .punch_process import start_punching_process
-from .tcp_punch_utils import log_time_wait_residue
 from .nat_predict import NATMapping
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
@@ -65,7 +76,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 180}
+    conf = {"timeout": 5}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
@@ -81,6 +92,19 @@ class PunchPlugin(Plugin):
 
     async def run(self, reply=None):
         """Coordinate the hole-punch exchange and launch the background punching process."""
+        if getattr(self, "stage_t0", None) is None:
+            self.stage_t0 = time.monotonic()
+        def stamp(label, **extra):
+            t = time.time()
+            elapsed_ms = int((time.monotonic() - self.stage_t0) * 1000)
+            extras = " ".join("{0}={1}".format(k, v) for k, v in extra.items())
+            line = "[PUNCH-STAGE] wall={0:.3f} t={1}ms stage={2} plugin_id={3} {4}".format(
+                t, elapsed_ms, label, self.plugin_id, extras,
+            )
+            log(line)
+            print(line, flush=True)
+        self.stamp = stamp
+        stamp("run_enter", reply=(reply is not None))
         log("[PUNCH-RUN] enter plugin_id={0} reply={1} completed={2}".format(
             self.plugin_id,
             reply is not None,
@@ -143,6 +167,7 @@ class PunchPlugin(Plugin):
                 puncher, stuns = await self.setup_puncher_client(reply)
             except BaseException as exc:
                 raise
+            stamp("setup_done", puncher=(puncher is not None), stuns=len(stuns) if stuns else 0)
             if puncher is None:
                 log("[PUNCH-RUN] PunchPlugin: no STUN clients available; aborting punch.")
                 if not self.result.done():
@@ -160,6 +185,7 @@ class PunchPlugin(Plugin):
                     puncher = await self.configure_puncher_process(puncher, stuns)
                 except BaseException as exc:
                     raise
+                stamp("configure_done")
         else:
             log("[PUNCH-RUN] reusing existing puncher plugin_id={0}".format(
                 self.plugin_id,
@@ -174,6 +200,19 @@ class PunchPlugin(Plugin):
             )
         except BaseException as exc:
             raise
+        stamp("advance_done", have_outgoing=(outgoing_msg is not None))
+
+        # Instrumentation: when a reply with mappings just landed, log
+        # the round-trip from our outgoing send to this receipt.  The
+        # send timestamp is stashed on self.outgoing_sent_at below
+        # before send_signal fires.
+        if (reply is not None
+                and getattr(self, "outgoing_sent_at", None) is not None):
+            rtt_ms = int((time.time() - self.outgoing_sent_at) * 1000)
+            log("[PUNCH-RTT] tcp_punch signal_rtt={0}ms plugin_id={1}".format(
+                rtt_ms, self.plugin_id,
+            ))
+            self.outgoing_sent_at = None
 
         # None signals the exchange is complete; the background punch process
         # takes it from here.
@@ -185,7 +224,10 @@ class PunchPlugin(Plugin):
 
         # --- Send our port predictions to the peer ---
         log("[PUNCH-RUN] sending outgoing PunchMsg plugin_id={0}".format(self.plugin_id))
+        self.outgoing_sent_at = time.time()
+        stamp("send_signal_start")
         await self.send_signal(outgoing_msg)
+        stamp("send_signal_done")
 
     async def setup_puncher_client(self, reply):
         """
@@ -196,10 +238,11 @@ class PunchPlugin(Plugin):
         # Safe two-level lookup: load_stun_clients populates entries
         # only for the (af, if_index) combinations that successfully
         # resolved a STUN server during node startup. On hosts where
-        # v6 STUN never came up (XP / Vista without a working v6
-        # path) the inner dict is missing the if_index entirely, and
-        # bare self.stun_clients[af][if_index] raises KeyError before
-        # the "no STUN clients loaded" guard below ever runs.
+        # v6 STUN never came up (Vista without a working v6 path, or
+        # any host where the v6 default route briefly flapped at
+        # startup) the inner dict is missing the if_index entirely,
+        # and bare self.stun_clients[af][if_index] raises KeyError
+        # before the "no STUN clients loaded" guard below ever runs.
         stuns = self.stun_clients.get(self.af, {}).get(if_index, [])
 
         # Lazy retry: load_stun_clients ran once at node startup and
@@ -261,8 +304,10 @@ class PunchPlugin(Plugin):
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time
         # is communicated between peers via PunchMsg so we do not need the large
         # WINDOW / MAX_CLOCK_ERROR values used by the CLI standalone mode.  The
-        # tight window (6 s) and short coordinator_delay (0.5 s) cut total punch
-        # latency roughly in half compared to the conservative CLI defaults.
+        # tight window (6 s) and short reply_delay (0.5 s, plus the
+        # mapping_reply future short-circuiting it on healthy paths)
+        # cut total punch latency roughly in half compared to the
+        # conservative CLI defaults.
         puncher = PunchClient(
             dest_ip,
             src_ip,
@@ -274,35 +319,75 @@ class PunchPlugin(Plugin):
             their_os=(self.dest_map.get("os") if self.dest_map else None),
         )
 
-        # Set coordinated time references.
-        timestamp = self.sys_clock.time()
-        puncher.set_timestamp(timestamp)
-
-        # Calculate the primary + secondary punch times for two-bucket
-        # overlap dual-fire.  See PunchClient.run_engine for the strategy:
-        # when the connector and listener call compute_rendezvous on
-        # opposite sides of a bucket boundary they pick adjacent buckets,
-        # but their {primary, primary+1} candidate sets always overlap on
-        # one common bucket -- so firing at both rendezvous in sequence
-        # guarantees the peer-pair lands on a synchronised fire moment.
-        # The secondary is exactly one WINDOW past the primary; both peers
-        # compute the same window arithmetic so they agree on the second
-        # rendezvous as well.
-        p = puncher.params
-        _, punch_time = compute_rendezvous(
-            timestamp,
-            window=p["window"],
-            min_run_window=p["min_run_window"],
-            max_error=p["max_clock_error"],
+        # NTP-pinned future start.  The connector picks an absolute
+        # punch moment (now + PLUGIN_PIN_OFFSET) and the listener reads
+        # the value back out of the inbound PunchMsg's payload.ntp
+        # field.  No bucket math, no compute_rendezvous, no two-bucket
+        # secondary -- both sides agree on one wall-clock instant via
+        # the signal exchange itself.
+        #
+        # puncher.timestamp stays as the LOCAL sys_clock.time() because
+        # PunchClient.sleep_until uses it as the reference for "now"
+        # when computing the remaining sleep -- setting it to anything
+        # other than the local wall-clock would break the sleep math.
+        # boundary_port_alloc is seeded separately from punch_time (see
+        # add_port_allocator(seed=...) below) so both peers derive
+        # ports from the same bucket regardless of timestamp skew.
+        #
+        # The CLI standalone path in punch_client.py __main__ keeps
+        # compute_rendezvous because it has no PunchMsg channel to
+        # communicate the pin.
+        # boundary_port_alloc derives the punch ports deterministically
+        # from the time bucket.  That only matches the peer's actual
+        # external ports when BOTH NATs allocate predictably:
+        #   - EQUAL_DELTA: external = local + constant offset
+        #   - NA_DELTA:    no NAT, external = local
+        # For INDEPENDENT / DEPENDENT / RANDOM / PRESERV deltas the
+        # external port cannot be derived from the bucket, so the
+        # boundary allocator would seed the spray with wrong ports.
+        # In that case skip it entirely and rely solely on the STUN-
+        # driven NAT predictor (advance_punching_protocol ->
+        # nat_alloc.port_alloc), which measures the live mapping.
+        #
+        # The same flag picks the NTP-pin offset: the predictor path
+        # makes the listener run 3 STUN round trips before it can fire,
+        # which does not fit inside the boundary path's PLUGIN_PIN_OFFSET
+        # -- so it gets the larger PLUGIN_PIN_OFFSET_PREDICT.
+        src_delta = (self.src.get("nat") or {}).get("delta") or {}
+        dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
+        boundary_ok = (
+            src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+            and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
         )
-        secondary_punch_time = punch_time + p["window"]
+        pin_offset = PLUGIN_PIN_OFFSET if boundary_ok else PLUGIN_PIN_OFFSET_PREDICT
 
-        puncher.set_punch_time(punch_time, secondary_punch_time=secondary_punch_time)
+        timestamp = self.sys_clock.time()
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.  Offset is
+            # bigger on the predictor path so the listener's STUN
+            # predict finishes before punch_time.
+            punch_time = timestamp + pin_offset
 
-        # Deterministic predictions based on boundary math.
-        # PunchClient.add_port_allocator forwards self.params to the allocator
-        # so it uses the same window / error constants for bucket derivation.
-        puncher.add_port_allocator(boundary_port_alloc)
+        puncher.set_timestamp(timestamp)
+        puncher.set_punch_time(punch_time)
+
+        if boundary_ok:
+            # Seed boundary_port_alloc with punch_time -- since both
+            # peers take punch_time verbatim (connector picks, listener
+            # reads from PunchMsg) they derive the same bucket and the
+            # same port pool regardless of timestamp drift between
+            # create_puncher calls.
+            puncher.add_port_allocator(boundary_port_alloc, seed=punch_time)
+        else:
+            log(fstr(
+                "[TCP-PUNCH] non-deterministic NAT delta "
+                "(src={0} dest={1}); skipping boundary_port_alloc, "
+                "using STUN NAT predictor only",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
 
         # Return the new puncher and the STUN clients
         return puncher, stuns
@@ -322,7 +407,20 @@ class PunchPlugin(Plugin):
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
         self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
-        # Schedule the punching process with a short delay.
+        # Future the worker-spawn task waits on instead of sleeping a
+        # fixed interval.  advance_punching_protocol resolves it the
+        # moment the peer's mappings have been folded into
+        # puncher.port_allocs; the worker spawns as soon as that
+        # happens rather than at a pessimistic timer mark.  A
+        # wait_for(reply_delay) in delayed_start_punching_proc bounds
+        # the wait so a lost / late signal doesn't stall the worker
+        # indefinitely (LAN-mode short-circuit, which never folds in
+        # peer mappings, falls through the timeout and uses the
+        # boundary-aligned port_allocs that setup_puncher_client
+        # already populated).
+        self.mapping_reply = asyncio.get_event_loop().create_future()
+
+        # Schedule the punching process.
         if self.plugin_id not in self.punch_proc:
             self.punch_proc[self.plugin_id] = asyncio.create_task(
                 async_wrap_errors(self.delayed_start_punching_proc(self.nic, puncher))
@@ -367,9 +465,51 @@ class PunchPlugin(Plugin):
                 log("[TCP-PUNCH] advance_punching_protocol: peer sent empty mappings list; dropping")
                 return None
 
+        # Re-entry guard: same shape as udp_punch's guard.  sidewire
+        # republishes the punch msg until app-ack'd, and the
+        # multi-broker fan-out means several duplicates can arrive at
+        # the listener within seconds.  Each one re-enters run() and
+        # lands here; nat_alloc.port_alloc() walks a state machine
+        # that asserts on invalid progressions, so the second call
+        # raises AssertionError.  Drop those duplicates.
+        #
+        # The discriminator MUST be "have we already folded the peer's
+        # mappings?" -- NOT "is puncher.port_allocs non-empty?".
+        # setup_puncher_client runs add_port_allocator(boundary_port_alloc)
+        # which fills port_allocs with 16 boundary entries BEFORE
+        # advance_punching_protocol is ever reached, so the old
+        # port_allocs check fired on the very first legitimate call,
+        # returned None without folding the peer mappings, and never
+        # resolved mapping_reply -- stalling the listener's worker for
+        # the full reply_delay (observed: 2 s wasted, punch fired
+        # unsynced, verify_pipe_alive failed on every Windows VM).
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
+            log(fstr(
+                "[TCP-PUNCH] advance_punching_protocol: duplicate reply "
+                "ignored (peer mappings already folded, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         # Compute the next round of port predictions.
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+
+        # Mark that the peer's mappings have now been folded.  The
+        # re-entry guard above keys off this so subsequent duplicate
+        # republishes are dropped without re-walking the nat_alloc
+        # state machine.
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
+
+        # Signal the worker-spawn task: the peer's mappings have been
+        # folded in and port_allocs is now valid.  Guarded by not done()
+        # because advance_punching_protocol may be re-entered across
+        # signal rounds (mapping refresh), and resolving an
+        # already-resolved future raises InvalidStateError.
+        reply_future = getattr(self, "mapping_reply", None)
+        if reply_future is not None and not reply_future.done():
+            reply_future.set_result(True)
 
         # End of protocol.
         if is_end == 1:
@@ -398,23 +538,31 @@ class PunchPlugin(Plugin):
     # SysClock so both peers agree on the same fire moment via their
     # respective clocks -- no RTT measurement, ACK-relative timing, or
     # other "let's get the peers in sync" scheme is needed or wanted at
-    # this layer. coordinator_delay below is a SETUP BUFFER only -- the
-    # time between "got peer's punch reply" and "spawn the worker
-    # process" -- so the worker has time to bind sockets before its
-    # internal sleep_until(punch_time) reaches the bucket boundary. Do
-    # NOT make it derive from RTT or anything else clock-adjacent; it's
-    # an OS-warmup nap, not a synchronisation primitive.
+    # this layer. reply_delay below is the timeout ceiling on the
+    # mapping_reply future -- normally the future resolves the moment
+    # advance_punching_protocol has folded the peer's mappings into
+    # puncher.port_allocs, and the worker spawns immediately.  Only the
+    # pathological "peer's signal never arrived" path actually consumes
+    # the full reply_delay before the worker proceeds anyway with
+    # whatever port_allocs are already set.  Do NOT make reply_delay
+    # derive from RTT or anything else clock-adjacent -- it's a
+    # fallback ceiling, not a synchronisation primitive.
     async def delayed_start_punching_proc(self, nic, puncher):
-        """Wait a short coordinator delay then launch the punching process and resolve the result."""
-        coordinator_delay = puncher.params.get("coordinator_delay", 2.0)
-        log("[PUNCH-DELAY] enter plugin_id={0} delay={1}s".format(
-            self.plugin_id, coordinator_delay,
+        """Wait for mapping_reply (or reply_delay timeout) then launch the punching process and resolve the result."""
+        reply_delay = puncher.params.get("reply_delay", 2.0)
+        log("[PUNCH-DELAY] enter plugin_id={0} reply_delay={1}s".format(
+            self.plugin_id, reply_delay,
         ))
         try:
-            await asyncio.sleep(coordinator_delay)
-            log("[PUNCH-DELAY] sleep done; calling start_punching_process plugin_id={0}".format(
-                self.plugin_id,
-            ))
+            try:
+                await asyncio.wait_for(self.mapping_reply, reply_delay)
+                log("[PUNCH-DELAY] mapping_reply resolved; calling start_punching_process plugin_id={0}".format(
+                    self.plugin_id,
+                ))
+            except asyncio.TimeoutError:
+                log("[PUNCH-DELAY] mapping_reply timed out after {0}s; proceeding plugin_id={1}".format(
+                    reply_delay, self.plugin_id,
+                ))
             pipe = await start_punching_process(
                 nic,
                 puncher,
@@ -453,14 +601,6 @@ class PunchPlugin(Plugin):
             # will be revisited in a dedicated session.
             log("[PUNCH-DELAY] finally plugin_id={0}".format(self.plugin_id))
             self.completed_pipe_ids.add(self.plugin_id)
-            # Post-mortem: are any of our boundary 4-tuples still in
-            # TIME_WAIT? With SO_LINGER {1,0} on punch sockets the
-            # answer should always be 0. Any non-zero count points at
-            # a code path that closed without the linger sockopt.
-            try:
-                await log_time_wait_residue(getattr(puncher, "src_ip", None))
-            except Exception:
-                pass
 
     async def close(self):
         """Cancel any in-flight punch task and remove this plugin's shared state.

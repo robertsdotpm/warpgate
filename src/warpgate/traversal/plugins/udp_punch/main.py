@@ -24,13 +24,17 @@ from ....protocol.proto_defs import P2P_PUNCH
 from ...traversal_plugin import Plugin
 from ...strategy_registry import register
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
-from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
+from ..tcp_punch.boundary_lib import (
+    PLUGIN_PIN_OFFSET, PLUGIN_PIN_OFFSET_PREDICT,
+    compute_rendezvous,  # noqa: F401
+)
+from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
 from .proto import UdpPunchMsg
-from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN
+from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN, UDP_PUNCH_PARAMS
 from .udp_punch_engine import drain_punch_residue, udp_punch_engine
 
 
@@ -44,7 +48,7 @@ class UdpPunchPlugin(Plugin):
     # does no useful work over it. Symmetric NAT goes to random_probe,
     # not here.
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 150}
+    conf = {"timeout": 5}
     proto_messages = (
         (UdpPunchMsg, P2P_PUNCH, 20),
     )
@@ -77,6 +81,38 @@ class UdpPunchPlugin(Plugin):
 
     async def run(self, reply=None):
         """Coordinate the punch exchange and fire the in-process UDP engine."""
+        # Pre-bucket clock-truth sanity check (mirrors tcp_punch's
+        # equivalent at the top of its run()).  If the peer's reply
+        # carries a tx_unix timestamp and the observed skew is larger
+        # than what (clock_uncertainty + max_clock_error + signal
+        # latency budget) can bridge, the bucket math literally cannot
+        # converge -- bail immediately rather than waste ~5 s of
+        # rendezvous wait + spray on a doomed punch.  The bucket
+        # algorithm itself remains the sole authority for fire time
+        # (see DO NOT comment above tcp_punch.delayed_start_punching_proc).
+        if reply is not None:
+            peer_tx = getattr(reply.payload, "tx_unix", 0)
+            if peer_tx:
+                peer_unc = float(getattr(reply.payload, "clock_uncertainty", 0.0))
+                our_unc = float(getattr(self.sys_clock, "uncertainty", 0.0))
+                max_err = UDP_PUNCH_PARAMS.get("max_clock_error", 4)
+                our_now = int(self.sys_clock.time())
+                SIGNAL_LATENCY_BUDGET = 10
+                budget = our_unc + peer_unc + max_err + SIGNAL_LATENCY_BUDGET
+                skew = abs(our_now - peer_tx)
+                if skew > budget:
+                    log("[UDP-PUNCH-RUN] pre-bucket bailout: clock skew "
+                        "{0}s exceeds budget {1}s (our_unc={2:.2f} "
+                        "peer_unc={3:.2f} max_err={4} latency={5}); "
+                        "plugin_id={6}".format(
+                            skew, int(budget), our_unc, peer_unc,
+                            max_err, SIGNAL_LATENCY_BUDGET,
+                            self.plugin_id,
+                        ))
+                    if not self.result.done():
+                        self.result.set_result(None)
+                    return
+
         puncher = self.punch_clients.get(self.plugin_id)
         if puncher is None:
             puncher, stuns = await self.setup_puncher_client(reply)
@@ -95,6 +131,17 @@ class UdpPunchPlugin(Plugin):
         outgoing_msg = await self.advance_punching_protocol(
             puncher, reply, puncher.punch_time
         )
+
+        # Instrumentation: log signal RTT when a reply with mappings
+        # just landed.  Mirrors tcp_punch/main.py's PUNCH-RTT line.
+        if (reply is not None
+                and getattr(self, "outgoing_sent_at", None) is not None):
+            import time as _time
+            rtt_ms = int((_time.time() - self.outgoing_sent_at) * 1000)
+            log("[PUNCH-RTT] udp_punch signal_rtt={0}ms plugin_id={1}".format(
+                rtt_ms, self.plugin_id,
+            ))
+            self.outgoing_sent_at = None
 
         # None signals the exchange is complete; the in-process engine
         # task takes over from here.
@@ -116,6 +163,8 @@ class UdpPunchPlugin(Plugin):
                 m.to_json() for m in send_mappings
             ]
 
+        import time as _time
+        self.outgoing_sent_at = _time.time()
         await self.send_signal(outgoing_msg)
 
     async def setup_puncher_client(self, reply):
@@ -192,7 +241,7 @@ class UdpPunchPlugin(Plugin):
             decider_ip,
             self.nic.get_nic_id(self.af),
             same_machine=self.same_machine,
-            params=FAST_PUNCH_PARAMS,
+            params=UDP_PUNCH_PARAMS,
             our_os=(self.src_map.get("os") if self.src_map else None),
             their_os=(self.dest_map.get("os") if self.dest_map else None),
         )
@@ -216,36 +265,65 @@ class UdpPunchPlugin(Plugin):
 
         timestamp = self.sys_clock.time()
         puncher.set_timestamp(timestamp)
-        p = puncher.params
-        _, punch_time = compute_rendezvous(
-            timestamp,
-            window=p["window"],
-            min_run_window=p["min_run_window"],
-            max_error=p["max_clock_error"],
+
+        # NTP-pinned future start (ported from tcp_punch).  The
+        # connector picks ONE absolute punch moment and ships it in the
+        # outgoing PunchMsg; the listener reads it back out of
+        # payload.ntp and uses it verbatim.  This replaces
+        # compute_rendezvous bucket math, whose independent per-peer
+        # quantisation forked when two peers' calls straddled a bucket
+        # boundary -- the pair then fired seconds apart and zero
+        # sockets converged.  One shared punch_time = no fork.
+        #
+        # boundary_port_alloc derives ports deterministically from the
+        # time bucket; that only matches the peer's real external
+        # ports when BOTH NATs allocate predictably (EQUAL_DELTA, or
+        # NA_DELTA = no NAT).  For INDEPENDENT / DEPENDENT / RANDOM /
+        # PRESERV deltas the bucket-derived ports are wrong, so the
+        # boundary allocator is skipped and the punch relies solely on
+        # the STUN NAT predictor (advance_punching_protocol ->
+        # nat_alloc.port_alloc).  The same flag picks the pin offset:
+        # the predictor path runs 3 STUN round trips on the listener
+        # before it can fire, which does not fit in PLUGIN_PIN_OFFSET,
+        # so it gets the larger PLUGIN_PIN_OFFSET_PREDICT.  Mirrors
+        # tcp_punch.setup_puncher_client.
+        src_delta = (self.src.get("nat") or {}).get("delta") or {}
+        dest_delta = (self.dest.get("nat") or {}).get("delta") or {}
+        boundary_ok = (
+            src_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
+            and dest_delta.get("type") in (EQUAL_DELTA, NA_DELTA)
         )
-        # Two-bucket overlap dual-fire: a peer pair whose
-        # compute_rendezvous calls land on opposite sides of a bucket
-        # boundary picks adjacent buckets; their {primary, primary+1}
-        # candidate sets always overlap on exactly one common bucket.
-        # Firing at both rendezvous in sequence guarantees we hit the
-        # overlap regardless of which side forked.  Mirrors tcp_punch.
-        secondary_punch_time = punch_time + p["window"]
-        puncher.set_punch_time(punch_time, secondary_punch_time=secondary_punch_time)
-        # n=2 with n_per_bucket=1 (boundary_port_alloc's shape for
-        # n=2): one port from the primary bucket, one from primary+1,
-        # giving 2 sockets per side. Two peers whose
-        # compute_rendezvous calls land on opposite sides of the
-        # min_run_window cutoff pick adjacent buckets {B, B+1} and
-        # {B+1, B+2}; the sets overlap on exactly ONE bucket
-        # (B+1) -> exactly ONE matching port pair across both peers.
-        # All other sockets fire at non-existent peer ports and hear
-        # nothing, so watch_for_winner has only one candidate to
-        # converge on -- no first-CONFIRM-mismatch risk. The
-        # mismatch concern that justified n=1 historically only
-        # applies when n_per_bucket >= 2 (multiple matching pairs
-        # per bucket give an actual race); at 1 port per bucket the
-        # winner is deterministic on both sides.
-        puncher.add_port_allocator(boundary_port_alloc, n=2)
+        pin_offset = PLUGIN_PIN_OFFSET if boundary_ok else PLUGIN_PIN_OFFSET_PREDICT
+
+        if reply is not None and getattr(reply.payload, "ntp", 0):
+            # Listener: take the connector's pinned moment verbatim.
+            punch_time = float(reply.payload.ntp)
+        else:
+            # Connector: pin a near-future absolute moment.
+            punch_time = timestamp + pin_offset
+        puncher.set_punch_time(punch_time)
+
+        if boundary_ok:
+            # n=1, single socket per side.  The old n=2 two-bucket
+            # overlap existed only to survive the bucket-fork: forked
+            # peers picked {B,B+1} and {B+1,B+2}, overlapping on
+            # exactly one bucket, so n=2 guaranteed one matching pair.
+            # With NTP-pin there is no fork -- both peers derive
+            # identical buckets -- so n=2 would instead yield TWO
+            # matching pairs, and UDP's first-CONFIRM-wins race is
+            # only safe with exactly ONE candidate socket per side.
+            # n=1 restores that single deterministic candidate.
+            # Seeded with punch_time so both peers (sharing punch_time
+            # verbatim) derive the same bucket regardless of local-
+            # clock skew between their create_puncher calls.
+            puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        else:
+            log(fstr(
+                "[UDP-PUNCH] non-deterministic NAT delta "
+                "(src={0} dest={1}); skipping boundary_port_alloc, "
+                "using STUN NAT predictor only",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
 
         return puncher, stuns
 
@@ -257,6 +335,15 @@ class UdpPunchPlugin(Plugin):
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
         self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
+        # Future the engine task waits on instead of sleeping a fixed
+        # interval.  advance_punching_protocol resolves it the moment
+        # the peer's mappings have been folded into puncher.port_allocs;
+        # the engine wakes up as soon as that happens rather than at a
+        # pessimistic timer mark.  A wait_for(reply_delay) in
+        # delayed_run_engine bounds the wait so a lost / late signal
+        # doesn't stall the engine indefinitely.
+        self.mapping_reply = asyncio.get_event_loop().create_future()
+
         if self.plugin_id not in self.punch_proc:
             self.punch_proc[self.plugin_id] = asyncio.create_task(
                 self.delayed_run_engine(puncher)
@@ -265,6 +352,13 @@ class UdpPunchPlugin(Plugin):
 
     async def advance_punching_protocol(self, puncher, reply, punch_time):
         """Compute the next round of port predictions; return outgoing UdpPunchMsg or None when done."""
+        # Clock-truth witness fields: peer reads these to run the
+        # pre-bucket bailout in its own run() (see top of run()).
+        # Both fields cost nothing to send and the bailout saves
+        # ~5 s of doomed rendezvous on bad clock pairs.
+        tx_unix = int(self.sys_clock.time())
+        clock_uncertainty = float(getattr(self.sys_clock, "uncertainty", 0.0))
+
         # For LAN, STUN is useless (returns each side's own port).
         # boundary_port_alloc in delayed_run_engine handles port
         # alignment between peers via NTP-aligned bucket. Send one
@@ -281,6 +375,8 @@ class UdpPunchPlugin(Plugin):
                     "mappings": [],
                     "ntp": punch_time,
                     "nonce": puncher.udp_nonce.hex(),
+                    "tx_unix": tx_unix,
+                    "clock_uncertainty": clock_uncertainty,
                 },
             })
             msg.meta.plugin_name = "udp_punch"
@@ -293,8 +389,45 @@ class UdpPunchPlugin(Plugin):
                 log("[UDP-PUNCH] advance_punching_protocol: peer sent empty mappings list; dropping")
                 return None
 
+        # Re-entry guard: sidewire's republish loop and the multi-broker
+        # rendezvous can both deliver duplicates of the same signed msg
+        # to the listener, which re-enters run() and lands here again
+        # with reply.payload.mappings populated.  nat_alloc.port_alloc()
+        # is stateful (NATPredictAlloc walks a state machine that
+        # asserts on invalid progressions) and a second call fires
+        # `AssertionError("Invalid nat predict state progression.")`.
+        # Drop the duplicate before it crashes the predictor.
+        #
+        # The discriminator MUST be "have we already folded the peer's
+        # mappings?" -- NOT "is puncher.port_allocs non-empty?".
+        # setup_puncher runs add_port_allocator(boundary_port_alloc)
+        # which fills port_allocs BEFORE advance_punching_protocol is
+        # ever reached, so the old port_allocs check fired on the very
+        # first legitimate call, returned None without folding the
+        # peer mappings, and never resolved mapping_reply.  Same bug
+        # fixed in tcp_punch.
+        if recv_mappings is not None and getattr(self, "peer_mappings_folded", False):
+            log(fstr(
+                "[UDP-PUNCH] advance_punching_protocol: duplicate reply "
+                "ignored (peer mappings already folded, plugin_id={0})",
+                (self.plugin_id,),
+            ))
+            return None
+
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        if recv_mappings is not None:
+            self.peer_mappings_folded = True
+
+        # Signal the engine task: the peer's mappings have been folded
+        # in and port_allocs is now valid for spawning the worker.
+        # Guarded by not done() because configure_puncher_process /
+        # advance_punching_protocol may be re-entered across signal
+        # rounds (mapping refresh), and resolving an already-resolved
+        # future raises InvalidStateError.
+        reply_future = getattr(self, "mapping_reply", None)
+        if reply_future is not None and not reply_future.done():
+            reply_future.set_result(True)
 
         if is_end == 1:
             return None
@@ -306,16 +439,40 @@ class UdpPunchPlugin(Plugin):
                 "mappings": mappings,
                 "ntp": punch_time,
                 "nonce": puncher.udp_nonce.hex(),
+                "tx_unix": tx_unix,
+                "clock_uncertainty": clock_uncertainty,
             },
         })
         msg.meta.plugin_name = "udp_punch"
         return msg
 
     async def delayed_run_engine(self, puncher):
-        """Wait for coordinator delay, set up bridge, dispatch worker that runs engine + bridge."""
-        coordinator_delay = puncher.params.get("coordinator_delay", 2.0)
+        """Wait for the peer's mapping reply (or reply_delay timeout), set up bridge, dispatch worker that runs engine + bridge.
+
+        Previously slept ``coordinator_delay`` unconditionally on the
+        theory that the peer's reply would have arrived in that time.
+        That was racy on slow signal paths (worker started without
+        port_allocs populated) and wasteful on fast paths (worker
+        idled until the timer expired even though the mappings landed
+        in 50 ms).  Now we ``wait_for`` the ``mapping_reply`` future
+        that ``advance_punching_protocol`` resolves the instant the
+        peer's mappings have been folded into ``puncher.port_allocs``.
+        The ``reply_delay`` param caps the wait so a dropped signal
+        doesn't stall the engine indefinitely; on TimeoutError we
+        proceed with whatever ``port_allocs`` is already set
+        (LAN-mode short-circuit relies on this, as do single-side
+        mapping-only runs).
+        """
+        reply_delay = puncher.params.get("reply_delay", 2.0)
         try:
-            await asyncio.sleep(coordinator_delay)
+            try:
+                await asyncio.wait_for(self.mapping_reply, reply_delay)
+            except asyncio.TimeoutError:
+                log(fstr(
+                    "udp_punch.delayed_run_engine: mapping_reply timed "
+                    "out after {0}s; spawning worker with current port_allocs",
+                    (reply_delay,),
+                ))
 
             # ---- Bridge setup (main side) ----
             #
@@ -376,16 +533,15 @@ class UdpPunchPlugin(Plugin):
                 self.bridge_socks = [listener_sock, worker_sock]
 
                 # getsockname() returns a 2-tuple for v4 and a 4-tuple
-                # for v6 ((host, port, flowinfo, scope_id)). The Pipe
-                # constructor's resolve_dest does `ip, port = dest`
-                # which blows up on the v6 4-tuple. Keep the full
-                # tuple for socket.connect (v6 form is required there)
-                # but pass a flat (ip, port) to Pipe.
+                # for v6 (host, port, flowinfo, scope_id). Both the
+                # socket.connect() calls below and the wrapped Pipe
+                # take the full tuple as-is: resolve_dest accepts the
+                # v6 4-tuple (reads ip + port positionally, re-derives
+                # scope from the route), so no flattening is needed and
+                # both AFs go through the same path. The bridge binds
+                # ::1 loopback so scope_id/flowinfo are 0 regardless.
                 listener_addr = listener_sock.getsockname()
                 worker_addr = worker_sock.getsockname()
-                # Use full getsockname() address for both connect() and Pipe
-                # dest so the asyncio transport's self._address comparison
-                # never mismatches on IPv6 (4-tuple vs 2-tuple ValueError).
                 worker_addr_for_pipe = worker_addr
                 # UDP-connect both ends so recv/send default to the
                 # known peer and the kernel filters incoming.
@@ -429,6 +585,15 @@ class UdpPunchPlugin(Plugin):
                 if not self.result.done():
                     self.result.set_result(None)
                 return
+
+            # Hand the wrapped Pipe to close() so teardown can shut the
+            # asyncio UDP datagram transport down through its own
+            # .close() -- which unregisters the loop reader. Raw
+            # sock.close() on listener_sock (which the transport owns)
+            # leaves the transport registered and the connector's loop
+            # spins recvfrom -> EBADF every iteration, starving the
+            # tcp_punch winner pipe's reader.
+            self.bridge_pipe = pipe
 
             try:
                 wrapped_addr = pipe.sock.getsockname()
@@ -588,15 +753,18 @@ class UdpPunchPlugin(Plugin):
                         (stale_drained, stale_errors),
                     ))
 
-                # Bridge is wired; let main resolve plugin.result so
-                # the demo can start sending ECHO and have it actually
-                # land on punched_sock.
+                # Hand off to selector_proxy.  Convergence is NOT
+                # signalled here -- selector_proxy fires ready_writer
+                # the moment its copy loop is live, and the main side's
+                # reader on the paired socket resolves convergence off
+                # that.  Signalling here (before the loop entered)
+                # raced: main resolved plugin.result and the demo's
+                # ECHO bytes queued in worker_sock with nobody draining
+                # them yet.  Mirrors tcp_punch's bridge-ready socketpair.
                 log(fstr(
                     "[UDP-WORKER] bridging punched <-> worker_sock {0}",
                     (worker_addr,),
                 ))
-                loop.call_soon_threadsafe(signal_convergence, True)
-
                 try:
                     selector_proxy(
                         punched_sock,
@@ -604,10 +772,34 @@ class UdpPunchPlugin(Plugin):
                         stop_reader,
                         sock_proto=_socket.SOCK_DGRAM,
                         socket_r=worker_sock,
+                        ready_writer=ready_worker,
                     )
                 except Exception:  # pylint: disable=broad-except
                     log_exception()
                 log("[UDP-WORKER] selector_proxy returned; worker exiting")
+
+            # Bridge-ready socketpair (ported from tcp_punch).
+            # selector_proxy writes one byte to ready_worker the moment
+            # its copy loop is live; the reader below picks that up on
+            # the main thread and resolves convergence True -- so the
+            # plugin result is only handed back once the bridge is
+            # actually draining worker_sock.  Failure paths still
+            # resolve convergence False directly from the worker.
+            ready_main, ready_worker = _socket.socketpair()
+            ready_main.setblocking(False)
+
+            def bridge_ready_cb():
+                try:
+                    ready_main.recv(1)
+                except OSError:
+                    pass
+                try:
+                    loop.remove_reader(ready_main.fileno())
+                except (OSError, ValueError):
+                    pass
+                signal_convergence(True)
+
+            loop.add_reader(ready_main.fileno(), bridge_ready_cb)
 
             worker_fut = loop.run_in_executor(None, punch_and_bridge)
 
@@ -628,6 +820,17 @@ class UdpPunchPlugin(Plugin):
                 # gets a None instead of hanging on plugin timeout.
                 if not convergence.done():
                     convergence.set_result(False)
+                # The worker has exited -- selector_proxy is done with
+                # ready_worker.  Drop the reader and close both ends.
+                try:
+                    loop.remove_reader(ready_main.fileno())
+                except (OSError, ValueError):
+                    pass
+                for s in (ready_main, ready_worker):
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
             worker_fut.add_done_callback(worker_done)
 
             if pipe is not None:
@@ -737,7 +940,31 @@ class UdpPunchPlugin(Plugin):
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # Close the wrapped UDP Pipe through its own .close() so the
+        # asyncio datagram transport unregisters its event-loop reader.
+        # Raw-closing listener_sock (the transport's fd) instead leaves
+        # a dead fd registered and the connector's loop EBADF-storms
+        # recvfrom every iteration, starving the tcp_punch winner pipe.
+        pipe = getattr(self, "bridge_pipe", None)
+        wrapped_sock = getattr(pipe, "sock", None) if pipe is not None else None
+        if pipe is not None:
+            try:
+                await pipe.close()
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ConnectionError, asyncio.TimeoutError):
+                pass
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
+            self.bridge_pipe = None
+
+        # worker_sock is the genuinely-raw selector_proxy end -- no
+        # asyncio transport owns it, so a plain close() is correct.
+        # listener_sock is owned by the Pipe closed above and must NOT
+        # be raw-closed here.
         for sock in getattr(self, "bridge_socks", []):
+            if wrapped_sock is not None and sock is wrapped_sock:
+                continue
             try:
                 sock.close()
             except OSError:

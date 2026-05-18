@@ -69,6 +69,10 @@ async def close_with_timeout(p):
 # Shutdown the node server and do cleanup.
 async def node_stop(node):
     """Shut down the node, closing traversal plugins, resources, the daemon, and the stop socket pair."""
+    import time as time_mod
+    log("[NODE-STOP] mono={0:.4f} node_stop entered".format(
+        time_mod.monotonic()
+    ))
     # Send stop signal (any amount of data.)
     try:
         node.stop_writer.send(b"Meow")

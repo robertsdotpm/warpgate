@@ -76,18 +76,24 @@ sel,
     """
     Poll the selector and collect successfully-connected sockets.
 
-    Exits early as soon as any socket transitions to ESTABLISHED so
-    choose_winning_tcp_sock can hand off the master/slave "$" sentinel
-    inside XP's brief simul-open ESTABLISHED window (~180ms wide -- XP
-    RSTs the connection 174ms after the wire-level handshake completes).
-    Without early exit the monitor's full 5s window expires long after
-    XP has torn the connection down, and the master's send b"$" gets
-    BrokenPipeError.
+    Exits early as soon as any socket transitions to ESTABLISHED, then
+    waits a short grace period (50ms) for the other simul-open tuples
+    in the same fire to come up -- they transition within ~10-20ms of
+    each other on the same RTT-aligned pair, so this catches the
+    sibling sockets without dragging the punch out.
 
-    Lingering for a short grace period after the first ESTABLISHED lets
-    the other simul-open tuples in the same fire collect too -- they
-    transition within ~10-20ms of each other on the same RTT-aligned
-    pair -- but capped to 50ms so we still beat the 180ms RST window.
+    DO NOT OPTIMIZE THIS LOOP -- the current early-exit + grace
+    structure is the safe shape.  Tightening the grace, removing the
+    grace_extended bump-on-multi, or replacing the loop with a fast-
+    path "first event wins" has been tried in past sessions and each
+    variant produced subtle convergence regressions (e.g. handing off
+    to choose_winning before the master's b"$" sentinel could fan
+    out, or selecting a sibling socket whose peer-side state was
+    still mid-handshake).  The 50ms+50ms grace is deliberately
+    conservative because the cost of waiting is small and the cost of
+    a wrong winner is a silent broken pipe.  If you think this can
+    be made faster, write it down in punch_speed memory instead and
+    talk to the user before touching the code.
 
     monitor_duration: max time to watch for connection events (seconds).
     retry_interval:   selector poll timeout per iteration (seconds).
@@ -96,9 +102,10 @@ sel,
 
     start_time = time.monotonic()
     end = start_time + monitor_duration
-    # Once we see the first ESTABLISHED, only wait this much longer for
-    # additional sockets to come up before exiting the loop.  50ms is
-    # comfortably under XP's 174ms post-handshake RST timer.
+    # Once we see the first ESTABLISHED, only wait this much longer
+    # for additional sockets to come up before exiting the loop.
+    # Tight grace is cheap -- sibling tuples in the same fire come
+    # up within ~10-20ms of each other.
     grace_period = 0.050
     grace_extended = False
 
@@ -152,9 +159,9 @@ sel,
                     log("[ENGINE-DBG] READ recv failed: {0}".format(repr(exc)))
 
         # Early exit once we have at least one ESTABLISHED socket and
-        # the grace period for stragglers has elapsed.  Critical for
-        # XP cross-NAT: handing off to choose_winning fast enough to
-        # send b"$" before the connection gets RST'd.
+        # the grace period for stragglers has elapsed.  Hands off to
+        # choose_winning as soon as sibling tuples in the same fire
+        # have had a chance to settle.
         if first_success_at is not None and time.monotonic() - first_success_at >= grace_period:
             if len(successful) > 1 and not grace_extended:
                 grace_period += 0.050
@@ -237,8 +244,13 @@ af,
             len(sock_list), len(pre_connect_infos),
         ))
 
-        # Application-level validation should still be done after this
-        sock = choose_winning_tcp_sock(dest_ip, sock_list, our_ip)
+        # Application-level validation should still be done after this.
+        # Pass monitor_duration (which is FAST_PUNCH_PARAMS["monitor_timeout"])
+        # as the non-master's sentinel-wait budget so it tracks the
+        # configured punch profile instead of using a stale hardcoded 5.0s.
+        sock = choose_winning_tcp_sock(
+            dest_ip, sock_list, our_ip, sentinel_wait=monitor_duration,
+        )
         log("[ENGINE] choose_winning_tcp_sock -> {0}".format(
             "selected" if sock else "no winner",
         ))

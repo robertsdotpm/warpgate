@@ -44,7 +44,27 @@ async def emit_ready_when_registered(gate):
 
 async def main():
     name = os.environ.get("WG_LISTEN_NAME") or None
-    gate = Gate(name=name) if name else Gate()
+    # WG_NIC pins the listener to a single interface by display name so
+    # the matrix VMs' flaky IPv4-only mobile NIC is excluded -- without
+    # it gate_listen discovers every NIC and the punch can land its
+    # winning socket on the mobile path, where the handshake completes
+    # but bytes never flow (pipe=True / verify fails).
+    nic = os.environ.get("WG_NIC") or None
+    nic_names = [nic] if nic else None
+    from warpgate.node.node_defs import NODE_CONF
+    # gate_listen is the matrix harness listener -- the orchestrator
+    # runs it back-to-back on the same VM, so a listen port can still
+    # be in TIME_WAIT from the previous run. reuse_addr=True lets the
+    # rebind succeed. Production NODE_CONF deliberately keeps this
+    # False (a real accidental double-start should fail fast); only
+    # this harness flips it.
+    conf = dict(NODE_CONF, reuse_addr=True)
+    # WG_NO_UPNP=1 starts the listener with port forwarding disabled --
+    # used to test whether UPnP/PCP background activity destabilises a
+    # contended host (win11).
+    if os.environ.get("WG_NO_UPNP") == "1":
+        conf["enable_upnp"] = False
+    gate = Gate(name=name, nic_names=nic_names, conf=conf)
     asyncio.ensure_future(emit_ready_when_registered(gate))
     try:
         await gate.listen(handle)

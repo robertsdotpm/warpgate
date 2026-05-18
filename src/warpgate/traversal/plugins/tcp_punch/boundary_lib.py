@@ -1,6 +1,7 @@
 """Sliding-window boundary analysis for port prediction."""
 import time
 import random
+from aionetiface.utility.utils import log
 
 # --- NTP Constants ---
 NTP_SERVER = "pool.ntp.org"
@@ -32,6 +33,37 @@ MIN_RUN_WINDOW = 10  # Minimum time required to run setup before the rendezvous
 # bounded well below 16 at any single moment.
 NUM_PORTS = 16
 BASE_PORT = 2024
+
+# Plugin path NTP-pin offset: when tcp_punch runs as a traversal plugin
+# (auto_connect cascade), the connector picks an absolute punch moment
+# `now + PLUGIN_PIN_OFFSET` and ships it inside the outgoing PunchMsg.
+# The listener reads the value back out of `payload.ntp` and uses it
+# verbatim, so both peers fire on the same wall-clock instant without
+# any bucket math. The floor is bounded by signal RTT through MQTT
+# (~300-600 ms on healthy paths) plus listener setup (socket binds +
+# NAT predict, ~200 ms). 1.0 s leaves slack; reduce toward ~0.5 s
+# once measured variance allows.
+#
+# This constant has NO effect on the CLI standalone path
+# (`punch_client.py` __main__): that path keeps the compute_rendezvous
+# bucket math because there's no PunchMsg exchange to communicate a
+# pinned time -- both sides must derive it independently from NTP.
+PLUGIN_PIN_OFFSET = 1.0
+
+# Predictor-path NTP-pin offset.  PLUGIN_PIN_OFFSET above is sized for
+# the boundary-allocator fast path, where the listener does ZERO STUN
+# between receiving the PunchMsg and firing -- just build the
+# PunchClient and bind sockets (~few hundred ms).  When either NAT has
+# a non-deterministic delta (INDEPENDENT / DEPENDENT / RANDOM /
+# PRESERV) boundary_port_alloc is skipped and the punch relies on the
+# STUN NAT predictor: the listener must run preload_mappings (3 STUN
+# round trips) plus get_single_mapping before it can fire.  That work
+# does not fit inside PLUGIN_PIN_OFFSET, so the predictor path uses a
+# larger offset.  3.0 s covers signal RTT + 3 concurrent STUN RTTs +
+# prediction compute + socket binds with margin; tune from measured
+# [PUNCH-STAGE] run_enter -> run_engine_enter spans on real
+# predictor-path punches rather than guessing further.
+PLUGIN_PIN_OFFSET_PREDICT = 3.0
 # Wider sample space than the original 20000 -- combined with the lower
 # BASE_PORT this gives the allocator the full user-port range (~2k-52k),
 # which makes collisions across back-to-back runs in the same NTP bucket
@@ -39,8 +71,28 @@ BASE_PORT = 2024
 PORT_RANGE = 50000
 CONNECT_TIMEOUT = 5.0
 RETRY_INTERVAL = 0.05
-MAX_SLEEP = 10
+# Slack added on top of worst-case rendezvous wait (window +
+# max_clock_error) to produce the max_sleep cap.  max_sleep is the
+# upper bound on sleep_until()'s blocking wait -- it must sit above
+# the worst-case legitimate rendezvous wait, otherwise sleep_until
+# returns early and the punch fires before the peer is ready (see
+# punch_client.py for the "may fire before peer is ready" warning).
+# The 2 s slack covers OS scheduler jitter on top of the worst case.
+MAX_SLEEP_SLACK = 2
 LARGE_PRIME = 2654435761
+
+
+def derive_max_sleep(window, max_clock_error, slack=MAX_SLEEP_SLACK):
+    """Return the max_sleep cap derived from a profile's bucket params.
+
+    Keeping max_sleep tied to (window, max_clock_error) instead of a
+    free parameter prevents the silent class of bug where a profile
+    shrinks its bucket size without updating max_sleep -- the result
+    is a cap below the worst-case rendezvous wait, sleep_until fires
+    early, and punches misfire with the only visible signal being the
+    cap-fired log line.
+    """
+    return window + max_clock_error + slack
 
 # Ports that SIP-ALG and RTP helper modules on SOHO routers (Asus,
 # Linksys, MikroTik) may silently inspect, mangle, or redirect.
@@ -60,10 +112,12 @@ SIP_ALG_BLACKLIST = frozenset(
 #
 # FAST_PUNCH_PARAMS: Tight values for network-protocol usage where punch_time
 #   is communicated between peers so both sides use the exact same value.
-#   Constraint: window > 2 * max_clock_error  →  6 > 2*2 = 4  ✓
-#   - Rendezvous wait: 2–8 seconds.
-#   - max_sleep (8 s) is deliberately above the 8 s worst-case remaining wait
-#     so sleep_until() does NOT fire early — both sides synchronise exactly.
+#   Constraint: window > 2 * max_clock_error.
+#   - max_sleep is derived from derive_max_sleep(window, max_clock_error)
+#     post dict-build, so any profile that shrinks the bucket params
+#     automatically gets the correct cap (sleep_until needs max_sleep
+#     above the worst-case rendezvous wait or it returns early before
+#     the bucket boundary and the punch misfires).
 # --------------------------
 
 DEFAULT_PUNCH_PARAMS = {
@@ -75,10 +129,23 @@ DEFAULT_PUNCH_PARAMS = {
     "connect_timeout": CONNECT_TIMEOUT,  # 5.0 s spray window
     "monitor_timeout": CONNECT_TIMEOUT,  # 5.0 s monitor window
     "retry_interval": RETRY_INTERVAL,  # 0.05 s selector poll interval
-    # PunchClient / plugin timing
-    "max_sleep": MAX_SLEEP,  # 10 s cap for sleep_until
-    "coordinator_delay": 2.0,  # s delay before spawning punch process
+    # PunchClient / plugin timing -- max_sleep is filled in below from
+    # derive_max_sleep(window, max_clock_error) so a profile change to
+    # the bucket params can't leave the cap behind.
+    # Timeout (seconds) the plugin will wait for the peer's mapping
+    # reply future to resolve before spawning the punch worker anyway.
+    # Replaces an unconditional sleep -- the plugin now sets the future
+    # the moment the peer's mappings arrive and advance_punching_protocol
+    # has folded them into puncher.port_allocs, so the worker normally
+    # starts the instant the mappings land.  reply_delay is the fallback
+    # ceiling for the pathological case where the peer's signal is
+    # dropped or delayed past this many seconds; the worker proceeds
+    # with whatever port_allocs are already in the puncher.
+    "reply_delay": 2.0,
 }
+DEFAULT_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
+    DEFAULT_PUNCH_PARAMS["window"], DEFAULT_PUNCH_PARAMS["max_clock_error"],
+)
 
 FAST_PUNCH_PARAMS = {
     # Time rendezvous — sized for SysClock-quorum'd peers.  Both sides
@@ -88,14 +155,20 @@ FAST_PUNCH_PARAMS = {
     # routed away (see XP RST CLAUDE note), so only intra-LAN XP-
     # punch passes through these params, where peer clocks usually
     # share an upstream and fall well inside max_clock_error=4.
-    # Constraint: window > 2 * max_clock_error  →  10 > 8 ✓; the +2 s
-    # buffer above the strict minimum gives slack against sub-second
-    # jitter at bucket boundaries.  Worst-case rendezvous wait =
-    # window + max_clock_error = 14 s (down from 62 s).  If matrix
-    # sweep flakes appear, bump max_clock_error first (5 or 6) and
-    # widen window to 2*max+2.
-    "window": 10,
-    "max_clock_error": 4,
+    # Constraint: window > 2 * max_clock_error  →  4 > 2 ✓; tight
+    # profile sized for SysClock-quorum'd peers where peer-to-peer
+    # skew is sub-second.  Worst-case rendezvous wait =
+    # window + max_clock_error = 5 s (down from 14 s).  Previously
+    # reverted to 10/4 when sub-2s pre-bucket bailouts were
+    # appearing -- those turned out to be a NameError in the
+    # re-entry guard (fstr not imported, fixed in edde6f3), not a
+    # genuine bailout firing, so this profile is safe again.
+    # Tightest profile: window=3 is the minimum given max_clock_error=1
+    # (constraint window > 2 * max_clock_error -> 3 > 2 ✓).  Worst-case
+    # rendezvous wait = window + max_clock_error = 4s, average wait
+    # ~2.5s (with min_run_window=1 below).
+    "window": 3,
+    "max_clock_error": 1,
     # min_run_window=10 was inherited from DEFAULT_PUNCH_PARAMS, which
     # sized it for *manual CLI* usage where a human types ssh commands
     # on two machines and needs ~10s of slack to start both sides.
@@ -113,7 +186,13 @@ FAST_PUNCH_PARAMS = {
     # cause was NUM_PORTS dropping from 16 to 2 (db0c676 + 2a36880).
     # 3 s wins back the original sweep-flake reduction (bucket-fork
     # window 3/42 = 7% vs 10/42 = 24% per bucket transition).
-    "min_run_window": 3,
+    # Drop to 1 s with the smaller window=4 profile: skip path adds
+    # exactly window=4s every fire, and at min_run_window=3 the skip
+    # rate is 75% (3/4) -> avg rendezvous wait ~5.4s.  At
+    # min_run_window=1 skip rate drops to 25% (1/4) -> avg rendezvous
+    # wait drops by ~2.25s.  Safe given SysClock-NTP-quorum'd peers
+    # have sub-second skew well below 1s.
+    "min_run_window": 1,
     # Engine timing — bumped from 2.0 to 3.0 each after the matrix sweep
     # showed udp_punch flaking on busy hosts. With 18 sockets each spraying
     # at 50 Hz the connector saw only 1/18 of expected PROBEs back -- the
@@ -121,17 +200,27 @@ FAST_PUNCH_PARAMS = {
     # MQTT broker churn + plugin coordination chatter. 3 s gives ~50%
     # headroom on both directions, still well below DEFAULT_PUNCH_PARAMS's
     # 5.0 s and well within plugin's 30/40 s timeout.
-    "connect_timeout": 3.0,  # 3.0 s spray window (5.0 caused regression)
-    "monitor_timeout": 3.0,  # 3.0 s monitor window
+    # Tightest profile: spray runs full window, monitor early-exits at
+    # 50ms grace on first ESTABLISHED so monitor_timeout is the
+    # fail-fast ceiling on a non-converging punch.  1.5s spray gives
+    # both peers a tight overlap window for simul-open SYN exchange;
+    # may flake on slow stacks (older Windows, BSD with high jitter)
+    # where convergence trails into the second half-second.  If sweep
+    # regressions appear, bump connect_timeout back to 3.0 first.
+    "connect_timeout": 1.5,  # 1.5 s spray window (tightened from 3.0)
+    "monitor_timeout": 1.5,  # 1.5 s fail-fast ceiling (was 3.0)
     "retry_interval": 0.05,  # 0.05 s selector poll interval (unchanged)
-    # PunchClient / plugin timing
-    "max_sleep": 16,  # 16 s cap — above worst-case wait of 14 s
-    # (window + max_clock_error) so sleep_until reaches the actual
-    # rendezvous time without the cap firing early.
-    "coordinator_delay": 0.5,  # 0.5 s — sleep_until handles the actual
-    # rendezvous wait; this is just a setup buffer before spawning
-    # the punch worker, doesn't need to scale with window.
+    # PunchClient / plugin timing -- max_sleep is filled in below from
+    # derive_max_sleep(window, max_clock_error).
+    # See DEFAULT_PUNCH_PARAMS above for the role of reply_delay; this
+    # is the fast-profile fallback ceiling.  Mostly a guard against a
+    # signal that never arrives -- on a healthy run the mapping-reply
+    # future resolves well below this and the worker spawns immediately.
+    "reply_delay": 2,
 }
+FAST_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
+    FAST_PUNCH_PARAMS["window"], FAST_PUNCH_PARAMS["max_clock_error"],
+)
 
 
 def now_from_network(network_timer, network_time):
@@ -228,9 +317,11 @@ now,
     # The rendezvous time is the start of the (bucket + 1) window.
     rendezvous_time = (bucket + 1) * window + max_error
 
-    # 3. Check if there's enough time left for setup. If not, skip to the following bucket.
-    if rendezvous_time - now < min_run_window:
+    # 3. Check if there's enough time left for setup.
+    # If not, skip to the following bucket.
+    if (rendezvous_time - now) < min_run_window:
         bucket += 1
         rendezvous_time = (bucket + 1) * window + max_error
+        log("min run window being applied -- next bucket window")
 
     return bucket, rendezvous_time

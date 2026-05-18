@@ -14,6 +14,16 @@ class ReverseConnectPlugin(Plugin):
 
     async def run(self, reply=None):
         """Signal the peer to dial us; await the inbound pipe."""
+        # Re-entry guard.  Same shape as direct_connect's.  TM's
+        # recv_signal_msg may schedule a second run() while the first
+        # is still awaiting the inbound pipe; without this guard each
+        # duplicate signal re-registers the inbound future and re-
+        # publishes the ConMsg, multiplying broker traffic and
+        # spawning extra back-connections on the peer.
+        if getattr(self, "run_started", False):
+            return
+        self.run_started = True
+
         msg = ConMsg()
         msg.meta.plugin_name = "direct_connect"
         # Reserve the inbound future BEFORE sending the signal -- a

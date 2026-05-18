@@ -52,6 +52,11 @@ class Node(Daemon):
         self.ifs = ifs if ifs is not None else []
         self.listen_ips = norm_listen_ips(ip if ip is not None else [])
         self.listen_port = port
+        # Names of NICs explicitly requested via --nic; empty means
+        # "discover all". Gate overwrites this from its own nic_names;
+        # a directly-constructed Node has no --nic restriction, but the
+        # attribute must still exist -- listen_on_ifs reads it always.
+        self.nic_names = []
         # listen_ips validation is deferred to node_start (after
         # load_network_interfaces populates self.ifs).  Earlier this
         # validation ran here, but the Gate entry-point doesn't pre-load
