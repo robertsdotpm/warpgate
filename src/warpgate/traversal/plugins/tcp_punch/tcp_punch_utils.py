@@ -123,6 +123,22 @@ def bind_punch_sockets(
                 )
             except OSError:
                 pass
+        # Windows UDP: a sendto to a closed port draws an ICMP
+        # port-unreachable, and Windows then makes the *next* recvfrom
+        # on that socket raise WSAECONNRESET (WinError 10054). The punch
+        # spray fires at many predicted ports -- most closed -- so this
+        # fires constantly and aborts the engine's recvfrom loop before
+        # the one converging probe is read. SIO_UDP_CONNRESET=False
+        # turns the behaviour off so recvfrom only returns real
+        # datagrams. v4 punch mostly escaped it (v4 ICMP unreachables
+        # are widely rate-limited / filtered in transit); v6 did not
+        # (ICMPv6 unreachables come back reliably), which is why
+        # udp_punch was v6-0/5 on the Windows matrix VMs.
+        if sock_type == socket.SOCK_DGRAM and hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                s.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except OSError:
+                pass
         bind_tup = binder_sync(af, ip_strip_if(bind_ip), p.src_port, nic_id)
         bound = False
         for retry in range(4):
