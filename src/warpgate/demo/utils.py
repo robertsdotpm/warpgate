@@ -426,9 +426,11 @@ async def echo_client(pipe, echo_data):
 
     while not sock_has_data(stop_rw[0]):
         send_buf = echo_data or to_b(await ainput("Echo: "))
-        if send_buf in (b"menu"):
-            send_buf = b""
-
+        # Exact-match the menu keyword. This was `in (b"menu")` -- not a
+        # tuple (no comma), so it ran `send_buf in b"menu"`, a bytes
+        # substring test. b"" is a substring of everything, so pressing
+        # Enter (empty input) matched and bounced to the menu.
+        if send_buf == b"menu":
             return "menu"
 
         # Empty input -- just re-prompt. Don't send a bare ECHO frame
