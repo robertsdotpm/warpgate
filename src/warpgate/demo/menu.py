@@ -82,7 +82,7 @@ async def connect_option(node, con_opts):
         cout()
         cout("Auto-connecting... Please wait...")
         try:
-            pipe, plugin = await auto_connect(node, dest_addr, timeout=60)
+            pipe, plugin = await auto_connect(node, dest_addr, protocol=None)
         except (OSError, ConnectionError, asyncio.TimeoutError) as e:
             cout("Auto-connect error: " + str(e))
             return "menu"
