@@ -10,24 +10,48 @@ import types
 import warnings
 import multiprocessing
 import platform
+from asyncio import futures
 
-
+# asyncio.futures._chain_future was added in Python 3.5.1; polyfill for 3.5.0.
+if not hasattr(futures, "_chain_future"):
+    def chain_future_35(source, dest):
+        """Propagate result/exception from asyncio Future source to concurrent dest."""
+        def on_done(f):
+            if dest.cancelled():
+                return
+            try:
+                exc = f.exception()
+            except asyncio.CancelledError:
+                dest.cancel()
+                return
+            if exc is not None:
+                dest.set_exception(exc)
+            else:
+                dest.set_result(f.result())
+        source.add_done_callback(on_done)
+    futures._chain_future = chain_future_35
 
 vmaj, vmin, _ = platform.python_version_tuple()
-if int(vmin) < 8:
-    print("Warpgate REPL needs >= Python 3.8")
-    exit()
+SUPPORTS_TOP_LEVEL_AWAIT = int(vmaj) >= 3 and int(vmin) >= 8
+SUPPORTS_INTERACT_EXITMSG = int(vmaj) >= 3 and int(vmin) >= 6
 
 from . import __version__ as warpgatev  # noqa: E402
 from aionetiface import fstr  # noqa: E402
 
 
 class AsyncIOInteractiveConsole(code.InteractiveConsole):
-    """Interactive Python console that supports top-level await via asyncio."""
+    """Interactive console; supports top-level await on all Python 3.5+.
+
+    On 3.8+ the compiler flag PyCF_ALLOW_TOP_LEVEL_AWAIT handles everything.
+    On 3.5-3.7 runsource detects await-containing input, wraps it in an
+    async def, runs the coroutine on the event loop, and merges any new
+    local variables back into the console namespace.
+    """
 
     def __init__(self, locals, loop):
         super().__init__(locals)
-        self.compile.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+        if SUPPORTS_TOP_LEVEL_AWAIT:
+            self.compile.compiler.flags |= ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
 
         self.loop = loop
         # Tracks the running REPL task (if any) and whether the user hit
@@ -35,6 +59,80 @@ class AsyncIOInteractiveConsole(code.InteractiveConsole):
         # globals so the console's lifetime bounds them.
         self.repl_future = None
         self.repl_future_interrupted = False
+
+    def runsource(self, source, filename="<input>", symbol="single"):
+        if SUPPORTS_TOP_LEVEL_AWAIT:
+            return super().runsource(source, filename, symbol)
+        # Python < 3.8: try normal compilation first.
+        try:
+            code_obj = self.compile(source, filename, symbol)
+        except (OverflowError, SyntaxError, ValueError) as exc:
+            if "await" not in source and "async " not in source:
+                self.showsyntaxerror(filename)
+                return False
+            # Source has await/async — distinguish incomplete from invalid.
+            err = str(exc)
+            if "EOF" in err or "expected an indented block" in err:
+                return True  # Need more input.
+            return self.run_as_async(source, filename)
+        if code_obj is None:
+            return True  # Incomplete input.
+        self.runcode(code_obj)
+        return False
+
+    def run_as_async(self, source, filename):
+        """Wrap source in an async def, run it on the loop, merge locals back."""
+        import textwrap
+        ns = "repl_ns_a7c2"
+        indented = textwrap.indent(source.rstrip(), "    ")
+        wrapper = (
+            "async def repl_coro_a7c2({ns}):\n"
+            "{body}\n"
+            "    {ns}.update({{k: v for k, v in locals().items() if k != '{ns}'}})\n"
+        ).format(ns=ns, body=indented)
+        try:
+            code_obj = compile(wrapper, filename, "exec")
+        except SyntaxError:
+            self.showsyntaxerror(filename)
+            return False
+        captured = {}
+        try:
+            exec(code_obj, self.locals)
+        except Exception:
+            self.showtraceback()
+            return False
+        coro_func = self.locals.pop("repl_coro_a7c2", None)
+        if coro_func is None:
+            return False
+        future = concurrent.futures.Future()
+
+        def callback():
+            self.repl_future = None
+            self.repl_future_interrupted = False
+            try:
+                coro = coro_func(captured)
+            except BaseException as exc:
+                future.set_exception(exc)
+                return
+            try:
+                self.repl_future = self.loop.create_task(coro)
+                futures._chain_future(self.repl_future, future)
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        self.loop.call_soon_threadsafe(callback)
+        try:
+            future.result()
+        except SystemExit:
+            raise
+        except BaseException:
+            if self.repl_future_interrupted:
+                self.write("\nKeyboardInterrupt\n")
+            else:
+                self.showtraceback()
+            return False
+        self.locals.update(captured)
+        return False
 
     def runcode(self, code):
         """Execute a code object in the asyncio event loop, supporting top-level await."""
@@ -125,9 +223,10 @@ class REPLThread(threading.Thread):
             )
 
             console.push("from warpgate.do_imports import *")
-            console.interact(
-                banner="\n".join(banner), exitmsg="exiting asyncio REPL..."
-            )
+            interact_kwargs = {"banner": "\n".join(banner)}
+            if SUPPORTS_INTERACT_EXITMSG:
+                interact_kwargs["exitmsg"] = "exiting asyncio REPL..."
+            console.interact(**interact_kwargs)
 
         finally:
             warnings.filterwarnings(
