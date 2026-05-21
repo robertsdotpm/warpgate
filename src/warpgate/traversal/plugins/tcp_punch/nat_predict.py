@@ -184,6 +184,7 @@ mode,
     our_nat,
     preloaded_mapping,
     step=1000,
+    index=0,
 ):
     """Predict a single outbound NAT mapping that coordinates with the peer's rmap."""
     # Allow last mapped to be modified from inside func.
@@ -228,34 +229,49 @@ mode,
 
     # NAT preserves distance between local ports in remote ports.
     if our_nat["delta"]["type"] == PRESERV_DELTA:
-        # Try use their port but make sure it fits in our range.
-        if not in_range(bind_port, our_nat["range"]):
-            bind_port = from_range(use_range)
-            # our_reply was computed from the ORIGINAL bind_port above; if
-            # we just replaced bind_port because it wasn't in our range,
-            # the reply hint must follow it -- otherwise we tell the peer
-            # to send replies to a port we never actually used.
-            if our_nat["type"] == RESTRICT_PORT_NAT:
-                our_reply = bind_port
+        # PRESERV branch used to chase the peer's bind_port: compute the
+        # signed distance from our last STUN-observed mapping to that
+        # bind_port and add the same distance to our last_local.  That
+        # only works when the NAT applies a CONSTANT (local - mapped)
+        # offset across every socket -- which is what EQUAL_DELTA does,
+        # not PRESERV.  Real PRESERV NATs (and the burst-sequential
+        # CGNATs the classifier surfaces as PRESERV when round 2 sees
+        # mapped_dist == local_dist == 1) preserve port distance only
+        # for sockets allocated close in time to the STUN observation;
+        # a socket whose local port is tens of thousands away from
+        # last_local lands in a different allocation family with an
+        # unrelated offset.  Three preloaded mappings on a real carrier
+        # NAT bear this out: (42662->1446), (48808->1448), (3352->1304)
+        # -- three different (local-mapped) shifts, not one.
+        #
+        # Match the WE-DICTATE pattern the other non-trivial deltas
+        # already use (INDEPENDENT / DEPENDENT / PREDICTABLE-fallback):
+        # bind sequentially after the last STUN observation
+        # (last_local + 1 + index) and tell the peer to target the
+        # adjacent mapped port (last_remote + 1 + index).  The peer
+        # reads our .remote and lands there regardless of what they
+        # initially templated.  The per-mapping index spreads the N
+        # punch sockets across N adjacent NAT slots so multiple SYNs
+        # racing through the allocator have non-colliding predictions.
+        offset = 1 + index
+        next_local = port_wrap(last_local + offset)
+        next_remote = port_wrap(last_remote + offset)
+        if not in_range(next_remote, use_range):
+            next_remote = from_range(use_range)
 
-        # Signed distance: PRESERV means the NAT preserves the *signed*
-        # distance between local ports as the distance between mapped
-        # ports.  Using abs() always shifted next_local UP from last_local,
-        # which is only correct when bind_port > last_remote.  When the
-        # target bind_port is BELOW last_remote (e.g. NAT maps low locals
-        # to high remotes, or the peer's port falls below our observed
-        # mapping range), abs() picks the wrong direction and the punch
-        # SYN exits via a NAT mapping nowhere near the predicted port.
-        dist = n_dist(last_remote, bind_port)
-        next_local = port_wrap(last_local + dist)
+        # We're dictating the mapped port now, not chasing the peer's
+        # choice -- so the reply-port hint for our RESTRICT_PORT NAT
+        # must point at the port we'll actually arrive on, not the
+        # peer's original ask.
+        if our_nat["type"] == RESTRICT_PORT_NAT:
+            our_reply = next_remote
 
-        log("[NAT-PREDICT] PRESERV: last=({0}->{1}) bind_port={2} "
-            "dist={3} next_local={4} our_reply={5}".format(
-                last_local, last_remote, bind_port, dist, next_local, our_reply,
+        log("[NAT-PREDICT] PRESERV: last=({0}->{1}) idx={2} "
+            "next_local={3} next_remote={4} our_reply={5}".format(
+                last_local, last_remote, index, next_local, next_remote, our_reply,
             ))
 
-        # Return results.
-        return NATMapping([next_local, our_reply, bind_port])
+        return NATMapping([next_local, our_reply, next_remote])
 
     # Independent and dependent NATs allocate mappings from a known range
     # (measured via a large number of STUN tests) and wrap around when they
@@ -358,6 +374,9 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
             src_nat,
             # Get a result instantly.
             preloaded_mapping,
+            # Per-mapping index so WE-DICTATE branches (PRESERV) can
+            # spread N punch sockets across N adjacent NAT-slots.
+            index=i,
         )
 
         # Save prediction.
@@ -448,7 +467,12 @@ mode,
     """Adjust our local port predictions to satisfy the peer's reply port restrictions."""
     test_no = min(len(send_mappings), len(recv_mappings))
     use_range = nats_intersect(src_nat, dest_nat, test_no)
-    bad_delta = [INDEPENDENT_DELTA, DEPENDENT_DELTA, RANDOM_DELTA]
+    # PRESERV joins the we-dictate set: its predictor branch no longer
+    # follows the peer's bind_port, so re-running it here against the
+    # peer's reply port would just produce another mapping in our own
+    # adjacent-to-STUN-sample range -- not actually satisfying their
+    # reply-port constraint.  Same for INDEPENDENT/DEPENDENT/RANDOM.
+    bad_delta = [PRESERV_DELTA, INDEPENDENT_DELTA, DEPENDENT_DELTA, RANDOM_DELTA]
 
     # Update our local ports for port restricted NATs.
     for i in range(0, test_no):
@@ -473,6 +497,7 @@ mode,
             use_range,
             src_nat,
             preloaded_mappings[i],
+            index=i,
         )
 
         # Update our local port.
