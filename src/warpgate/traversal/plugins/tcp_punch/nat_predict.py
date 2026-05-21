@@ -231,11 +231,28 @@ mode,
         # Try use their port but make sure it fits in our range.
         if not in_range(bind_port, our_nat["range"]):
             bind_port = from_range(use_range)
+            # our_reply was computed from the ORIGINAL bind_port above; if
+            # we just replaced bind_port because it wasn't in our range,
+            # the reply hint must follow it -- otherwise we tell the peer
+            # to send replies to a port we never actually used.
+            if our_nat["type"] == RESTRICT_PORT_NAT:
+                our_reply = bind_port
 
-        # How far away is our last mapping from desired port.
-        # Delta dist will wrap inside any assumed range.
-        dist = abs(n_dist(last_remote, bind_port))
+        # Signed distance: PRESERV means the NAT preserves the *signed*
+        # distance between local ports as the distance between mapped
+        # ports.  Using abs() always shifted next_local UP from last_local,
+        # which is only correct when bind_port > last_remote.  When the
+        # target bind_port is BELOW last_remote (e.g. NAT maps low locals
+        # to high remotes, or the peer's port falls below our observed
+        # mapping range), abs() picks the wrong direction and the punch
+        # SYN exits via a NAT mapping nowhere near the predicted port.
+        dist = n_dist(last_remote, bind_port)
         next_local = port_wrap(last_local + dist)
+
+        log("[NAT-PREDICT] PRESERV: last=({0}->{1}) bind_port={2} "
+            "dist={3} next_local={4} our_reply={5}".format(
+                last_local, last_remote, bind_port, dist, next_local, our_reply,
+            ))
 
         # Return results.
         return NATMapping([next_local, our_reply, bind_port])
@@ -345,6 +362,22 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
 
         # Save prediction.
         results.append(result)
+
+    # Diagnostic: log the full input + output of this prediction round so
+    # punch failures can be reconstructed from the log without needing to
+    # rerun the demo.  Previously only mode/types/counts were logged,
+    # which made it impossible to tell whether a failed punch came from
+    # a bad NAT classification (wrong delta type), a wrong preloaded STUN
+    # measurement, a bad bind_port template, or a bug in get_single_mapping.
+    log("[NAT-PREDICT] preloaded={0}".format(
+        [(m.local, m.remote) for m in preloaded_mappings],
+    ))
+    log("[NAT-PREDICT] recv_template={0}".format(
+        [(m.local, m.reply, m.remote) for m in recv_mappings],
+    ))
+    log("[NAT-PREDICT] send_mappings={0}".format(
+        [(m.local, m.reply, m.remote) for m in results],
+    ))
 
     # R8-6: sequential-allocator one-step-ahead candidate.
     # ~40-60% of SOHO routers allocate ports sequentially (Guha2005 §3.2).
