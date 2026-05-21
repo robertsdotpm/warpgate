@@ -256,8 +256,16 @@ mode,
         offset = 1 + index
         next_local = port_wrap(last_local + offset)
         next_remote = port_wrap(last_remote + offset)
-        if not in_range(next_remote, use_range):
-            next_remote = from_range(use_range)
+        # We intentionally do NOT check next_remote against use_range:
+        # nats_intersect() bumps use_range[0] to 2000 to keep BIND-PORT
+        # selection out of privileged territory, but next_remote isn't a
+        # bind port -- it's what the carrier NAT will actually map us to,
+        # and real CGNATs commonly allocate from sub-2000 pools (the
+        # observed last_remote=1319 is the canonical case).  Falling back
+        # to from_range(use_range) here was randomising the predicted
+        # mapping back to 30k+ ports the NAT never assigns, defeating
+        # the whole WE-DICTATE prediction.  port_wrap() above guards
+        # arithmetic overflow; that's the only invariant we need.
 
         # We're dictating the mapped port now, not chasing the peer's
         # choice -- so the reply-port hint for our RESTRICT_PORT NAT
