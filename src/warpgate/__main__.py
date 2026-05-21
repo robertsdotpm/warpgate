@@ -36,7 +36,7 @@ SUPPORTS_TOP_LEVEL_AWAIT = int(vmaj) >= 3 and int(vmin) >= 8
 SUPPORTS_INTERACT_EXITMSG = int(vmaj) >= 3 and int(vmin) >= 6
 
 from . import __version__ as warpgatev  # noqa: E402
-from aionetiface import fstr  # noqa: E402
+from aionetiface import fstr, aionetiface_setup_event_loop  # noqa: E402
 
 
 class AsyncIOInteractiveConsole(code.InteractiveConsole):
@@ -196,8 +196,12 @@ class REPLThread(threading.Thread):
         """Drive the interactive REPL console until the user exits."""
         try:
             loop_policy = str(asyncio.get_event_loop_policy())
-            if "elector" in loop_policy:
+            # CustomEventLoopPolicy is Selector-backed; map its repr (and the
+            # stdlib SelectorEventLoopPolicy repr) to the friendly "selector".
+            if "Custom" in loop_policy or "elector" in loop_policy:
                 loop_policy = "selector"
+            elif "roactor" in loop_policy:
+                loop_policy = "proactor"
 
             spawn_method = multiprocessing.get_start_method()
             vmaj, vmin, _ = platform.python_version_tuple()
@@ -239,7 +243,13 @@ class REPLThread(threading.Thread):
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+    # Install CustomEventLoopPolicy BEFORE touching the loop. Without this, on
+    # Python 3.8+ Windows the default WindowsProactorEventLoopPolicy is still
+    # active and get_event_loop() returns a ProactorEventLoop -- which the rest
+    # of the stack is not built for (see aionetiface entrypoint.py).
+    aionetiface_setup_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     repl_locals = {"asyncio": asyncio}
     for key in {
         "__name__",
