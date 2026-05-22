@@ -32,7 +32,7 @@ from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
-from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
+from ..tcp_punch.punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE
 from .proto import UdpPunchMsg
 from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN, UDP_PUNCH_PARAMS
 from .udp_punch_engine import drain_punch_residue, udp_punch_engine
