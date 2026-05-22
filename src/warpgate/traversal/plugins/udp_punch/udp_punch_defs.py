@@ -108,7 +108,10 @@ STUN_TXID_LEN = 12
 
 def stun_format_enabled():
     """True iff WG_PROBE_STUN_FORMAT=1 in the env."""
-    return os.environ.get("WG_PROBE_STUN_FORMAT") == "1"
+    # Strip trailing whitespace -- cmd.exe's `set X=1 &&` syntax bakes a
+    # trailing space into the value, so a literal `== "1"` check fails
+    # on Windows-launched processes.
+    return os.environ.get("WG_PROBE_STUN_FORMAT", "").strip() == "1"
 
 
 def build_frame(kind, nonce):

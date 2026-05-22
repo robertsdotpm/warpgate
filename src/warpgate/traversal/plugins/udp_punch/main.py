@@ -324,7 +324,7 @@ class UdpPunchPlugin(Plugin):
             # verbatim) derive the same bucket regardless of local-
             # clock skew between their create_puncher calls.
             puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
-        elif os.environ.get("WG_DISABLE_PREDICT") == "1":
+        elif os.environ.get("WG_DISABLE_PREDICT", "").strip() == "1":
             # Predictor is also disabled, so without forcing the boundary
             # allocator we'd end up with port_allocs=[] and the engine
             # would bind 0/0 sockets and abort.  Force the deterministic
@@ -366,7 +366,7 @@ class UdpPunchPlugin(Plugin):
         # supported set).  Punches that genuinely need predictor (PRESERV
         # / INDEPENDENT / DEPENDENT / RANDOM on either side) will fail
         # under this flag; that's the trade-off for a clean test signal.
-        if os.environ.get("WG_DISABLE_PREDICT") == "1":
+        if os.environ.get("WG_DISABLE_PREDICT", "").strip() == "1":
             log("[UDP-PUNCH] WG_DISABLE_PREDICT=1; skipping NATPredictAlloc")
             self.nat_alloc = None
         else:
