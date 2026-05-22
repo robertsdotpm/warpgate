@@ -665,7 +665,7 @@ async def listen_on_ifs(node):
                 ("; ".join(failed) or "(no --ip address matched any NIC)",),
             )
             log(msg)
-            raise OSError(msg)
+            raise RuntimeError(msg)
         return
 
     # --- default path: per-NIC "nic" + "ext" binds -----------------------
@@ -736,7 +736,7 @@ async def listen_on_ifs(node):
                     (nic.name, ", ".join(missing)),
                 )
                 log(msg)
-                raise OSError(msg)
+                raise RuntimeError(msg)
 
         if not (nic_ok or ext_ok):
             failed_nics.append(getattr(nic, "id", nic_i))
@@ -748,7 +748,7 @@ async def listen_on_ifs(node):
             (len(acct), failed_nics),
         )
         log(msg)
-        raise OSError(msg)
+        raise RuntimeError(msg)
 
 
 async def remote_reachability_cb(reachability, _msg, client_tup, pipe):
