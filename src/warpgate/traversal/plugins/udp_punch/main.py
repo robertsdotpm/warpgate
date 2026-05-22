@@ -34,7 +34,13 @@ from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE
 from .proto import UdpPunchMsg
-from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN, UDP_PUNCH_PARAMS
+from .udp_punch_defs import (
+    UDP_PUNCH_FRAME_LEN,
+    UDP_PUNCH_MAGIC,
+    UDP_PUNCH_NONCE_LEN,
+    UDP_PUNCH_PARAMS,
+    parse_frame,
+)
 from .udp_punch_engine import drain_punch_residue, udp_punch_engine
 
 
@@ -913,11 +919,16 @@ class UdpPunchPlugin(Plugin):
                     nonce_bytes = puncher.udp_nonce
 
                     def filtered_add_msg(data, client_tup):
-                        if (
-                            len(data) == UDP_PUNCH_FRAME_LEN
-                            and bytes(data[:4]) == UDP_PUNCH_MAGIC
-                            and bytes(data[5:5 + len(nonce_bytes)]) == nonce_bytes
-                        ):
+                        # Drop any frame parse_frame() recognises whose
+                        # nonce matches this session's.  Covers both
+                        # native P2UP (21B) and STUN-shape (20-32B
+                        # Binding Request/Success).  Compare on the
+                        # first 12 bytes because the STUN-shape only
+                        # carries the truncated 12-byte TXID over the
+                        # wire (parse_frame zero-pads back to 16).
+                        buf = bytes(data)
+                        kind, recv_nonce = parse_frame(buf)
+                        if kind is not None and recv_nonce[:12] == nonce_bytes[:12]:
                             drop_count[0] += 1
                             if drop_count[0] <= 3 or drop_count[0] % 50 == 0:
                                 log(fstr(
