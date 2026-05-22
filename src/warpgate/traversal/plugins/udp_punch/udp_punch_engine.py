@@ -32,12 +32,22 @@ from aionetiface.net.address import resolve_dest_tup
 
 from ..tcp_punch.tcp_punch_utils import bind_punch_sockets
 from .udp_punch_defs import (
+    STUN_FRAME_LEN_WITH_XMA,
     UDP_PUNCH_FRAME_LEN,
     UDP_PUNCH_KIND_CONFIRM,
     UDP_PUNCH_KIND_PROBE,
     build_frame,
     parse_frame,
 )
+
+
+# Peek/drain buffer wide enough for the longest punch frame we accept:
+# either the native 21-byte P2UP frame or a 32-byte STUN Binding Success
+# (20-byte header + 12-byte XOR-MAPPED-ADDRESS).  Sizing at the native
+# 21 bytes truncates STUN frames -- parse_frame then rejects them on the
+# length check, AND on Windows the drain recvfrom() raises WSAEMSGSIZE
+# because the kernel discards the unread tail.
+PUNCH_RECV_BUFLEN = max(UDP_PUNCH_FRAME_LEN, STUN_FRAME_LEN_WITH_XMA)
 
 
 # Module-level fallbacks. Per-call params dicts override these.
@@ -199,7 +209,11 @@ def watch_for_winner(
         log("udp_punch.watch_for_winner: no bound sockets; nothing to watch")
         return None
 
-    confirm_frame = build_frame(UDP_PUNCH_KIND_CONFIRM, nonce)
+    # confirm_frame is built per-PROBE arrival in the loop below.  Under
+    # WG_PROBE_STUN_FORMAT a Binding Success Response must carry an
+    # XOR-MAPPED-ADDRESS attribute describing the peer's reflexive
+    # address, so the frame depends on the peer addr we just learned
+    # from recvfrom -- can't be precomputed.
     end = time.monotonic() + listen_duration
     log(fstr(
         "udp_punch.watch_for_winner: watching {0} sockets at {1} duration={2}s nonce={3}",
@@ -224,7 +238,7 @@ def watch_for_winner(
         for s in ready:
             # MSG_PEEK: don't drain unrecognised data.
             try:
-                buf, addr = s.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+                buf, addr = s.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
             except OSError:
                 continue
 
@@ -252,7 +266,7 @@ def watch_for_winner(
 
             # It IS a punch frame -- consume the bytes off the queue.
             try:
-                s.recvfrom(UDP_PUNCH_FRAME_LEN)
+                s.recvfrom(PUNCH_RECV_BUFLEN)
             except OSError:
                 continue
 
@@ -287,6 +301,14 @@ def watch_for_winner(
                 else:
                     confirm_burst = 1
                     confirm_interval = 0.0
+                # Build CONFIRM per peer addr -- STUN Binding Success
+                # Response needs an XOR-MAPPED-ADDRESS attribute pointing
+                # at the peer's reflexive transport address (the addr we
+                # just got from recvfrom).  Native P2UP mode ignores
+                # peer_addr.
+                confirm_frame = build_frame(
+                    UDP_PUNCH_KIND_CONFIRM, nonce, peer_addr=sendto_addr,
+                )
                 for i in range(confirm_burst):
                     try:
                         s.sendto(confirm_frame, sendto_addr)
@@ -343,7 +365,7 @@ def watch_for_winner(
         ready = []
     for s in ready:
         try:
-            buf, addr = s.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+            buf, addr = s.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
         except OSError:
             continue
         # Same flowinfo normalization as the main loop -- XP's
@@ -354,7 +376,7 @@ def watch_for_winner(
         kind, recv_nonce = parse_frame(buf)
         if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce[:12] == nonce[:12]:
             try:
-                s.recvfrom(UDP_PUNCH_FRAME_LEN)
+                s.recvfrom(PUNCH_RECV_BUFLEN)
             except OSError:
                 pass
             return (s, addr)

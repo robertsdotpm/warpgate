@@ -102,8 +102,11 @@ import os
 STUN_MAGIC_COOKIE = b"\x21\x12\xa4\x42"
 STUN_TYPE_BINDING_REQUEST = b"\x00\x01"
 STUN_TYPE_BINDING_SUCCESS = b"\x01\x01"
-STUN_FRAME_LEN = 20  # 2 (type) + 2 (length) + 4 (cookie) + 12 (TXID)
+STUN_ATTR_XOR_MAPPED_ADDRESS = b"\x00\x20"
+STUN_HEADER_LEN = 20  # 2 (type) + 2 (length) + 4 (cookie) + 12 (TXID)
 STUN_TXID_LEN = 12
+STUN_FRAME_LEN_BARE = STUN_HEADER_LEN  # request with no attributes
+STUN_FRAME_LEN_WITH_XMA = STUN_HEADER_LEN + 12  # +XOR-MAPPED-ADDRESS for IPv4
 
 
 def stun_format_enabled():
@@ -114,23 +117,62 @@ def stun_format_enabled():
     return os.environ.get("WG_PROBE_STUN_FORMAT", "").strip() == "1"
 
 
-def build_frame(kind, nonce):
+def _build_xor_mapped_address_v4(ip_str, port):
+    """Build the XOR-MAPPED-ADDRESS attribute (12 bytes) for an IPv4 peer.
+
+    RFC 5389 §15.2.  The port is XOR'd with the top 16 bits of the
+    magic cookie; the IPv4 address is XOR'd with the full 32-bit
+    cookie.  This is what real STUN servers send in Binding Success
+    responses, so a STUN-aware NAT or DPI scanner can validate the
+    response against the request it just saw.
+    """
+    import socket
+    ip_bytes = socket.inet_aton(ip_str)
+    cookie_u32 = int.from_bytes(STUN_MAGIC_COOKIE, "big")
+    cookie_u16 = (cookie_u32 >> 16) & 0xffff
+    xor_port = (port ^ cookie_u16).to_bytes(2, "big")
+    xor_ip = bytes(b ^ c for b, c in zip(ip_bytes, STUN_MAGIC_COOKIE))
+    # Attribute: type=XOR-MAPPED-ADDRESS, length=8, value=8 bytes
+    #   reserved(1) + family=IPv4(1) + xor_port(2) + xor_ip(4)
+    attr_value = b"\x00\x01" + xor_port + xor_ip
+    return STUN_ATTR_XOR_MAPPED_ADDRESS + b"\x00\x08" + attr_value
+
+
+def build_frame(kind, nonce, peer_addr=None):
     """Build a punch frame for the given kind + nonce.
 
     Default format is the 21-byte P2UP magic + kind + 16-byte nonce.
-    With WG_PROBE_STUN_FORMAT=1, emit a STUN-shaped 20-byte frame
-    instead (see module-level comment on the STUN constants).
+    With WG_PROBE_STUN_FORMAT=1, emit a STUN-shaped frame:
+      * PROBE  -> 20-byte Binding Request (no attributes).
+      * CONFIRM -> 32-byte Binding Success Response with an
+        XOR-MAPPED-ADDRESS attribute (IPv4) describing peer_addr.
+        peer_addr (IPv4 tuple ('ip', port)) is REQUIRED for CONFIRM
+        under STUN format -- a Binding Success without a mapped
+        address is malformed and a DPI scanner can reject it.  If
+        the peer's family isn't IPv4 the attribute is omitted and
+        we fall back to the bare 20-byte success response.
     """
     if len(nonce) != UDP_PUNCH_NONCE_LEN:
         raise ValueError("nonce must be {0} bytes".format(UDP_PUNCH_NONCE_LEN))
     if stun_format_enabled():
         if kind == UDP_PUNCH_KIND_PROBE:
             msg_type = STUN_TYPE_BINDING_REQUEST
+            attrs = b""
         elif kind == UDP_PUNCH_KIND_CONFIRM:
             msg_type = STUN_TYPE_BINDING_SUCCESS
+            attrs = b""
+            if peer_addr is not None:
+                try:
+                    peer_ip, peer_port = peer_addr[0], peer_addr[1]
+                    # Only IPv4 attributes implemented; skip for v6.
+                    if peer_ip and "." in peer_ip:
+                        attrs = _build_xor_mapped_address_v4(peer_ip, peer_port)
+                except (ValueError, TypeError, OSError):
+                    attrs = b""
         else:
             raise ValueError("unknown kind {0}".format(kind))
-        return msg_type + b"\x00\x00" + STUN_MAGIC_COOKIE + nonce[:STUN_TXID_LEN]
+        msg_length = len(attrs).to_bytes(2, "big")
+        return msg_type + msg_length + STUN_MAGIC_COOKIE + nonce[:STUN_TXID_LEN] + attrs
     return UDP_PUNCH_MAGIC + bytes([kind]) + nonce
 
 
@@ -138,14 +180,18 @@ def parse_frame(buf):
     """Parse a punch frame; returns (kind, nonce) or (None, None) on mismatch.
 
     Accepts both the native P2UP format and the STUN-shaped format.
-    The STUN decode looks for the RFC 5389 magic cookie and treats
-    Binding Request as PROBE, Binding Success as CONFIRM.  Either
-    peer can emit either format and the other side will parse it,
-    so the env flag can be flipped per host without breaking compat.
+    Under STUN format, the message length field indicates how many
+    bytes of attributes follow the 20-byte header.  We accept any
+    length >= 0 -- the TXID identifies the session regardless of
+    how many attributes the peer chose to include.
     """
     if len(buf) == UDP_PUNCH_FRAME_LEN and buf[:4] == UDP_PUNCH_MAGIC:
         return (buf[4], buf[5:5 + UDP_PUNCH_NONCE_LEN])
-    if len(buf) == STUN_FRAME_LEN and buf[4:8] == STUN_MAGIC_COOKIE:
+    if len(buf) >= STUN_HEADER_LEN and buf[4:8] == STUN_MAGIC_COOKIE:
+        # Sanity: declared attribute-payload length matches actual.
+        declared = int.from_bytes(buf[2:4], "big")
+        if STUN_HEADER_LEN + declared != len(buf):
+            return (None, None)
         msg_type = buf[0:2]
         if msg_type == STUN_TYPE_BINDING_REQUEST:
             kind = UDP_PUNCH_KIND_PROBE
