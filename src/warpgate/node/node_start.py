@@ -11,6 +11,7 @@ from aionetiface import (
     IP4, IP6, OPEN_INTERNET, AFGroup, Interface, SysClock,
     list_interfaces, load_interfaces, parse_node_addr, make_node_addr,
     field_wrap, dhash, create_task, Signing, os_id, os_net_timeouts,
+    ErrorCantLoadNATInfo
 )
 from aionetiface.nic.nat.nat_utils import nat_info
 from aionetiface.nic.nat.nat_cache import (
@@ -30,7 +31,7 @@ from .node_utils import (
 )
 from .nickname import Nickname
 from ..traversal.traversal_manager import TraversalManager
-from ..traversal.plugin_loader import load_plugins
+from ..traversal.plugin_loader import load_plugins, register_plugin_wire_names
 from ..install_check import verify_sibling_installs
 
 
@@ -279,8 +280,11 @@ async def classify_nat_background(node, out):
             raise
         except (OSError, ConnectionError, asyncio.TimeoutError):
             log_exception()
+        except ErrorCantLoadNATInfo:
+            log_exception()
         except Exception:  # pylint: disable=broad-except
             log_exception()
+
         nat = getattr(nic, "nat", None)
         if nat is not None:
             nat_by_nic[getattr(nic, "name", None)] = nat
@@ -458,6 +462,25 @@ async def setup_router_and_signal(node, kp, out, cout):
     router.add_msg_handler(node.traversal.recv_signal_msg)
 
     node.traversal.kp = node.kp
+
+    # Wire-names MUST be in node.traversal.sig_proto BEFORE the MQTT
+    # subscription goes live in setup_signal_router below.  Otherwise the
+    # window between 'subscribed' and 'setup_traversal_plugins finished'
+    # (~600ms during which load_p2p_stun_clients, punch_coord, listen and
+    # nickname all run) drops any PunchMsg / signal that arrives at the
+    # listener with "ValueError: unknown wire_name 'tcp_punch.PunchMsg'".
+    # That window is sub-second on a healthy LAN but trivially exposed by
+    # a connector whose own startup finishes faster -- the listener never
+    # sees the punch and sidewire's republish loses the race if the
+    # connector exits inside its punch budget.
+    #
+    # register_plugin_wire_names is the pure-sync subset of load_plugins
+    # (import classes + populate sig_proto + proto_handlers) with no
+    # cls.setup() awaits, so it's safe to run before stun_clients /
+    # sys_clock have been wired up.  load_plugins below re-runs the same
+    # registration during full setup; the collision check makes the
+    # double-write a no-op.
+    register_plugin_wire_names(node)
 
     await setup_signal_router(node, router, out, cout)
 
