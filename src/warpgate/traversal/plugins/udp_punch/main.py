@@ -48,7 +48,14 @@ class UdpPunchPlugin(Plugin):
     # does no useful work over it. Symmetric NAT goes to random_probe,
     # not here.
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 5}
+    # 15s gives engine + bridge enough headroom on Windows.  The 5s value
+    # was right at the edge: spray (1.5s) + watch (1.5s) + signal_rtt
+    # (~1s) + clock_settle (~0.6s) lands ~5s; cleanup_loop checks
+    # expires_at every 5s and reaped the plugin mid-bridge when the
+    # engine ran long, killing master's CONFIRM-send before the wire
+    # got it.  Wire capture showed Win10's PROBEs arriving at p2pd.net
+    # but zero Out packets from p2pd.net in response.
+    conf = {"timeout": 15}
     proto_messages = (
         (UdpPunchMsg, P2P_PUNCH, 20),
     )
