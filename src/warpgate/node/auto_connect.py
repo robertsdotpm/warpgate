@@ -1134,9 +1134,41 @@ async def auto_connect(
             dest_nat = worst_nat(dest_map)
             src_cgnat = is_cgnat_external(src_map)
             dest_cgnat = is_cgnat_external(dest_map)
-            line = "[AC-PHASE] {0} -> pipe={1} plugin={2} src_nat={3} dest_nat={4} elapsed={5}ms src_cgnat={6} dest_cgnat={7}".format(
+
+            # Liveness verify per phase.  Previously only the FIRST
+            # successful phase ran verify_pipe_alive -- subsequent
+            # phases' pipes were closed without a PING/PONG round-trip,
+            # so the [AC-PHASE] line reported pipe=True purely on
+            # engine-returned-a-socket, not on "pipe actually carries
+            # bytes."  test_all_phases mode is the diagnostic harness
+            # downstream gate_sweep matrices rely on for per-plugin
+            # success; without per-phase verify, udp_punch passing the
+            # matrix while its echo round-trip silently failed was
+            # invisible (the cascade winner was always direct_connect,
+            # so app echo succeeded through that, not udp_punch).
+            #
+            # Run verify on every non-None pipe and surface the result
+            # in the [AC-PHASE] line as alive=true/false.  Failing
+            # verify on a non-winner just closes that pipe; on a not-
+            # yet-winner, falls through to the next phase as before.
+            alive = None
+            if pipe is not None:
+                transport = getattr(plugin, "transport", TCP)
+                try:
+                    alive = await verify_pipe_alive(pipe, transport=transport)
+                except (OSError, ConnectionError, asyncio.TimeoutError):
+                    log_exception()
+                    alive = False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    log_exception()
+                    alive = False
+
+            line = "[AC-PHASE] {0} -> pipe={1} alive={2} plugin={3} src_nat={4} dest_nat={5} elapsed={6}ms src_cgnat={7} dest_cgnat={8}".format(
                 phase_fn.__name__,
                 pipe is not None,
+                ("true" if alive else "false") if pipe is not None else "n/a",
                 getattr(plugin, "name", type(plugin).__name__) if plugin is not None else None,
                 src_nat,
                 dest_nat,
@@ -1152,37 +1184,22 @@ async def auto_connect(
                     tel.record(
                         phase_fn.__name__,
                         getattr(plugin, "name", None) if plugin is not None else None,
-                        pipe is not None,
+                        bool(alive),
                         elapsed_ms,
                         src_nat,
                         dest_nat,
                     )
                 except Exception:
                     pass
-            if pipe is not None and winner_pipe is None:
-                # Liveness verify: punch engines occasionally declare
-                # ESTABLISHED for a pipe that the kernel then tears
-                # down before app bytes can flow (multi-NIC routing
-                # asymmetry, NAT mapping closing on the spray's
-                # trailing SYNs, XP-style 174ms post-handshake RST,
-                # etc).  Round-trip a PING and fall through to the
-                # next phase if no PONG comes back.
-                transport = getattr(plugin, "transport", TCP)
-                alive = await verify_pipe_alive(pipe, transport=transport)
-                if not alive:
-                    log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
-                        phase_fn.__name__,
-                    ))
-                    try:
-                        await close_plugin(
-                            plugin, node.traversal.plugins, node.traversal.inbound_pipes,
-                        )
-                    except (OSError, asyncio.TimeoutError):
-                        log_exception()
-                else:
-                    winner_pipe = pipe
-                    winner_plugin = plugin
+            if pipe is not None and alive and winner_pipe is None:
+                # Earliest phase whose pipe verified alive becomes the
+                # cascade winner.  Later phases still run for telemetry
+                # (their pipes get verified + closed for measurement).
+                winner_pipe = pipe
+                winner_plugin = plugin
             elif pipe is not None:
+                # Failed verify, OR we already have a winner -- close
+                # this phase's pipe so it doesn't leak.
                 try:
                     await close_plugin(
                         plugin, node.traversal.plugins, node.traversal.inbound_pipes,
