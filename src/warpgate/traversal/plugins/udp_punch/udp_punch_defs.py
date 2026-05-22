@@ -48,11 +48,25 @@ UDP_PUNCH_FRAME_LEN = 4 + 1 + UDP_PUNCH_NONCE_LEN  # 21
 from ..tcp_punch.boundary_lib import derive_max_sleep  # noqa: E402
 
 UDP_PUNCH_PARAMS = {
-    "window": 3,
-    "max_clock_error": 1,
-    "min_run_window": 1,
-    "connect_timeout": 1.5,
-    "monitor_timeout": 1.5,
+    # Pre-tightening profile -- the values udp_punch ran the matrix on
+    # historically (full_sweep_v4 9/9).  6b05a78 re-tightened to
+    # tcp_punch's tight (3/1/1, 1.5s) values on the assumption that
+    # boundary-allocator's n=1 had removed the spray-load reason for
+    # 3.0s engine timing.  That assumption only holds when the punch
+    # actually takes the boundary fast-path; the predictor path
+    # (PRESERV / INDEPENDENT / DEPENDENT / RANDOM on either side, and
+    # the asymmetric / mobile-NIC carrier CGNAT cases we exercise in
+    # the matrix) still uses 9-17 sockets at 50Hz spray.  Wire capture
+    # showed Windows udp_punch losing ~98% of inbound PROBEs under
+    # consumer-router UDP burst caps when the engine raced through the
+    # tight 1.5s window.  3.0s windows give the burst room to spread
+    # below the cap and the executor thread room to keep up under MQTT
+    # churn.
+    "window": 10,
+    "max_clock_error": 4,
+    "min_run_window": 3,
+    "connect_timeout": 3.0,
+    "monitor_timeout": 3.0,
     "retry_interval": 0.05,
     "reply_delay": 2,
 }
