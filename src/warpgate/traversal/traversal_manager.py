@@ -302,6 +302,25 @@ class TraversalManager:
         if self.done_callback:
             plugin.result.add_done_callback(self.done_callback)
 
+        # Extend expires_at when the result resolves successfully, regardless of
+        # whether the resolution happened synchronously inside run_plugin or
+        # later from a background worker.  Without this, plugins with delayed
+        # convergence (udp_punch's delayed_run_engine, random_probe's worker,
+        # tcp_punch's punch_process) succeed AFTER plugin.timeout elapses;
+        # cleanup_loop then reaps the pipe within ~5s and any ECHO bytes the
+        # peer sends after convergence land on an already-closed plugin.
+        def extend_on_success(fut, plugin=plugin):
+            try:
+                if fut.result() is not None:
+                    plugin.expires_at = get_running_loop().time() + 3600
+                    log("[TM] result-done callback: extended expires_at by "
+                        "3600s for plugin={0}".format(
+                            getattr(plugin, "plugin_id", "?"),
+                        ))
+            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+                pass
+        plugin.result.add_done_callback(extend_on_success)
+
         # Schedule cleanup loop if needed.
         if not self.cleanup_task or self.cleanup_task.done():
             self.cleanup_task = get_running_loop().create_task(self.cleanup_loop())
