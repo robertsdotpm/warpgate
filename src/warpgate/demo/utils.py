@@ -205,10 +205,22 @@ def display_ifs_loaded(ifs):
                 buf += "(v6)"
         if nic.nat is None:
             buf += "\n\t\tnat = unknown (load_nat did not complete)"
+        elif nic.nat.get("type") is None:
+            # Seeded by apply_cached_or_placeholder_nat from nat_info()
+            # with no args -- nic.nat is a dict but the fields are None
+            # until classify_nat_background fills them in.  Treat the
+            # same as "load_nat did not complete" for display purposes;
+            # the background task will overwrite shortly.
+            buf += "\n\t\tnat = unknown (classification deferred)"
         else:
             buf += fstr("\n\t\t{0} nat; ", (nat_txt[nic.nat["type"]],))
-            buf += fstr("{0} delta = ", (delta_txt[nic.nat["delta"]["type"]],))
-            buf += fstr("{0}", (nic.nat["delta"]["value"],))
+            delta_type = nic.nat["delta"]["type"]
+            delta_value = nic.nat["delta"]["value"]
+            if delta_type is None:
+                buf += "unknown delta"
+            else:
+                buf += fstr("{0} delta = ", (delta_txt[delta_type],))
+                buf += fstr("{0}", (delta_value,))
         buf += "\n"
     cout(buf)
 
