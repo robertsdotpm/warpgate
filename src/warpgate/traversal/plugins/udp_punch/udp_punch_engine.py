@@ -44,18 +44,7 @@ from .udp_punch_defs import (
 SPRAY_DURATION = 5.0
 LISTEN_DURATION = 6.0
 RETRY_INTERVAL = 0.05
-# Spray rate.  Was 0.02 (50 rounds/s) -- with master's 17 sockets that's
-# 850 pps which hits consumer-router UDP burst caps (per project memory:
-# ~256-packet burst limit on the LAN here, possibly higher elsewhere).
-# Wire capture during the Win10 matrix showed master sending 1241 PROBE
-# packets in 1.5s and Win10 receiving only 17 of them (~98.6% loss);
-# TCP punch on the same path is unaffected because the router doesn't
-# burst-cap TCP.  0.1s (10 rounds/s) keeps a 1.5s spray under ~255
-# packets total for a 17-socket master, well within the cap.  Per-socket
-# retransmit count drops from ~75 to 15 but each path still gets enough
-# attempts to converge (boundary_alloc/predictor pick the same port
-# both sides, so 1 successful PROBE both ways is enough).
-SPRAY_INTERVAL = 0.1
+SPRAY_INTERVAL = 0.02
 
 
 def fire_probes(
