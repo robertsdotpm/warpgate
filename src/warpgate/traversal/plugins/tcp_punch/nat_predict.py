@@ -483,6 +483,14 @@ mode,
     bad_delta = [PRESERV_DELTA, INDEPENDENT_DELTA, DEPENDENT_DELTA, RANDOM_DELTA]
 
     # Update our local ports for port restricted NATs.
+    log("[NAT-PREDICT] update_for_reply_ports enter src_delta={0} bad={1} "
+        "test_no={2} send_before={3} recv={4}".format(
+            (src_nat.get("delta") or {}).get("type"),
+            (src_nat.get("delta") or {}).get("type") in bad_delta,
+            test_no,
+            [(m.local, m.reply, m.remote) for m in send_mappings],
+            [(m.local, m.reply, m.remote) for m in recv_mappings],
+        ))
     for i in range(0, test_no):
         # No NAT so reply ports don't apply.
         if mode == TCP_PUNCH_SELF:
@@ -491,10 +499,12 @@ mode,
         # The update is to satisfy a port restricted NAT.
         # These NATs require a specific reply port.
         if not recv_mappings[i].reply:
+            log("[NAT-PREDICT] update i={0} skip: recv reply=0".format(i))
             continue
 
         # We can satisfy their requirements.
         if src_nat["delta"]["type"] in bad_delta:
+            log("[NAT-PREDICT] update i={0} skip: src delta in bad_delta".format(i))
             continue
 
         # local, remote, reply, sock.
@@ -511,5 +521,11 @@ mode,
         # Update our local port.
         send_mappings[i].local = mapping.local
         send_mappings[i].remote = recv_mappings[i].reply
+        log("[NAT-PREDICT] update i={0} -> local={1} remote={2} (from recv.reply)".format(
+            i, send_mappings[i].local, send_mappings[i].remote,
+        ))
 
+    log("[NAT-PREDICT] update_for_reply_ports exit send_after={0}".format(
+        [(m.local, m.reply, m.remote) for m in send_mappings],
+    ))
     return send_mappings
