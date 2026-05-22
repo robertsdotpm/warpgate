@@ -177,6 +177,23 @@ class NATPredictAlloc:
 
             # Adjust our local bind ports if they need a specific
             # reply port to accept a connection.
+            # update_for_reply_ports' signature is
+            # (mode, src_nat, dest_nat, preloaded_mappings,
+            #  send_mappings, recv_mappings) -- the LAST two args are
+            # send THEN recv.  This call previously had them swapped,
+            # so update_for_reply_ports' loop walked recv_mappings
+            # iterating over OUR mappings (whose .reply was always 0),
+            # found every recv reply==0, and skip-skip-skipped without
+            # ever updating self.send_mappings to satisfy the peer's
+            # reply-port constraints.  Visible only when the EQUAL
+            # side is the protocol initiator: the EQUAL initiator
+            # reaches UPDATED_PREDICTIONS, calls this, gets no
+            # updates, then sprays SYNs at its initial RANDOM template
+            # ports while the peer (PRESERV responder) sprays at its
+            # WE-DICTATE adjacent slots -- the two sides never
+            # converge on the wire.  PRESERV initiator avoids this
+            # branch entirely (PRESERV is in bad_delta) so the bug
+            # was latent until now.
             return (
                 nat_mapping_to_port_alloc(
                     update_for_reply_ports(
@@ -184,8 +201,8 @@ class NATPredictAlloc:
                         self.src_nat,
                         self.dest_nat,
                         self.preloaded_mappings,
-                        self.recv_mappings,
                         self.send_mappings,
+                        self.recv_mappings,
                     )
                 ),
                 1,

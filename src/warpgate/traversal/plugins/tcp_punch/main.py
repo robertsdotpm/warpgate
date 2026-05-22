@@ -508,18 +508,33 @@ class PunchPlugin(Plugin):
         # Mark that the peer's mappings have now been folded.  The
         # re-entry guard above keys off this so subsequent duplicate
         # republishes are dropped without re-walking the nat_alloc
-        # state machine.
+        # state machine.  ONLY fold-then-signal when recv_mappings was
+        # supplied: for the INITIATOR's first call (recv_mappings is
+        # None) we've only sent OUR predictions out and the peer hasn't
+        # responded yet, so puncher.port_allocs contains only our
+        # initial template / WE-DICTATE values.  Releasing the worker
+        # at that point binds sockets to those values and fires SYNs
+        # before update_for_reply_ports has a chance to re-target them
+        # at the peer's actual reply-ports.  Wait until recv_mappings
+        # is non-None (peer's response folded) so the worker sees
+        # port_allocs in their final form.  The PRESERV-initiator
+        # case is unaffected -- PRESERV's first prediction is already
+        # the WE-DICTATE answer and doesn't need updating -- and is
+        # protected by the reply_delay timeout in
+        # delayed_start_punching_proc which fires the worker anyway
+        # if the peer never replies.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the worker-spawn task: the peer's mappings have been
-        # folded in and port_allocs is now valid.  Guarded by not done()
-        # because advance_punching_protocol may be re-entered across
-        # signal rounds (mapping refresh), and resolving an
-        # already-resolved future raises InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the worker-spawn task: the peer's mappings have
+            # been folded in and port_allocs is now valid.  Guarded
+            # by not done() because advance_punching_protocol may be
+            # re-entered across signal rounds (mapping refresh), and
+            # resolving an already-resolved future raises
+            # InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         # End of protocol.
         if is_end == 1:

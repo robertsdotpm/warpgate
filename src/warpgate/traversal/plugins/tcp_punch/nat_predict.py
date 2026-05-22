@@ -516,6 +516,15 @@ mode,
             log("[NAT-PREDICT] update i={0} skip: src delta in bad_delta".format(i))
             continue
 
+        # preloaded_mappings has 3 entries from preload_mappings(3, ...)
+        # but test_no can be up to 8 (the spray width).  nat_prediction's
+        # main loop guards this with try/except IndexError; mirror that
+        # here so update_for_reply_ports doesn't IndexError for i >= 3.
+        try:
+            per_iter_preload = preloaded_mappings[i]
+        except IndexError:
+            per_iter_preload = preloaded_mappings[0]
+
         # local, remote, reply, sock.
         mapping = get_single_mapping(
             mode,
@@ -523,7 +532,7 @@ mode,
             preloaded_mappings[-1],
             use_range,
             src_nat,
-            preloaded_mappings[i],
+            per_iter_preload,
             index=i,
         )
 

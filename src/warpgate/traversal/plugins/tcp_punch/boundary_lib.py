@@ -216,7 +216,16 @@ FAST_PUNCH_PARAMS = {
     # is the fast-profile fallback ceiling.  Mostly a guard against a
     # signal that never arrives -- on a healthy run the mapping-reply
     # future resolves well below this and the worker spawns immediately.
-    "reply_delay": 2,
+    #
+    # Bumped from 2 to 2.8 because mapping_reply is now only resolved
+    # AFTER recv_mappings has been folded (see main.py
+    # advance_punching_protocol).  Observed signal_rtt on the
+    # mobile<->LAN predictor path is 1.4-2.0s; the 2.0s ceiling
+    # cut into legitimate late replies and made the worker spawn
+    # with un-updated port_allocs.  2.8s gives ~0.8s of slack on a
+    # 2.0s rtt while staying safely under PLUGIN_PIN_OFFSET_PREDICT
+    # (3.0s) so the worker still spawns BEFORE punch_time.
+    "reply_delay": 2.8,
 }
 FAST_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
     FAST_PUNCH_PARAMS["window"], FAST_PUNCH_PARAMS["max_clock_error"],
