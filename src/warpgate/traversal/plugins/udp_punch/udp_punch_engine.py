@@ -44,7 +44,14 @@ from .udp_punch_defs import (
 SPRAY_DURATION = 5.0
 LISTEN_DURATION = 6.0
 RETRY_INTERVAL = 0.05
-SPRAY_INTERVAL = 0.02
+# Aggressive 50 Hz (0.02s) sprayed 17 sockets * 50 * 3s = 2550 packets total,
+# triggering router UDP-burst caps on the inbound side -- wire capture showed
+# master sending 2437 Out and slave receiving 17 (~0.7% delivery).  Drop to
+# 0.5s (2 Hz) -- 17 sockets * 2 Hz * 3s = ~102 packets total, well under
+# any consumer-router burst threshold while still giving each socket 6 PROBE
+# retransmits.  Convergence only needs ONE PROBE through each direction +
+# one CONFIRM back; the CONFIRM-spread above provides 10 reply attempts.
+SPRAY_INTERVAL = 0.5
 
 
 def fire_probes(
@@ -264,10 +271,23 @@ def watch_for_winner(
                 ))
                 # Reflect a CONFIRM so the peer sees this path.  Slave
                 # only sends one (master-driven path is enough); master
-                # blasts 5x as the "I picked this path" marker for the
-                # slave to lock onto.
-                burst = 5 if is_master else 1
-                for _ in range(burst):
+                # sprays the CONFIRM over time so the slave's recv loop
+                # has multiple chances to land one through high inbound
+                # UDP loss on the slave's NAT.  A tight 5x burst at
+                # ~0.7% delivery (observed on consumer-router LAN here)
+                # has expected = 0 CONFIRMs through; spreading the
+                # CONFIRMs across ~1s with 100ms gaps gives the slave's
+                # 3s watch window 10 separate landing opportunities and
+                # stays well under any burst-rate cap.  Slave's reply
+                # stays at burst=1 -- master locks on the FIRST PROBE
+                # arrival, so it doesn't need a long reply window.
+                if is_master:
+                    confirm_burst = 10
+                    confirm_interval = 0.1
+                else:
+                    confirm_burst = 1
+                    confirm_interval = 0.0
+                for i in range(confirm_burst):
                     try:
                         s.sendto(confirm_frame, sendto_addr)
                     except OSError as exc:
@@ -276,6 +296,8 @@ def watch_for_winner(
                             (log_sock_addr(s), sendto_addr, repr(exc)),
                         ))
                         break
+                    if confirm_interval and i < confirm_burst - 1:
+                        time.sleep(confirm_interval)
                 if is_master:
                     log(fstr(
                         "udp_punch.watch_for_winner: MASTER locking on PROBE arrival; sock={0} peer={1}",
