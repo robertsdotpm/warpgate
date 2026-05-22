@@ -324,6 +324,21 @@ class UdpPunchPlugin(Plugin):
             # verbatim) derive the same bucket regardless of local-
             # clock skew between their create_puncher calls.
             puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        elif os.environ.get("WG_DISABLE_PREDICT") == "1":
+            # Predictor is also disabled, so without forcing the boundary
+            # allocator we'd end up with port_allocs=[] and the engine
+            # would bind 0/0 sockets and abort.  Force the deterministic
+            # boundary path even though delta != EQUAL/NA so the punch
+            # still has SOMETHING to fire from.  The candidate port may
+            # not match what the peer's actual NAT picks (because the
+            # delta isn't EQUAL), so this is best-effort -- it's the
+            # only path we have under WG_DISABLE_PREDICT.
+            log(fstr(
+                "[UDP-PUNCH] WG_DISABLE_PREDICT=1 forces boundary_port_alloc "
+                "despite non-EQUAL delta (src={0} dest={1})",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
+            puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
         else:
             log(fstr(
                 "[UDP-PUNCH] non-deterministic NAT delta "
