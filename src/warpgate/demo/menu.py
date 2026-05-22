@@ -160,11 +160,13 @@ async def connect_option(node, con_opts):
     # outer wait only hits its ceiling on a legitimate long success.
     pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
 
-    # Unconditional cleanup: cancels any still-running punch task and removes
-    # the plugin from the traversal manager's registry.  On success the punch
-    # task is already done so this is a fast no-op; on failure it terminates
-    # the background subprocess and frees the ports for the next attempt.
-    if plugin_holder[0] is not None:
+    # Failure-only cleanup: cancels any still-running punch task and removes
+    # the plugin from the traversal manager's registry so the next attempt
+    # gets a fresh port pool.  Must NOT run on success: udp_punch keeps its
+    # selector_proxy bridge running off bridge_socks after convergence, and
+    # plugin.close() tears those down -- the bridge's write-arm then fails
+    # with fd=-1 on the very first ECHO and the round-trip times out.
+    if pipe is None and plugin_holder[0] is not None:
         await close_plugin(
             plugin_holder[0],
             node.traversal.plugins,
