@@ -52,11 +52,16 @@ CONNECT_TIMEOUT = 5.0
 RETRY_INTERVAL = 0.05
 
 
-def setup_engine(af, port_allocs, src_ip, nic_id):
+def setup_engine(af, port_allocs, src_ip, nic_id, route=None):
     """Bind all sockets for the given port allocations and register them with a selector."""
     # TCP hole punching uses ONE socket per port.
     # No listen sockets. Each socket will perform active open only.
-    pre_connect_infos = bind_tcp_sockets(af, nic_id, port_allocs, src_ip)
+    # route is forwarded to bind_tcp_sockets so apply_nic_pin_sockopts
+    # can SO_BINDTODEVICE the punch sockets to the chosen NIC.  Without
+    # it the kernel routes punch outbound via lowest-metric default
+    # regardless of bound source IP -- mobile's punch SYNs would leave
+    # via the LAN gateway and never traverse the carrier NAT.
+    pre_connect_infos = bind_tcp_sockets(af, nic_id, port_allocs, src_ip, route=route)
 
     sel = selectors.DefaultSelector()
 
@@ -183,6 +188,7 @@ af,
     our_ip,
     same_machine,
     params=None,
+    route=None,
 ):
     """
     TCP hole-punch engine.
@@ -211,7 +217,7 @@ af,
     pre_connect_infos = []
     sel = None
     try:
-        pre_connect_infos, sel = setup_engine(af, port_allocs, src_ip, nic_id)
+        pre_connect_infos, sel = setup_engine(af, port_allocs, src_ip, nic_id, route=route)
         bound_locals = []
         for pa, s in pre_connect_infos:
             try:

@@ -242,16 +242,32 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
 
         def worker_done(fut):
             """Forward punching_process exceptions to the host process log."""
+            # Distinguish the three legitimate outcomes so the log reads
+            # truthfully -- previously CancelledError on the future was
+            # caught silently and logged as "completed cleanly", which
+            # made it impossible to tell whether the worker actually
+            # ran the engine to completion or was cancelled before the
+            # punch fired.
+            if fut.cancelled():
+                log("[PUNCH-PROC] worker future CANCELLED (sleep_until "
+                    "or run_engine interrupted before completion)")
+                return
             try:
                 exc = fut.exception()
-            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+            except Exception:  # pylint: disable=broad-except
                 exc = None
             if exc is not None:
                 log("[PUNCH-PROC] worker future raised {0}: {1}".format(
                     type(exc).__name__, repr(exc),
                 ))
-            else:
-                log("[PUNCH-PROC] worker future completed cleanly")
+                return
+            try:
+                result = fut.result()
+            except Exception:  # pylint: disable=broad-except
+                result = "<result() raised>"
+            log("[PUNCH-PROC] worker future completed cleanly result={0}".format(
+                "pipe-like" if result is not None else "None",
+            ))
 
         worker_fut.add_done_callback(worker_done)
 

@@ -158,14 +158,22 @@ class TraversalManager:
         try:
             await asyncio.wait_for(plugin.run(reply), timeout=plugin.timeout)
         except asyncio.CancelledError:
+            log("[TM] run_plugin CancelledError plugin={0} id={1} -- "
+                "cancelling plugin.result".format(
+                    getattr(plugin, "name", "?"),
+                    getattr(plugin, "plugin_id", "?"),
+                ))
             if not plugin.result.done():
                 plugin.result.cancel()
             asyncio.ensure_future(async_wrap_errors(close_plugin(plugin, self.plugins, self.inbound_pipes)))
             raise
         except (asyncio.TimeoutError, OSError, ConnectionError) as exc:
-            log("[TM] run_plugin caught {0}: {1}".format(
-                type(exc).__name__, repr(exc),
-            ))
+            log("[TM] run_plugin caught {0}: {1} plugin={2} id={3} -- "
+                "setting plugin.result=None".format(
+                    type(exc).__name__, repr(exc),
+                    getattr(plugin, "name", "?"),
+                    getattr(plugin, "plugin_id", "?"),
+                ))
             log_exception()
             if not plugin.result.done():
                 plugin.result.set_result(None)
@@ -571,6 +579,12 @@ class TraversalManager:
                         log("[TM] cleanup_loop: plugin missing expires_at, skipping")
                         continue
                     if now >= expires_at:
+                        log("[TM] cleanup_loop: expiring plugin={0} id={1} "
+                            "now={2:.3f} expires_at={3:.3f} overdue={4:.3f}s".format(
+                                getattr(plugin, "name", "?"),
+                                getattr(plugin, "plugin_id", "?"),
+                                now, expires_at, now - expires_at,
+                            ))
                         try:
                             await close_plugin(plugin, self.plugins, self.inbound_pipes)
                         except asyncio.CancelledError:

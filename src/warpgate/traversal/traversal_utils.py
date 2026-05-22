@@ -577,6 +577,9 @@ async def close_plugin(plugin, plugins, inbound_pipes):
     further signals for this plugin_id are in-flight.
     """
     plugin_id = getattr(plugin, "plugin_id", None)
+    log("[CLOSE-PLUGIN] enter plugin_id={0} result_done={1}".format(
+        plugin_id, plugin.result.done(),
+    ))
     plugins.pop(plugin_id, None)
 
     fut = inbound_pipes.pop(plugin_id, None)
@@ -584,6 +587,7 @@ async def close_plugin(plugin, plugins, inbound_pipes):
         fut.cancel()
 
     if not plugin.result.done():
+        log("[CLOSE-PLUGIN] cancelling plugin.result plugin_id={0}".format(plugin_id))
         plugin.result.cancel()
 
     close_fn = getattr(plugin, "close", None)

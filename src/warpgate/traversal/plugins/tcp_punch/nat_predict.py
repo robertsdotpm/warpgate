@@ -115,7 +115,7 @@ async def get_high_port_mapping(stun_client):
     raise ConnectionError("high port sock fail.")
 
 
-def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_no=2):
+def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_no=8):
     """Build placeholder NATMapping templates used when no peer mappings are yet available."""
     mappings = []
     for _ in range(0, test_no):
@@ -130,7 +130,7 @@ def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_
     return mappings
 
 
-def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=2):
+def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=8):
     """Normalise NAT info and produce initial mapping templates for the prediction algorithm."""
     # Set test_no based on recipients test no.
     # [[remote port, required reply port], ...]
@@ -331,7 +331,16 @@ mode,
     raise AssertionError("Can't predict this NAT type.")
 
 
-async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=2):
+async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=8):
+    # Wider spray for the predictor path to absorb carrier-NAT
+    # allocation-pointer drift between the STUN preload and the punch
+    # fire. At test_no=2 the wire-level mappings only had to drift by 2
+    # slots to miss both candidates; with test_no=8 (and the
+    # last_local+1..N WE-DICTATE pattern in get_single_mapping) the
+    # spray covers a contiguous 8-port window adjacent to the last STUN
+    # observation, tolerating up to 8 slots of pointer advance.
+    # XP's half-open SYN cap is 10, so 8 stays safely under (matching
+    # boundary_alloc's NUM_PORTS=8 chosen for the same reason).
     """Compute predicted send and preloaded mappings for a hole-punch session."""
     log("[NAT-PREDICT] mode={0} src_nat_type={1} dest_nat_type={2} "
         "stuns={3} recv_mappings={4}".format(

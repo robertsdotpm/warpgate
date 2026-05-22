@@ -308,6 +308,15 @@ class PunchPlugin(Plugin):
         # mapping_reply future short-circuiting it on healthy paths)
         # cut total punch latency roughly in half compared to the
         # conservative CLI defaults.
+        # Build a Route referencing this NIC so the engine can pass it
+        # to apply_nic_pin_sockopts and SO_BINDTODEVICE the punch
+        # sockets.  Without this the kernel routes the punch SYNs via
+        # the lowest-metric default route -- on a multi-default-route
+        # host (LAN + mobile) that's the wrong NIC and the punch never
+        # traverses the carrier NAT.  Route.bind() isn't called: the
+        # engine binds its own sockets to explicit (src_ip, src_port)
+        # tuples; we just need route.interface for the pin.
+        punch_route = self.nic.route(self.af)
         puncher = PunchClient(
             dest_ip,
             src_ip,
@@ -317,6 +326,7 @@ class PunchPlugin(Plugin):
             params=FAST_PUNCH_PARAMS,
             our_os=(self.src_map.get("os") if self.src_map else None),
             their_os=(self.dest_map.get("os") if self.dest_map else None),
+            route=punch_route,
         )
 
         # NTP-pinned future start.  The connector picks an absolute
@@ -610,14 +620,16 @@ class PunchPlugin(Plugin):
         """
         task = self.punch_proc.pop(self.plugin_id, None)
         self.punch_clients.pop(self.plugin_id, None)
-        log("[PUNCH-CLOSE] plugin_id={0} task_was_pending={1}".format(
+        log("[PUNCH-CLOSE] plugin_id={0} task_was_pending={1} result_done={2}".format(
             self.plugin_id,
             task is not None and not task.done() if task else False,
+            self.result.done(),
         ))
         await cancel_task(task)
 
         # Cancel the result future if nobody resolved it (e.g. outer timeout).
         if not self.result.done():
+            log("[PUNCH-CLOSE] cancelling self.result plugin_id={0}".format(self.plugin_id))
             self.result.cancel()
         self.completed_pipe_ids.add(self.plugin_id)
 
