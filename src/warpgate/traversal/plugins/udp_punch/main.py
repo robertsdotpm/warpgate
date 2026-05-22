@@ -416,18 +416,32 @@ class UdpPunchPlugin(Plugin):
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        # Only fold-then-signal when recv_mappings was supplied: for
+        # the INITIATOR's first call we've only sent OUR predictions
+        # out and the peer hasn't responded yet, so puncher.port_allocs
+        # contains only our initial template / WE-DICTATE values.
+        # Releasing the worker at that point binds sockets to those
+        # values and fires PROBE bursts before update_for_reply_ports
+        # has a chance to re-target them at the peer's actual reply-
+        # ports.  This is the asymmetric-direction bug tcp_punch had
+        # (EQUAL-initiator / PRESERV-responder failed) -- same shared
+        # NATPredictAlloc state machine here.  The PRESERV-initiator
+        # case is unaffected (its first send_mappings are already the
+        # WE-DICTATE answer), and the reply_delay fallback timeout in
+        # delayed_run_engine still fires the worker if the peer never
+        # replies.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the engine task: the peer's mappings have been folded
-        # in and port_allocs is now valid for spawning the worker.
-        # Guarded by not done() because configure_puncher_process /
-        # advance_punching_protocol may be re-entered across signal
-        # rounds (mapping refresh), and resolving an already-resolved
-        # future raises InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the engine task: the peer's mappings have been folded
+            # in and port_allocs is now valid for spawning the worker.
+            # Guarded by not done() because configure_puncher_process /
+            # advance_punching_protocol may be re-entered across signal
+            # rounds (mapping refresh), and resolving an already-resolved
+            # future raises InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         if is_end == 1:
             return None

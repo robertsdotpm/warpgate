@@ -318,15 +318,24 @@ class PunchPcapPlugin(Plugin):
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        # Only fold-then-signal when recv_mappings was supplied: for the
+        # INITIATOR's first call we've only sent OUR predictions out and
+        # the peer hasn't responded yet, so puncher.port_allocs contains
+        # only our initial template / WE-DICTATE values.  Releasing the
+        # worker at that point binds sockets to those values before
+        # update_for_reply_ports can re-target them at the peer's
+        # actual reply-ports.  See tcp_punch for the full
+        # asymmetric-direction analysis -- same shared NATPredictAlloc
+        # state machine, same gating fix.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the pcap-engine task: peer's mappings have been folded
-        # in and port_allocs is now valid.  Guarded by not done() so
-        # re-entries across signal rounds don't InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the pcap-engine task: peer's mappings have been folded
+            # in and port_allocs is now valid.  Guarded by not done() so
+            # re-entries across signal rounds don't InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         if is_end == 1:
             return None
