@@ -668,12 +668,14 @@ class UdpPunchPlugin(Plugin):
                     convergence.set_result(success)
 
             def f_engine(af, nic_id, port_allocs, src_ip, dest_ip,
-                         f_sleep_until, our_ip, same_machine, params):
+                         f_sleep_until, our_ip, same_machine, params,
+                         route=None):
                 # Adapter: PunchClient.run_engine calls f_engine with
-                # the tcp_punch signature (which includes our_ip and
-                # excludes nonce / stop_reader / route).  We close
-                # over the UDP-specific extras and ignore our_ip.
-                _ = our_ip
+                # the tcp_punch signature (our_ip + route).  We close
+                # over the UDP-specific extras (nonce, stop_reader) and
+                # ignore our_ip.  Prefer the route the client passes;
+                # fall back to the closed-over puncher_route.
+                del our_ip
                 return udp_punch_engine(
                     af=af,
                     nic_id=nic_id,
@@ -685,7 +687,7 @@ class UdpPunchPlugin(Plugin):
                     same_machine=same_machine,
                     params=params,
                     stop_reader=stop_reader,
-                    route=puncher_route,
+                    route=route if route is not None else puncher_route,
                 )
 
             def punch_and_bridge():
