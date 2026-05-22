@@ -94,12 +94,6 @@ def bind_punch_sockets(
     else:
         bind_ip = "0.0.0.0" if af == socket.AF_INET else "::"
 
-    log("bind_punch_sockets: ENTER sock_type={0} af={1} nic_id={2} src_ip={3} route={4} route.interface={5}".format(
-        sock_type, af, nic_id, src_ip,
-        "None" if route is None else "<Route>",
-        "None" if (route is None or route.interface is None) else getattr(route.interface, "name", "?"),
-    ))
-
     bound_socks = []
     bind_failures = []
     for p in port_allocs:
