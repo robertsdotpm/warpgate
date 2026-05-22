@@ -195,13 +195,13 @@ class REPLThread(threading.Thread):
     def run(self):
         """Drive the interactive REPL console until the user exits."""
         try:
-            loop_policy = str(asyncio.get_event_loop_policy())
-            # CustomEventLoopPolicy is Selector-backed; map its repr (and the
-            # stdlib SelectorEventLoopPolicy repr) to the friendly "selector".
-            if "Custom" in loop_policy or "elector" in loop_policy:
-                loop_policy = "selector"
-            elif "roactor" in loop_policy:
-                loop_policy = "proactor"
+            # Show the actual policy class name -- previously this mapped
+            # to a friendly "selector" / "proactor" label, but that
+            # collapsed CustomEventLoopPolicy and asyncio.DefaultEventLoopPolicy
+            # to the same string, making it impossible to tell from the
+            # banner whether aionetiface_setup_event_loop() had actually
+            # run.  type(policy).__name__ is unambiguous.
+            loop_policy = type(asyncio.get_event_loop_policy()).__name__
 
             spawn_method = multiprocessing.get_start_method()
             vmaj, vmin, _ = platform.python_version_tuple()
