@@ -237,7 +237,7 @@ def watch_for_winner(
                 addr = (addr[0], addr[1], 0, addr[3])
 
             kind, recv_nonce = parse_frame(buf)
-            if kind is None or recv_nonce != nonce:
+            if kind is None or recv_nonce[:12] != nonce[:12]:
                 # Not a punch frame from this session (wrong nonce or format).
                 # Drain it so the queue advances to real punch frames.
                 # MSG_PEEK always surfaces the oldest datagram — a stuck
@@ -352,7 +352,7 @@ def watch_for_winner(
         if len(addr) == 4:
             addr = (addr[0], addr[1], 0, addr[3])
         kind, recv_nonce = parse_frame(buf)
-        if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce == nonce:
+        if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce[:12] == nonce[:12]:
             try:
                 s.recvfrom(UDP_PUNCH_FRAME_LEN)
             except OSError:
@@ -385,7 +385,7 @@ def drain_punch_residue(sock, nonce):
         except (BlockingIOError, OSError):
             break
         kind, recv_nonce = parse_frame(buf)
-        if kind is None or recv_nonce != nonce:
+        if kind is None or recv_nonce[:12] != nonce[:12]:
             break
         try:
             sock.recvfrom(UDP_PUNCH_FRAME_LEN)

@@ -76,22 +76,82 @@ UDP_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
 )
 
 
+import os
+
+# Experimental: WG_PROBE_STUN_FORMAT=1 makes PROBE / CONFIRM frames look
+# like RFC 5389 STUN Binding Request / Success Response, so consumer
+# routers with STUN-aware ALG give them the same favourable treatment
+# (longer NAT mapping timeouts, less aggressive burst filtering,
+# Endpoint-Independent Mapping promotion) as real STUN traffic.
+#
+# Wire shape (20 bytes, big-endian):
+#   [0:2]   Message Type  -- 0x0001 (Binding Request) for PROBE,
+#                            0x0101 (Binding Success Response) for
+#                            CONFIRM.  Matches RFC 5389 exactly so a
+#                            STUN-decoding ALG sees a well-formed
+#                            request/response pair flowing both ways.
+#   [2:4]   Message Length -- 0x0000 (no STUN attributes).
+#   [4:8]   Magic Cookie  -- 0x2112A442 (RFC 5389 magic).
+#   [8:20]  Transaction ID -- first 12 bytes of session nonce.
+#
+# We truncate the 16-byte session nonce to STUN's 12-byte TXID width.
+# That still leaves 96 bits of entropy -- collision space remains
+# astronomically large for the session lifetimes involved.  The peer
+# stores the full nonce locally and only the truncated form crosses
+# the wire; both sides truncate identically.
+STUN_MAGIC_COOKIE = b"\x21\x12\xa4\x42"
+STUN_TYPE_BINDING_REQUEST = b"\x00\x01"
+STUN_TYPE_BINDING_SUCCESS = b"\x01\x01"
+STUN_FRAME_LEN = 20  # 2 (type) + 2 (length) + 4 (cookie) + 12 (TXID)
+STUN_TXID_LEN = 12
+
+
+def stun_format_enabled():
+    """True iff WG_PROBE_STUN_FORMAT=1 in the env."""
+    return os.environ.get("WG_PROBE_STUN_FORMAT") == "1"
+
+
 def build_frame(kind, nonce):
-    """Build a 21-byte UDP punch frame for the given kind + nonce."""
+    """Build a punch frame for the given kind + nonce.
+
+    Default format is the 21-byte P2UP magic + kind + 16-byte nonce.
+    With WG_PROBE_STUN_FORMAT=1, emit a STUN-shaped 20-byte frame
+    instead (see module-level comment on the STUN constants).
+    """
     if len(nonce) != UDP_PUNCH_NONCE_LEN:
         raise ValueError("nonce must be {0} bytes".format(UDP_PUNCH_NONCE_LEN))
+    if stun_format_enabled():
+        if kind == UDP_PUNCH_KIND_PROBE:
+            msg_type = STUN_TYPE_BINDING_REQUEST
+        elif kind == UDP_PUNCH_KIND_CONFIRM:
+            msg_type = STUN_TYPE_BINDING_SUCCESS
+        else:
+            raise ValueError("unknown kind {0}".format(kind))
+        return msg_type + b"\x00\x00" + STUN_MAGIC_COOKIE + nonce[:STUN_TXID_LEN]
     return UDP_PUNCH_MAGIC + bytes([kind]) + nonce
 
 
 def parse_frame(buf):
-    """Parse a UDP punch frame; returns (kind, nonce) or (None, None) on mismatch.
+    """Parse a punch frame; returns (kind, nonce) or (None, None) on mismatch.
 
-    Used by the engine to filter inbound datagrams: anything that
-    doesn't match length+magic is application traffic that should
-    pass through to the wrapping Pipe untouched.
+    Accepts both the native P2UP format and the STUN-shaped format.
+    The STUN decode looks for the RFC 5389 magic cookie and treats
+    Binding Request as PROBE, Binding Success as CONFIRM.  Either
+    peer can emit either format and the other side will parse it,
+    so the env flag can be flipped per host without breaking compat.
     """
-    if len(buf) != UDP_PUNCH_FRAME_LEN:
-        return (None, None)
-    if buf[:4] != UDP_PUNCH_MAGIC:
-        return (None, None)
-    return (buf[4], buf[5:5 + UDP_PUNCH_NONCE_LEN])
+    if len(buf) == UDP_PUNCH_FRAME_LEN and buf[:4] == UDP_PUNCH_MAGIC:
+        return (buf[4], buf[5:5 + UDP_PUNCH_NONCE_LEN])
+    if len(buf) == STUN_FRAME_LEN and buf[4:8] == STUN_MAGIC_COOKIE:
+        msg_type = buf[0:2]
+        if msg_type == STUN_TYPE_BINDING_REQUEST:
+            kind = UDP_PUNCH_KIND_PROBE
+        elif msg_type == STUN_TYPE_BINDING_SUCCESS:
+            kind = UDP_PUNCH_KIND_CONFIRM
+        else:
+            return (None, None)
+        # Return the truncated TXID padded back to 16 bytes so the
+        # downstream nonce-match check works against the locally-
+        # stored 16-byte nonce truncated identically.
+        return (kind, buf[8:8 + STUN_TXID_LEN] + b"\x00" * 4)
+    return (None, None)
