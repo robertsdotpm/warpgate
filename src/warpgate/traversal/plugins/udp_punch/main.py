@@ -338,9 +338,26 @@ class UdpPunchPlugin(Plugin):
         """Register the puncher and schedule the in-process punch engine."""
         self.punch_clients[self.plugin_id] = puncher
 
-        self.nat_alloc = NATPredictAlloc(stuns)
-        self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
-        self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
+        # WG_DISABLE_PREDICT=1 skips the STUN-based NAT predictor, so the
+        # punch runs with the boundary_port_alloc fast-path only (n=1
+        # deterministic socket per side derived from the NTP bucket).
+        # Diagnostic: predictor adds 8 socket spray with multi-port
+        # destinations, which on consumer routers / lossy paths produces
+        # n*sprays packets that overshoot per-host UDP burst thresholds
+        # and starve out the boundary socket's traffic.  With predictor
+        # off, master sprays 1 socket * 50Hz * 3s = 150 packets total
+        # instead of ~2550; the one deterministic candidate is enough
+        # for EQUAL+EQUAL or EQUAL+NA pairs (boundary_port_alloc's
+        # supported set).  Punches that genuinely need predictor (PRESERV
+        # / INDEPENDENT / DEPENDENT / RANDOM on either side) will fail
+        # under this flag; that's the trade-off for a clean test signal.
+        if os.environ.get("WG_DISABLE_PREDICT") == "1":
+            log("[UDP-PUNCH] WG_DISABLE_PREDICT=1; skipping NATPredictAlloc")
+            self.nat_alloc = None
+        else:
+            self.nat_alloc = NATPredictAlloc(stuns)
+            self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
+            self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
         # Future the engine task waits on instead of sleeping a fixed
         # interval.  advance_punching_protocol resolves it the moment
@@ -373,12 +390,22 @@ class UdpPunchPlugin(Plugin):
         # None on any reply. Mirrors tcp_punch's LAN short-circuit
         # (commit cb7a765). Nonce stays in payload.nonce so the
         # responder still sees it without the mappings round-trip.
-        if self.nat_alloc.punch_mode == TCP_PUNCH_LAN:
+        #
+        # WG_DISABLE_PREDICT=1 takes the same short-circuit path
+        # regardless of punch_mode -- with nat_alloc=None we have no
+        # STUN-predicted mappings to fold; the boundary_port_alloc
+        # socket added in setup_puncher_client carries the entire punch.
+        if self.nat_alloc is None or self.nat_alloc.punch_mode == TCP_PUNCH_LAN:
             if reply is not None:
                 return None
+            # Use mode=2 (REMOTE) as default when nat_alloc was disabled.
+            punch_mode_for_msg = (
+                self.nat_alloc.punch_mode if self.nat_alloc is not None
+                else TCP_PUNCH_REMOTE
+            )
             msg = UdpPunchMsg({
                 "payload": {
-                    "punch_mode": self.nat_alloc.punch_mode,
+                    "punch_mode": punch_mode_for_msg,
                     "mappings": [],
                     "ntp": punch_time,
                     "nonce": puncher.udp_nonce.hex(),
