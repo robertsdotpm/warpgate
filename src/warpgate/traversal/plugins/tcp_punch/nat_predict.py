@@ -163,53 +163,17 @@ def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=8):
 
 
 async def preload_mappings(no, stuns):
-    """Concurrently fetch no high-port STUN mappings from the given STUN clients.
+    """Concurrently fetch no high-port STUN mappings from the given STUN clients."""
+    # Get a mapping to use.
+    tasks = []
+    for _ in range(0, no):
+        stun = random.choice(stuns)
+        task = get_high_port_mapping(stun)
+        tasks.append(task)
 
-    Samples STUN servers WITHOUT replacement when possible.  random.choice
-    can pick the same server twice for a 3-sample preload, which costs us
-    real diversity -- two samples through the same anchor IP can land on
-    the same NAT-mapping family even when the next allocation slot has
-    moved on, so the predictor sees less drift than is actually present.
-    Fall back to with-replacement only when there are fewer stuns than
-    samples requested.
-    """
-    if len(stuns) >= no:
-        chosen = random.sample(list(stuns), no)
-    else:
-        chosen = list(stuns)
-        while len(chosen) < no:
-            chosen.append(random.choice(stuns))
-
-    tasks = [get_high_port_mapping(s) for s in chosen]
     mappings = await asyncio.gather(*tasks)
     mappings = strip_none(mappings)
     return mappings
-
-
-def filter_preload_outliers(mappings):
-    """Drop preloaded samples whose remote port deviates wildly from the median.
-
-    Real NAT allocation patterns cluster -- EQUAL puts mapped == local,
-    PRESERV keeps successive mapped within a small window, INDEPENDENT/
-    DEPENDENT advance by a fixed step.  A stray sample from a different
-    NAT family (e.g. an IPv6 sample mixed with v4, or a STUN reflection
-    through a secondary CGNAT path) shows up as a remote port hundreds
-    of thousands of bins away from the others.
-
-    Median-Absolute-Deviation gate with a floor of 1000 ports -- generous
-    enough that legitimate sequential allocation (delta < 1000) never
-    trips it, tight enough to catch the cross-family case.  Never strip
-    below 2 samples (the drift-rate estimator needs >=2).
-    """
-    if len(mappings) < 3:
-        return mappings
-    remotes = sorted(m.remote for m in mappings)
-    median = remotes[len(remotes) // 2]
-    deviations = sorted(abs(m.remote - median) for m in mappings)
-    mad = deviations[len(deviations) // 2]
-    threshold = max(mad * 6, 1000)
-    kept = [m for m in mappings if abs(m.remote - median) <= threshold]
-    return kept if len(kept) >= 2 else mappings
 
 
 def get_single_mapping(
@@ -323,32 +287,29 @@ mode,
     # failed hole punching. Ranges must be exact for these delta types;
     # increasing test_no and rounding to powers of two improves accuracy.
 
-    # INDEPENDENT: NAT advances mapped port by a constant delta per
-    # allocation regardless of local port.  Spread N candidates across
-    # N adjacent allocation slots so the SYN spray covers the pointer
-    # advancing during the punch fire, not just the slot we observed
-    # at preload time.  Was: next_remote = last_remote + delta for
-    # every i (effective spray width 1).
+    # Poor concurrency support.
     if our_nat["delta"]["type"] == INDEPENDENT_DELTA:
-        delta_val = our_nat["delta"]["value"]
+        # We can use anything for a local port.
+        # The remote mappings have a pattern regardless of local tuples.
         next_local = from_range([2000, MAX_PORT])
-        next_remote = field_wrap(
-            last_remote + (1 + index) * delta_val, use_range,
-        )
+        next_remote = field_wrap(last_remote + our_nat["delta"]["value"], use_range)
+
+        # Return port predictions.
+        # These allocations apply even if strict port NAT.
+        # But we tell other side to use a specific mapping for coordination.
         return NATMapping([next_local, our_reply, next_remote])
 
-    # DEPENDENT: mapped advances by delta per local-port advance.  Bind
-    # locals at last_local+1+i so the NAT walks delta*i in lockstep.
-    # Was: next_local = last_local+1 for every i (EADDRINUSE on 7/8
-    # sockets) and next_remote constant.
+    # Poor concurrency support.
     if our_nat["delta"]["type"] == DEPENDENT_DELTA:
+        next_local = port_wrap(last_local + 1)
         delta_val = our_nat["delta"]["value"]
-        next_local = port_wrap(last_local + 1 + index)
         if delta_val == 0:
             return NATMapping([next_local, our_reply, last_remote])
-        next_remote = field_wrap(
-            last_remote + (1 + index) * delta_val, use_range,
-        )
+        next_remote = field_wrap(last_remote + delta_val, use_range)
+
+        # Return port predictions.
+        # These allocations apply even if strict port NAT.
+        # But we tell other side to use a specific mapping for coordination.
         return NATMapping([next_local, our_reply, next_remote])
 
     # Delta type is random -- get a mapping from STUN to reuse.
@@ -392,79 +353,16 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
         mode, src_nat, dest_nat, recv_mappings, test_no
     )
 
-    # Preload NAT predictions: STUN samples to anchor the predictor.
-    # This path carries the punch only when boundary_alloc was skipped
-    # -- at least one side has a non-deterministic delta (INDEPENDENT /
-    # DEPENDENT / RANDOM / PRESERV), where the external port has to be
-    # measured rather than derived from a time bucket.
-    #
-    # Default 3 samples are enough to fit a linear drift model for
-    # EQUAL / PRESERV / INDEPENDENT / DEPENDENT.  For RANDOM_DELTA on a
-    # PREDICTABLE_NAT, get_single_mapping returns preloaded[i] directly,
-    # so the spray width is exactly len(preloaded) -- 3 collapses test_no=8
-    # into 3 effective candidates.  Preload test_no in that case so each
-    # spray slot gets a fresh STUN sample (still cheap; STUN burst).
-    src_delta_info = src_nat.get("delta") or {}
-    is_random_predictable = (
-        src_delta_info.get("type") == RANDOM_DELTA
-        and src_nat.get("type") in PREDICTABLE_NATS
-    )
-    preload_no = test_no if is_random_predictable else 3
-
-    # In-process preload cache.  Carrier NATs allocate slowly enough that
-    # back-to-back punch attempts (failure + retry, or multi-peer fan-out
-    # from one node) see the allocation pointer barely moved between
-    # preloads.  Stash the last successful burst on the first STUN client's
-    # NIC and reuse if recent.  Strictly best-effort: any miss falls back
-    # to a fresh STUN burst, so a stale cache costs at most one bad
-    # prediction (which spray + drift candidates absorb).
-    nic_obj = stuns[0].interface if stuns else None
-    cache_key = ("preload", src_nat.get("type"), (src_nat.get("delta") or {}).get("type"))
-    PRELOAD_CACHE_TTL = 30.0  # seconds
-    now_t = asyncio.get_event_loop().time() if hasattr(asyncio, "get_event_loop") else None
-
-    cached = None
-    if nic_obj is not None and now_t is not None:
-        cache_dict = getattr(nic_obj, "preload_cache", None)
-        if isinstance(cache_dict, dict):
-            entry = cache_dict.get(cache_key)
-            if entry is not None:
-                cached_mappings, cached_t_start, cached_t_end = entry
-                if (now_t - cached_t_end) < PRELOAD_CACHE_TTL and len(cached_mappings) >= preload_no:
-                    cached = (cached_mappings[:preload_no], cached_t_start, cached_t_end)
-                    log("[NAT-PREDICT] preload cache HIT age={0:.1f}s".format(
-                        now_t - cached_t_end,
-                    ))
-
-    if cached is not None:
-        preloaded_mappings, t_preload_start, t_preload_end = cached
-    else:
-        # Capture wall-clock around the STUN burst so we can estimate the
-        # NAT's allocation-pointer drift (ports/sec) and extrapolate forward
-        # to the actual punch fire time.
-        t_preload_start = now_t
-        preloaded_mappings = await preload_mappings(preload_no, stuns)
-        t_preload_end = asyncio.get_event_loop().time() if hasattr(
-            asyncio, "get_event_loop"
-        ) else None
-        # Store on the NIC for the next call within TTL.
-        if nic_obj is not None and t_preload_start is not None:
-            cache_dict = getattr(nic_obj, "preload_cache", None)
-            if not isinstance(cache_dict, dict):
-                cache_dict = {}
-                try:
-                    nic_obj.preload_cache = cache_dict
-                except (AttributeError, TypeError):
-                    cache_dict = None
-            if cache_dict is not None:
-                cache_dict[cache_key] = (
-                    preloaded_mappings, t_preload_start, t_preload_end,
-                )
-
+    # Preload NAT predictions: 3 successive STUN samples.  This path
+    # carries the punch only when the boundary allocator was skipped
+    # -- i.e. at least one side has a non-deterministic delta
+    # (INDEPENDENT / DEPENDENT / RANDOM / PRESERV), where the external
+    # port genuinely has to be measured rather than derived from the
+    # time bucket.  3 successive samples are enough to pin the
+    # allocation pattern; get_single_mapping's IndexError fallback to
+    # preloaded_mappings[0] covers indices beyond 3.
+    preloaded_mappings = await preload_mappings(3, stuns)
     assert len(preloaded_mappings)
-    # Outlier filter -- drop cross-family STUN samples that would corrupt
-    # last_remote (the WE-DICTATE anchor).  Done before downstream usage.
-    preloaded_mappings = filter_preload_outliers(preloaded_mappings)
 
     # Use default ports for client if unknown
     # or try use their ports if known.
@@ -539,39 +437,6 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
         results.append(NATMapping([from_range([2000, MAX_PORT]), 0, ahead_remote]))
         log("[NAT-PREDICT] R8-6: added one-ahead candidate remote={0} "
             "(delta={1})".format(ahead_remote, src_delta_val))
-
-    # Drift-rate candidate: estimate ports/sec from the preload burst and
-    # extrapolate forward to the punch fire (assume ~2s gap; conservative
-    # since signal_rtt is usually ~1s and we add one for spread).  R8-6
-    # adds a SINGLE one-delta-ahead slot; this adds a RATE-based slot
-    # that scales with however long it actually takes to fire.  Only
-    # meaningful for non-trivial allocation rates and reasonable preload
-    # spans (no extrapolation from a single sample, no extrapolation
-    # when t_preload_end - t_preload_start collapses to zero).
-    if (
-        src_delta_type in (INDEPENDENT_DELTA, DEPENDENT_DELTA, PRESERV_DELTA)
-        and len(preloaded_mappings) >= 2
-        and t_preload_start is not None
-        and t_preload_end is not None
-    ):
-        dt = t_preload_end - t_preload_start
-        if dt > 0.05:
-            r_first = preloaded_mappings[0].remote
-            r_last = preloaded_mappings[-1].remote
-            drift_per_s = (r_last - r_first) / dt
-            # Project forward by the typical inter-stage gap (~2s).
-            drift_ahead = int(drift_per_s * 2.0)
-            # Sanity-clamp to avoid extrapolating into nonsense for
-            # noisy single-burst estimates: don't predict more than
-            # +/- use_range/4 from last_remote.
-            cap = max(2000, (use_range[1] - use_range[0]) // 4)
-            if abs(drift_ahead) <= cap:
-                drift_remote = field_wrap(r_last + drift_ahead, use_range)
-                results.append(NATMapping(
-                    [from_range([2000, MAX_PORT]), 0, drift_remote],
-                ))
-                log("[NAT-PREDICT] drift: rate={0:.0f}ports/s ahead={1} "
-                    "remote={2}".format(drift_per_s, drift_ahead, drift_remote))
 
     # R11-3: ±1 jitter candidates for small-delta NATs (Wang2011 §3.3
     # found ~18% of consumer NATs add ±1-3 random jitter on top of a
