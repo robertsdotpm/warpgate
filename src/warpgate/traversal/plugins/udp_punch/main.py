@@ -35,8 +35,7 @@ from ..tcp_punch.punch_client import PunchClient
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE
 from .proto import UdpPunchMsg
 from .udp_punch_defs import (
-    UDP_PUNCH_FRAME_LEN,
-    UDP_PUNCH_MAGIC,
+    UDP_PUNCH_MAX_FRAME_LEN,
     UDP_PUNCH_NONCE_LEN,
     UDP_PUNCH_PARAMS,
     parse_frame,
@@ -812,7 +811,7 @@ class UdpPunchPlugin(Plugin):
                 stale_errors = 0
                 for _ in range(256):
                     try:
-                        punched_sock.recv(UDP_PUNCH_FRAME_LEN + 64)
+                        punched_sock.recv(UDP_PUNCH_MAX_FRAME_LEN + 64)
                         stale_drained += 1
                     except BlockingIOError:
                         break

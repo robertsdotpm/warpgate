@@ -12,7 +12,7 @@ Two halves:
                          destination ports on the symmetric peer's
                          external IP; listens on that same socket
                          for the first reply that bears the shared
-                         magic+nonce.
+                         nonce.
 
   run_symmetric_side(...) -- the symmetric peer.  Opens N UDP
                          sockets each bound to a different local
@@ -21,8 +21,21 @@ Two halves:
                          ext_port); listens on every socket and
                          returns the first one that hears back.
 
-Wire format per probe (always exactly PROBE_LEN bytes):
-    magic (4)  nonce (16)  role (1)  probe_index (2 BE)
+Wire format per probe: RFC 5389 STUN Binding Request, always
+exactly PROBE_LEN (20) bytes.  Our session-specific data is packed
+into STUN's 12-byte Transaction ID:
+
+    txid[0:9]  = first 9 bytes of the 16-byte session nonce
+    txid[9:10] = role byte (ROLE_CONE or ROLE_SYM)
+    txid[10:12] = 2-byte probe index (big-endian)
+
+The remaining 7 bytes of nonce stay node-local and never cross the
+wire; receivers compare on the 9-byte prefix only.  9 bytes is
+2^72 collision space which is well above session lifetime needs.
+The STUN shape gives ALG / DPI middleboxes no reason to deprioritise
+the spray -- they see traffic indistinguishable from legitimate STUN
+Binding Requests, the same fix that yesterday converted udp_punch
+from "ALG murders the spray" to "ALG gives us the priority lane".
 
 Successful return value from either side is a dict
     {"sock": <connected socket>, "peer": (ip, port)}
@@ -48,7 +61,6 @@ from .random_probe_defs import (
     PROBE_IDX_CONFIRM,
     PROBE_LEN,
     PROBE_LISTEN_TIMEOUT,
-    PROBE_MAGIC,
     PROBE_PORT_HI,
     PROBE_PORT_LO,
     ROLE_CONE,
@@ -57,23 +69,51 @@ from .random_probe_defs import (
 
 
 # ─────────────────────────────────────────────────────────────────
-# Wire format
+# Wire format (STUN Binding Request with role/idx packed in TXID)
 # ─────────────────────────────────────────────────────────────────
 
 
+# Wire-format msg_type byte for the only class we emit and accept on
+# random_probe: STUN Binding Request (Binding | Request | 0x3fff mask).
+RANDOM_PROBE_WIRE_TYPE = b"\x00\x01"
+
+# Layout offsets inside the 12-byte STUN Transaction ID.
+TXID_NONCE_LEN = 9
+TXID_ROLE_OFFSET = 9
+TXID_IDX_OFFSET = 10
+
+
 def encode_probe(nonce, role, idx):
-    """Pack one probe datagram.
+    """Pack one probe datagram as a STUN Binding Request.
 
     *nonce* must be exactly 16 bytes; *role* must be ROLE_CONE or
-    ROLE_SYM; *idx* is a per-probe sequence number in [0, 65535].
-    The result is always PROBE_LEN bytes so receivers can skip
-    anything that isn't an exact length match without parsing.
+    ROLE_SYM; *idx* is a per-probe sequence number in [0, 65535]
+    (idx=PROBE_IDX_CONFIRM is the cone's terminal CONFIRM marker).
+
+    The result is always PROBE_LEN bytes (20) and parses as a
+    bare-bones Binding Request to any RFC 5389 decoder.
     """
+    from aionetiface.protocol.stun.stun_defs import (
+        RFC5389, STUNMsg, STUNMsgCodes, STUNMsgTypes,
+    )
+
     if len(nonce) != 16:
         raise ValueError("probe nonce must be 16 bytes")
     if role not in (ROLE_CONE, ROLE_SYM):
         raise ValueError("probe role must be ROLE_CONE or ROLE_SYM")
-    return PROBE_MAGIC + nonce + role + struct.pack("!H", idx & 0xFFFF)
+
+    txid = (
+        bytes(nonce[:TXID_NONCE_LEN])
+        + bytes(role)
+        + struct.pack("!H", idx & 0xFFFF)
+    )
+    msg = STUNMsg(
+        msg_type=STUNMsgTypes.Binding,
+        msg_code=STUNMsgCodes.Request,
+        mode=RFC5389,
+    )
+    msg.txn_id = txid
+    return msg.pack()
 
 
 def decode_probe(data, want_nonce):
@@ -81,19 +121,58 @@ def decode_probe(data, want_nonce):
     Validate that *data* is one of *our* probes for the session
     identified by *want_nonce*.  Returns the parsed fields on hit,
     or None when the datagram doesn't belong to us (wrong length,
-    bad magic, wrong nonce, unknown role).
+    bad magic cookie, wrong msg_type, wrong nonce prefix, unknown
+    role).
     """
     if len(data) != PROBE_LEN:
         return None
-    if data[:4] != PROBE_MAGIC:
+
+    from aionetiface.protocol.stun.stun_defs import (
+        RFC5389, STUNMsg, STUN_MAGIC_COOKIE,
+    )
+
+    if bytes(data[4:8]) != STUN_MAGIC_COOKIE:
         return None
-    if data[4:20] != want_nonce:
+    try:
+        msg, _ = STUNMsg.unpack(bytes(data), mode=RFC5389)
+    except Exception:  # pylint: disable=broad-except
         return None
-    role = data[20:21]
+    if bytes(msg.msg_type) != RANDOM_PROBE_WIRE_TYPE:
+        return None
+
+    txid = bytes(msg.txn_id)
+    if txid[:TXID_NONCE_LEN] != bytes(want_nonce[:TXID_NONCE_LEN]):
+        return None
+    role = txid[TXID_ROLE_OFFSET:TXID_ROLE_OFFSET + 1]
     if role not in (ROLE_CONE, ROLE_SYM):
         return None
-    idx = struct.unpack("!H", data[21:23])[0]
+    idx = struct.unpack("!H", txid[TXID_IDX_OFFSET:TXID_IDX_OFFSET + 2])[0]
     return {"role": role, "idx": idx}
+
+
+def looks_like_random_probe(data):
+    """Coarse predicate: does *data* have the wire shape of one of our
+    probe datagrams?
+
+    Used by stream filters that need to drop probe-shaped residue from
+    a post-convergence socket queue without keeping a reference to the
+    session nonce.  Does NOT verify nonce or role -- false positives
+    are rare (legitimate STUN Binding Requests not from us could match,
+    but in practice the filter sits on a punched UDP socket where the
+    only incoming traffic is from the peer).  Callers that need
+    nonce-tight verification should use decode_probe instead.
+    """
+    if len(data) != PROBE_LEN:
+        return False
+    if bytes(data[0:2]) != RANDOM_PROBE_WIRE_TYPE:
+        return False
+    # Lazy import; this function is called per packet but the cookie
+    # constant is module-level cached by the import system after the
+    # first call.
+    from aionetiface.protocol.stun.stun_defs import STUN_MAGIC_COOKIE
+    if bytes(data[4:8]) != STUN_MAGIC_COOKIE:
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -487,12 +566,13 @@ async def peek_then_recv_probe(
 ):
     """Wait for inbound, peek at it, conditionally consume.
 
-    Returns ((data, addr), True) when a *probe* (PROBE_MAGIC +
-    matching nonce) is at the head of the queue and we've
-    consumed it, OR (None, False) when something arrived but it
-    wasn't a probe -- in that case the data is left in the
-    kernel queue for the next consumer (the application's Pipe)
-    so we don't eat real user data during the algorithm phase.
+    Returns ((data, addr), True) when a *probe* (STUN Binding Request
+    + matching session-nonce prefix in the Transaction ID) is at the
+    head of the queue and we've consumed it, OR (None, False) when
+    something arrived but it wasn't a probe -- in that case the data
+    is left in the kernel queue for the next consumer (the
+    application's Pipe) so we don't eat real user data during the
+    algorithm phase.
 
     This is the fix for "the algorithm consumes user data".  The
     cone side often converges first, returns from

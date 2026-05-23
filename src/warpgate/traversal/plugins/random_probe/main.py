@@ -43,9 +43,7 @@ from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
 
 from .random_probe_defs import (
     DEFAULT_PROBE_COUNT,
-    PROBE_LEN,
     PROBE_LISTEN_TIMEOUT,
-    PROBE_MAGIC,
 )
 from .random_probe_lib import (
     async_drain_probe_residue,
@@ -484,11 +482,11 @@ class RandomProbePlugin(Plugin):
             stream = pipe.pipe_events.stream
             stream.subs = {}
             pipe.subscribe(SUB_ALL)
-            from .random_probe_defs import PROBE_LEN, PROBE_MAGIC
+            from .random_probe_lib import looks_like_random_probe
             original_add_msg = stream.add_msg
 
             def filtered_add_msg(data, client_tup):
-                if len(data) == PROBE_LEN and bytes(data[:4]) == PROBE_MAGIC:
+                if looks_like_random_probe(bytes(data)):
                     return
                 return original_add_msg(data, client_tup)
 

@@ -1,12 +1,12 @@
 """Constants for the random-probe symmetric NAT traversal plugin."""
 
-# 4-byte magic that prefixes every probe datagram.  Lets the receiver
-# distinguish a real probe from internet noise / replays without
-# needing per-packet signing.  Picked at random; treat as opaque.
-PROBE_MAGIC = b"P2RP"
-
-# Total probe payload length: magic(4) + nonce(16) + role(1) + idx(2)
-PROBE_LEN = 4 + 16 + 1 + 2
+# Total probe payload length.  Each probe is a STUN Binding Request
+# (RFC 5389 §6) with our role + idx + nonce-prefix packed into the
+# 12-byte Transaction ID -- see random_probe_lib.encode_probe.  The
+# bare STUN header is 20 bytes and we emit no attributes, so every
+# probe is exactly 20 bytes on the wire.  Receivers reject anything
+# of a different length cheaply before doing the structured decode.
+PROBE_LEN = 20
 
 # Default per-side probe count.  Birthday paradox: both sides draw N
 # ports from [PROBE_PORT_LO, PROBE_PORT_HI] = 32768 ports.

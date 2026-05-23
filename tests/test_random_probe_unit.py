@@ -24,7 +24,6 @@ from aionetiface.nic.nat.nat_defs import (
 from warpgate.traversal.plugins.random_probe.random_probe_defs import (
     DEFAULT_PROBE_COUNT,
     PROBE_LEN,
-    PROBE_MAGIC,
     PROBE_PORT_HI,
     PROBE_PORT_LO,
     ROLE_CONE,
@@ -33,8 +32,10 @@ from warpgate.traversal.plugins.random_probe.random_probe_defs import (
 from warpgate.traversal.plugins.random_probe.random_probe_lib import (
     decode_probe,
     encode_probe,
+    looks_like_random_probe,
     random_probe_ports,
 )
+from aionetiface.protocol.stun.stun_defs import STUN_MAGIC_COOKIE
 from warpgate.traversal.plugins.random_probe.main import is_symmetric_nat
 from warpgate.traversal.plugins.random_probe.proto import RandomProbeMsg
 # Plugin loader patches WIRE_NAME at install; unit tests bypass the
@@ -50,10 +51,20 @@ class TestProbeWireFormat(unittest.TestCase):
         buf = encode_probe(nonce, ROLE_CONE, 7)
         self.assertEqual(len(buf), PROBE_LEN)
 
-    def test_magic_prefix(self):
+    def test_stun_magic_cookie_at_offset_4(self):
+        # Frames are STUN Binding Requests, so the RFC 5389 magic
+        # cookie lives at offset 4-8 (not at offset 0 like the old
+        # P2RP magic).
         nonce = os.urandom(16)
         buf = encode_probe(nonce, ROLE_SYM, 0)
-        self.assertEqual(buf[:4], PROBE_MAGIC)
+        self.assertEqual(bytes(buf[4:8]), STUN_MAGIC_COOKIE)
+
+    def test_binding_request_msg_type(self):
+        # Every probe is a Binding Request -- msg_type at offset 0-2
+        # must be b"\x00\x01" (Binding | Request, RFC 5389 §6).
+        nonce = os.urandom(16)
+        buf = encode_probe(nonce, ROLE_CONE, 0)
+        self.assertEqual(bytes(buf[0:2]), b"\x00\x01")
 
     def test_round_trip_cone(self):
         nonce = os.urandom(16)
@@ -81,20 +92,29 @@ class TestProbeWireFormat(unittest.TestCase):
         self.assertIsNone(decode_probe(buf, nonce))
 
     def test_decode_rejects_wrong_magic(self):
-        nonce = os.urandom(16)
-        buf = b"XXXX" + nonce + ROLE_CONE + struct.pack("!H", 0)
-        self.assertIsNone(decode_probe(buf, nonce))
+        # 20 bytes but the STUN magic-cookie slot is wrong.
+        bad = b"XXXX" * 5
+        self.assertIsNone(decode_probe(bad, b"\x00" * 16))
 
     def test_decode_rejects_wrong_nonce(self):
         nonce = os.urandom(16)
-        other = os.urandom(16)
+        # Use distinct prefixes -- decode_probe compares the first
+        # 9 bytes of nonce (STUN TXID-width nonce slot).
+        other = b"\xff" * 9 + b"\x00" * 7
         buf = encode_probe(nonce, ROLE_CONE, 0)
         self.assertIsNone(decode_probe(buf, other))
 
     def test_decode_rejects_unknown_role(self):
-        nonce = os.urandom(16)
-        buf = PROBE_MAGIC + nonce + b"\x99" + struct.pack("!H", 0)
-        self.assertIsNone(decode_probe(buf, nonce))
+        # Craft a Binding Request whose TXID has a role byte that
+        # is neither ROLE_CONE (0x01) nor ROLE_SYM (0x02).
+        from aionetiface.protocol.stun.stun_defs import (
+            RFC5389, STUNMsg, STUNMsgCodes, STUNMsgTypes,
+        )
+        msg = STUNMsg(msg_type=STUNMsgTypes.Binding,
+                      msg_code=STUNMsgCodes.Request, mode=RFC5389)
+        nonce = b"\x00" * 16
+        msg.txn_id = nonce[:9] + b"\x99" + struct.pack("!H", 0)
+        self.assertIsNone(decode_probe(msg.pack(), nonce))
 
     def test_encode_rejects_bad_nonce_length(self):
         with self.assertRaises(ValueError):
@@ -103,6 +123,13 @@ class TestProbeWireFormat(unittest.TestCase):
     def test_encode_rejects_unknown_role(self):
         with self.assertRaises(ValueError):
             encode_probe(b"\x00" * 16, b"\x05", 0)
+
+    def test_looks_like_random_probe(self):
+        nonce = os.urandom(16)
+        buf = encode_probe(nonce, ROLE_CONE, 7)
+        self.assertTrue(looks_like_random_probe(buf))
+        self.assertFalse(looks_like_random_probe(b"random garbage"))
+        self.assertFalse(looks_like_random_probe(b"\x00" * PROBE_LEN))
 
 
 class TestRandomProbePorts(unittest.TestCase):

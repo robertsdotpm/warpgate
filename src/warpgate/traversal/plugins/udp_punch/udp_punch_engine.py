@@ -32,22 +32,23 @@ from aionetiface.net.address import resolve_dest_tup
 
 from ..tcp_punch.tcp_punch_utils import bind_punch_sockets
 from .udp_punch_defs import (
-    STUN_FRAME_LEN_WITH_XMA,
-    UDP_PUNCH_FRAME_LEN,
     UDP_PUNCH_KIND_CONFIRM,
     UDP_PUNCH_KIND_PROBE,
+    UDP_PUNCH_MAX_FRAME_LEN,
     build_frame,
     parse_frame,
 )
 
 
-# Peek/drain buffer wide enough for the longest punch frame we accept:
-# either the native 21-byte P2UP frame or a 32-byte STUN Binding Success
-# (20-byte header + 12-byte XOR-MAPPED-ADDRESS).  Sizing at the native
-# 21 bytes truncates STUN frames -- parse_frame then rejects them on the
-# length check, AND on Windows the drain recvfrom() raises WSAEMSGSIZE
-# because the kernel discards the unread tail.
-PUNCH_RECV_BUFLEN = max(UDP_PUNCH_FRAME_LEN, STUN_FRAME_LEN_WITH_XMA)
+# Peek / drain buffer wide enough for the longest punch frame we
+# accept.  All frames are STUN now (Binding Request 20 bytes or
+# Binding Success Response with optional XOR-MAPPED-ADDRESS up to
+# ~44 bytes for IPv6); UDP_PUNCH_MAX_FRAME_LEN gives generous
+# headroom.  Sizing too small would: (a) truncate STUN frames on
+# MSG_PEEK so parse_frame rejects them on length, and (b) on Windows
+# trigger WSAEMSGSIZE on the drain recvfrom because the kernel
+# discards the unread tail.
+PUNCH_RECV_BUFLEN = UDP_PUNCH_MAX_FRAME_LEN
 
 
 # Module-level fallbacks. Per-call params dicts override these.
@@ -209,10 +210,10 @@ def watch_for_winner(
         log("udp_punch.watch_for_winner: no bound sockets; nothing to watch")
         return None
 
-    # confirm_frame is built per-PROBE arrival in the loop below.  Under
-    # WG_PROBE_STUN_FORMAT a Binding Success Response must carry an
-    # XOR-MAPPED-ADDRESS attribute describing the peer's reflexive
-    # address, so the frame depends on the peer addr we just learned
+    # confirm_frame is built per-PROBE arrival in the loop below.  A
+    # STUN Binding Success Response must carry an XOR-MAPPED-ADDRESS
+    # attribute describing the peer's reflexive address (RFC 5389
+    # §6.3.3), so the frame depends on the peer addr we just learned
     # from recvfrom -- can't be precomputed.
     end = time.monotonic() + listen_duration
     log(fstr(
@@ -403,14 +404,14 @@ def drain_punch_residue(sock, nonce):
     drained = 0
     while True:
         try:
-            buf, _ = sock.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+            buf, _ = sock.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
         except (BlockingIOError, OSError):
             break
         kind, recv_nonce = parse_frame(buf)
         if kind is None or recv_nonce[:12] != nonce[:12]:
             break
         try:
-            sock.recvfrom(UDP_PUNCH_FRAME_LEN)
+            sock.recvfrom(PUNCH_RECV_BUFLEN)
         except OSError:
             break
         drained += 1
