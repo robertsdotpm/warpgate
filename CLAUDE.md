@@ -1,5 +1,15 @@
 # warpgate — project instructions
 
+## Orchestrators MUST pass explicit `afs` to `Gate`
+
+When the matrix runner / gate_sweep / any test harness constructs a `Gate`, it must pass `afs=(...)` (or set `WG_AFS` on the spawned subprocess) naming exactly the address families that iteration intends to exercise. The Gate validates the requested AFs against the loaded NICs' `nic.supported()` and raises `GateAfNotSupported` if any requested AF can't be served.
+
+The orchestrator side then maps that exception (signalled via the `WG_AF_NOT_SUPPORTED requested=... available=...` sentinel line from `gate_listen`) to a `SKIP_AF` outcome — distinct from `READY_FAIL` and from `echo=fail`. Aggregated reports separate **real failures** (broken cascade) from **environment-skips** (the NIC literally can't speak that AF).
+
+Default `afs=None` keeps the historical permissive behaviour for interactive demo / single-user invocations — only the orchestrator path is constrained to explicit AFs. Without the explicit afs gate, a v6-iteration against a v4-only mobile NIC silently binds whatever the NIC offers, the cascade then fails for env-not-bug reasons, and aggregated stats misreport the env-skip as a punch regression.
+
+Per-NIC AF capability lives in `warpgate_test_run/plugin_sweep.py:VMS[<vm>]["nic_ext_afs"]` (Windows mobile NICs are all `(4,)` — IPv4-only) and `anchor_sweep.py:VMS[<vm>]["nic_afs"]` (defaults to `(4, 6)` when absent). `matrix_full` reads these and filters its task list so the structurally-impossible combinations never even fire.
+
 ## Python compatibility
 
 `requires-python = ">=3.5"` is intentional and must not be changed. Do not raise the minimum Python version under any circumstances.
