@@ -146,6 +146,22 @@ async def setup_node():
                  " disable extra NICs before serious testing.")
             cout()
 
+    # Wait for the background NAT classification task to finish before
+    # printing the address.  classify_nat_background may rebuild and
+    # republish node.addr_bytes with the real measured NAT type;
+    # printing before it completes shows a placeholder value that
+    # doesn't match what peers will resolve via PNP.  The task is
+    # ~2s on a healthy network and bounded by load_nat's own
+    # timeouts, so the wait is short and always finite.
+    nat_task = getattr(node, "nat_classify_task", None)
+    if nat_task is not None:
+        try:
+            await nat_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            log_exception()
+
     cout()
     cout(fstr("Node started = {0}", (to_s(node.addr_bytes),)))
     cout(fstr("Node port = {0}", (node.listen_port,)))
