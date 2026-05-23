@@ -42,7 +42,7 @@ import selectors
 import socket
 import struct
 import time
-from aionetiface import log
+from aionetiface import log, log_exception
 from .tcp_punch_utils import bind_tcp_sockets, connect_on_tcp_sockets
 from .punch_utils import choose_winning_tcp_sock
 
@@ -260,6 +260,21 @@ af,
         log("[ENGINE] choose_winning_tcp_sock -> {0}".format(
             "selected" if sock else "no winner",
         ))
+
+        # Print the winner's actual 4-tuple so every punch result
+        # self-documents whether it went external.  peername.ip
+        # not appearing on any local interface == real wire round-
+        # trip (no kernel-local shortcut).  Cheaper than asking
+        # the user to run `ip route get` after the fact.
+        if sock is not None:
+            try:
+                sockname = sock.getsockname()
+                peername = sock.getpeername()
+                log("[ENGINE] winner sockname={0} peername={1}".format(
+                    sockname, peername,
+                ))
+            except (OSError, ValueError):
+                log_exception()
 
         # Revert SO_LINGER {1,0} on the winning socket. We set it at
         # bind time so failed-punch close()es bypass TIME_WAIT and
