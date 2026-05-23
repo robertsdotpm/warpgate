@@ -46,7 +46,7 @@ from .node_protocol import (
     register_liveness_pong_future,
     unregister_liveness_pong_future,
 )
-from .node_utils import enrich_addr_map_with_loopback
+from .node_utils import enrich_addr_map_with_loopback, report_punch_failure
 from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
 
@@ -1165,6 +1165,21 @@ async def auto_connect(
                     log_exception()
                     alive = False
 
+            # Punch-failure ground-truth: pipe returned but didn't carry
+            # bytes through PING/PONG verification.  If the local NIC's
+            # delta classification was probationary (cold-start optimistic
+            # PRESERV default), the failure is evidence the optimistic
+            # guess was wrong -- invalidate the cache so the next cold
+            # start re-classifies honestly.  No-op when classification
+            # was a measured verdict; in that case the failure is more
+            # likely peer-side or transient.
+            if pipe is not None and not alive:
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
+                try:
+                    report_punch_failure(node, plugin_name=plugin_name)
+                except Exception:  # pylint: disable=broad-except
+                    log_exception()
+
             line = "[AC-PHASE] {0} -> pipe={1} alive={2} plugin={3} src_nat={4} dest_nat={5} elapsed={6}ms src_cgnat={7} dest_cgnat={8}".format(
                 phase_fn.__name__,
                 pipe is not None,
@@ -1249,6 +1264,14 @@ async def auto_connect(
             log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
                 phase_fn.__name__,
             ))
+            # Same punch-failure feedback as the test_all_phases path:
+            # invalidate cache when verify failed AND the local NIC's
+            # delta was probationary.
+            try:
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
+                report_punch_failure(node, plugin_name=plugin_name)
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
             try:
                 await close_plugin(
                     plugin, node.traversal.plugins, node.traversal.inbound_pipes,
