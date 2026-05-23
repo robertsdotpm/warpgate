@@ -182,37 +182,28 @@ async def load_network_interfaces(node):
         try:
             if_names = await list_interfaces()
             if nic_names:
-                # Each interface has a canonical name (description on
-                # Windows) but may also be reachable via friendly /
-                # alias names registered in the netifaces backend's
-                # by_name_index.  Build a per-canonical alias set so
-                # callers can pin --nic / WG_NIC to either form.
-                # Falls back to plain canonical match on backends that
-                # don't expose by_name_index (POSIX).
+                # Each wanted name is either a canonical (description
+                # on Windows; device path elsewhere) or an alias the
+                # netifaces backend recognises (friendly name on
+                # Windows).  Resolve each through by_name_index to
+                # its canonical, then filter against the discovered
+                # list.  Backends without by_name_index (POSIX) fall
+                # through to canonical-only matching.
+                aliases = {}
                 try:
                     netifaces = await aionetiface_setup_netifaces()
-                    by_name_index = getattr(netifaces, "by_name_index", None)
+                    aliases = getattr(netifaces, "by_name_index", {}) or {}
                 except Exception:  # pylint: disable=broad-except
-                    by_name_index = None
-                wanted = set(nic_names)
-                filtered = []
-                for canonical in if_names:
-                    if canonical in wanted:
-                        filtered.append(canonical)
-                        continue
-                    # Match via alias: any entry in by_name_index that
-                    # resolves to this canonical iface and is also in
-                    # the wanted set counts as a hit.
-                    if by_name_index is not None:
-                        # by_name_index maps both canonical and alias
-                        # names to the same if_info dict.  Find aliases
-                        # for this canonical by reverse-lookup.
-                        canonical_info = by_name_index.get(canonical)
-                        if canonical_info is not None:
-                            for alias_name, alias_info in by_name_index.items():
-                                if alias_info is canonical_info and alias_name in wanted:
-                                    filtered.append(canonical)
-                                    break
+                    pass
+
+                def to_canonical(name):
+                    if name in if_names:
+                        return name
+                    info = aliases.get(name)
+                    return info.get("name") if info else None
+
+                filtered = [c for c in (to_canonical(n) for n in nic_names)
+                            if c in if_names]
                 if not filtered:
                     raise ValueError(
                         "nic_names {0!r} matched no available interfaces {1!r}".format(
