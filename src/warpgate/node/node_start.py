@@ -288,13 +288,38 @@ async def classify_nat_background(node, out):
     for nic in node.ifs:
         before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
 
+    # Determine per-NIC cold-start status BEFORE classification runs.
+    # A NIC is "cold-start" when no usable cached entry was seeded
+    # earlier (apply_cached_or_placeholder_nat fell back to the
+    # nat_info() placeholder default rather than a previous measurement).
+    # The placeholder default produced by nat_info() with no args is
+    # (RESTRICT_PORT_NAT, EQUAL_DELTA) -- so any NIC whose seeded nat
+    # matches that exactly is cold; anything else carried a prior
+    # measurement from cache.  This lets delta_test apply its
+    # optimistic-default-on-cold-start behaviour only where it's
+    # actually warranted, never on a NIC we've already classified
+    # before and stored.
+    is_cold_for_nic = {}
+    placeholder = nat_info()
+    for nic in node.ifs:
+        cur = getattr(nic, "nat", None) or {}
+        is_cold = (
+            cur.get("type") == placeholder.get("type")
+            and isinstance(cur.get("delta"), dict)
+            and cur["delta"].get("type") == placeholder["delta"]["type"]
+        )
+        is_cold_for_nic[getattr(nic, "name", None)] = is_cold
+
     # NAT classification timeout scales up on XP/Vista (slow stacks).
     nat_timeout = os_net_timeouts()["nat_load"]
     nat_by_nic = {}
     for nic in node.ifs:
         try:
             await asyncio.wait_for(
-                nic.load_nat(timeout=nat_timeout),
+                nic.load_nat(
+                    timeout=nat_timeout,
+                    is_cold_start=is_cold_for_nic.get(getattr(nic, "name", None), False),
+                ),
                 timeout=nat_timeout + 5,
             )
         except asyncio.CancelledError:
