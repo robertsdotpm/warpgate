@@ -76,7 +76,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 5}
+    conf = {"timeout": 10}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
