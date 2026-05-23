@@ -11,6 +11,7 @@ iteration.
 import asyncio
 import os
 import sys
+import traceback
 
 from aionetiface import aionetiface_setup_event_loop
 aionetiface_setup_event_loop()
@@ -37,9 +38,12 @@ async def emit_ready_when_registered(gate):
             print("WG_READY: {0}".format(gate.full_name), flush=True)
             return
         if gate.node and getattr(gate.node, "nickname_error", None) is not None:
-            print("WG_READY_TIMEOUT", flush=True)
+            print("WG_READY_TIMEOUT (nickname_error={0!r})".format(
+                gate.node.nickname_error,
+            ), flush=True)
             return
-    print("WG_READY_TIMEOUT", flush=True)
+    print("WG_READY_TIMEOUT (poll loop exhausted; gate.full_name never set "
+          "after 200s)", flush=True)
 
 
 async def main():
@@ -70,8 +74,19 @@ async def main():
         await gate.listen(handle)
     except asyncio.CancelledError:
         raise
-    except Exception:
-        print("WG_READY_TIMEOUT", flush=True)
+    except Exception as exc:
+        # Print the exception class + message + full traceback on the
+        # WG_READY_TIMEOUT line so the orchestrator's listener-log
+        # capture has a real diagnostic instead of just the bare
+        # sentinel.  Without this every silent gate.listen() failure
+        # surfaced as "WG_READY_TIMEOUT" with no clue what went wrong,
+        # forcing every diagnosis through the aionetiface log file
+        # (which itself misses errors raised between log() calls).
+        print("WG_READY_TIMEOUT exc={0}: {1}".format(
+            type(exc).__name__, exc,
+        ), flush=True)
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
