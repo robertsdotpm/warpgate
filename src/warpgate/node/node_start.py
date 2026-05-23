@@ -15,7 +15,7 @@ from aionetiface import (
 )
 from aionetiface.nic.nat.nat_utils import nat_info
 from aionetiface.nic.nat.nat_cache import (
-    network_fingerprint, nat_cache_get, nat_cache_put,
+    network_fingerprint, nat_cache_get, nat_cache_put, nat_cache_invalidate,
 )
 from sidewire import Router
 from .node_utils import (
@@ -228,12 +228,18 @@ def apply_cached_or_placeholder_nat(node):
     publish the address straight away. A network-fingerprint cache hit
     seeds the real previously-measured values (rebuilt via nat_info to
     avoid trusting the raw JSON blob); a miss seeds nat_info()'s
-    optimistic default. Either way the background task overwrites it
-    with a fresh probe and republishes if it differs.
+    optimistic default.
+
+    Stores whether the cache hit was FRESH on the node
+    (node.nat_cache_is_fresh) so classify_nat_background can decide
+    whether to skip the BG classification entirely (fresh) or refresh
+    in the background (stale / miss).
     """
     fingerprint = network_fingerprint(node.ifs)
     node.nat_fingerprint = fingerprint
-    cached = nat_cache_get(fingerprint) or {}
+    cached_nics, is_fresh = nat_cache_get(fingerprint)
+    node.nat_cache_is_fresh = bool(is_fresh)
+    cached = cached_nics or {}
     for nic in node.ifs:
         name = getattr(nic, "name", None)
         entry = cached.get(name)
@@ -261,7 +267,22 @@ async def classify_nat_background(node, out):
     The ~2s classify + republish completes well inside the ~8s
     connector settling window, so a peer never resolves the
     placeholder addr in practice.
+
+    Trust-first short-circuit: when the NAT cache hit was fresh
+    (node.nat_cache_is_fresh set by apply_cached_or_placeholder_nat),
+    skip the real classification entirely.  The cached values are
+    already seeded into nic.nat and the published address reflects
+    them; running another classification round just burns STUN load
+    and risks overwriting confident cached data with a transient bad
+    measurement.  The cache is re-classified on:
+      - cache miss (no entry at all)  -> classify normally
+      - stale hit (entry past TTL)    -> classify in background
+      - cache invalidation by a punch-attempt failure (separately wired)
     """
+    if getattr(node, "nat_cache_is_fresh", False):
+        log("[NAT-CLASSIFY] cache fresh; skipping background classify")
+        return
+
     classify_t0 = time.monotonic()
     before = {}
     for nic in node.ifs:
