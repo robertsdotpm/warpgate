@@ -120,6 +120,32 @@ async def setup_node():
     # Show which interfaces were loaded and their NAT classification.
     display_ifs_loaded(ifs)
 
+    # Windows XP doesn't have per-source routing / SO_BINDTODEVICE
+    # equivalent, so bound sockets on a non-default NIC silently
+    # egress out of the default route's NIC anyway.  A demo running
+    # XP with multiple loaded NICs is almost certainly going to behave
+    # in confusing ways: the punch / probe binds report the "right"
+    # source NIC but the kernel sends from the wrong one, peers see
+    # different mappings than predicted, and everything looks like a
+    # NAT misclassification instead of an XP routing limitation.
+    # Warn loudly so users aren't chasing the wrong bug.
+    if sys.platform == "win32" and len(ifs) > 1:
+        try:
+            ver = sys.getwindowsversion()
+            is_xp = (ver.major, ver.minor) == (5, 1)
+        except AttributeError:
+            is_xp = False
+        if is_xp:
+            cout()
+            cout("WARNING: Windows XP loaded with multiple NICs.")
+            cout("  XP lacks per-source routing (no SO_BINDTODEVICE"
+                 " equivalent).")
+            cout("  Sockets bound to a non-default NIC will silently"
+                 " egress via the default route's NIC; cross-NIC punches")
+            cout("  may misbehave.  Treat as single-NIC-at-a-time --"
+                 " disable extra NICs before serious testing.")
+            cout()
+
     cout()
     cout(fstr("Node started = {0}", (to_s(node.addr_bytes),)))
     cout(fstr("Node port = {0}", (node.listen_port,)))

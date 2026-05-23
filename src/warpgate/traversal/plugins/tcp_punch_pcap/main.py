@@ -386,9 +386,18 @@ class PunchPcapPlugin(Plugin):
             # port BEFORE the punch fires. tcpip.sys / Linux kernel
             # must NOT see the SYN as "no socket listening" and emit
             # an RST; the pcap stack will own the handshake.
+            #
+            # install_block_ports shells out to iptables / pfctl /
+            # netsh -- a synchronous subprocess that on Linux can
+            # take 100ms+ and would otherwise stall the event loop on
+            # every TCP punch attempt.  Offload to the default thread
+            # pool executor.
             local_ports = sorted(set(int(pa.src_port)
                                      for pa in puncher.port_allocs))
-            firewall_ports = install_block_ports(local_ports)
+            loop = asyncio.get_event_loop()
+            firewall_ports = await loop.run_in_executor(
+                None, install_block_ports, local_ports,
+            )
 
             # Resolve pcap NIC name. On Unix it's the NIC's name; on
             # Windows it's the NPF device path. Same lookup the original
