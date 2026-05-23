@@ -105,7 +105,7 @@ class RandomProbePlugin(Plugin):
     # LOOPBACK_BIND stays out -- random_probe over loopback is
     # degenerate (kernel short-circuit, nothing to verify).
     route_types = (EXT_BIND, NIC_BIND)
-    conf = {"timeout": 5}
+    conf = {"timeout": 10}
     proto_messages = (
         (RandomProbeMsg, P2P_RANDOM_PROBE, 18),
     )
