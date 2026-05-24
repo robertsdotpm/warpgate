@@ -587,17 +587,21 @@ class RandomProbePlugin(Plugin):
                 # streak counter. recv() consumes one item per call.
                 rp_stale_drained = 0
                 rp_stale_errors = 0
+                rp_stale_heads = []
                 for _ in range(256):
                     try:
-                        punched_sock_ref.recv(4096)
+                        d = punched_sock_ref.recv(4096)
                         rp_stale_drained += 1
+                        if len(rp_stale_heads) < 6:
+                            rp_stale_heads.append(bytes(d[:32]))
                     except BlockingIOError:
                         break
                     except (ConnectionRefusedError, OSError):
                         rp_stale_errors += 1
-                log("[RP-WORKER] post-connect stale drain: {0} frames {1} errors".format(
-                    rp_stale_drained, rp_stale_errors,
-                ))
+                log("[RP-WORKER] post-connect stale drain: {0} frames {1} errors "
+                    "heads={2}".format(
+                        rp_stale_drained, rp_stale_errors, rp_stale_heads,
+                    ))
 
                 # Signal convergence BEFORE entering selector_proxy so
                 # main can resolve result and the demo can start sending.
