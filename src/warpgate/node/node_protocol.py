@@ -55,7 +55,7 @@ def unregister_liveness_pong_future(pipe, nonce):
     futures = getattr(pipe, "liveness_pong_futures", None)
     if futures is not None:
         futures.pop(nonce, None)
-from ..traversal.plugins.random_probe.random_probe_lib import (
+from ..traversal.plugins.random_probe.random_probe_utils import (
     looks_like_random_probe,
 )
 from ..traversal.plugins.udp_punch.udp_punch_defs import (

@@ -45,15 +45,13 @@ from .random_probe_defs import (
     DEFAULT_PROBE_COUNT,
     PROBE_LISTEN_TIMEOUT,
 )
-from .random_probe_lib import (
-    async_drain_probe_residue,
+from .random_probe_engine import sync_run_bidirectional_spray
+from .random_probe_utils import (
+    decode_probe,
     drain_probe_residue,
+    looks_like_random_probe,
     make_udp_socket,
-    sync_run_bidirectional_spray,
-    sync_run_non_sym_side,
-    sync_run_symmetric_side,
     sync_stun_discover_mapping,
-    wait_until,
 )
 
 
@@ -485,7 +483,6 @@ class RandomProbePlugin(Plugin):
             stream = pipe.pipe_events.stream
             stream.subs = {}
             pipe.subscribe(SUB_ALL)
-            from .random_probe_lib import looks_like_random_probe
             original_add_msg = stream.add_msg
 
             def filtered_add_msg(data, client_tup):
@@ -544,7 +541,6 @@ class RandomProbePlugin(Plugin):
                     except (BlockingIOError, OSError):
                         time.sleep(0.05)
                         continue
-                    from .random_probe_lib import decode_probe
                     if decode_probe(data, nonce_ref) is None:
                         time.sleep(0.05)
                         continue
