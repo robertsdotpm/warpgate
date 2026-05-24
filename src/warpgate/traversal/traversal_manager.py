@@ -385,34 +385,20 @@ class TraversalManager:
         if isinstance(msg, ConMsg):
             msg.meta.plugin_name = "direct_connect"
 
-        # Asymmetric tcp_punch -> tcp_punch_pcap override:
-        # When the peer sends a PunchMsg labelled plugin_name="tcp_punch"
-        # but OUR local OS is NT-5 (XP / 2000) AND we have the
-        # tcp_punch_pcap plugin installed, redirect locally to
-        # tcp_punch_pcap.  The peer can't know our OS at signal-
-        # dispatch time (they pick their plugin from THEIR OS), so
-        # the redirection must happen here, on the receiver side.
-        # The wire bytes are identical (both plugins share
-        # tcp_punch.PunchMsg) -- only the local plugin instantiated
-        # to handle the message changes.
-        # See warpgate/src/warpgate/traversal/plugins/tcp_punch_pcap/__init__.py
-        # for the full design rationale.
-        if (
-            msg.meta.plugin_name == "tcp_punch"
-            and "tcp_punch_pcap" in self.plugin_loaders
-        ):
-            try:
-                from aionetiface import os_id
-                local_os = os_id() or ""
-            except ImportError:
-                local_os = ""
-            if (
-                local_os.startswith("Windows-XP")
-                or local_os.startswith("Windows-2000")
-            ):
-                log("create_inbound_plugin: redirecting tcp_punch -> "
-                    "tcp_punch_pcap (local OS {0!r})".format(local_os))
-                msg.meta.plugin_name = "tcp_punch_pcap"
+        # Note: prior versions redirected tcp_punch -> tcp_punch_pcap
+        # on Windows-XP / Windows-2000 receivers whenever pcap was
+        # installed.  That redirect was rationalised by the now-revised
+        # "XP cross-NAT tcp_punch is broken at tcpip.sys" claim
+        # (see warpgate/CLAUDE.md "Windows XP cross-NAT tcp_punch"
+        # section -- the original observation was confounded by XP's
+        # DNS-clears-on-NIC-disable bug, not a stack-level RST).
+        # Live test 2026-05-24 shows XP cross-NAT tcp_punch passes
+        # 2/2 against p2pd.net with working DNS, so the redirect was
+        # both unnecessary and actively harmful when pcap is enabled
+        # (it would steal traffic from the working native path).
+        # tcp_punch_pcap stays opt-in for users who explicitly target
+        # it in plugins=[...] -- this just removes the automatic
+        # hijack of the inbound tcp_punch path.
 
         if msg.meta.plugin_name not in self.plugin_loaders:
             raise ValueError("Plugin not installed.")
