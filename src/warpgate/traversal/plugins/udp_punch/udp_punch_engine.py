@@ -25,6 +25,7 @@ Lessons re-applied from random_probe:
 """
 import select
 import socket
+import sys
 import time
 
 from aionetiface import fstr, log, sock_has_data
@@ -490,7 +491,19 @@ def udp_punch_engine(
     # instead of hitting a closed port-restricted entry.  The master does
     # NOT prime: its role is to be the first to send the real probes that
     # the slave's pinhole will accept.
-    if not is_master:
+    #
+    # SKIP ON WINDOWS: when the TTL-expired router replies with ICMP
+    # Time Exceeded, Windows marks the originating UDP socket as
+    # broken (WinError 10052 "keep-alive activity detected failure"
+    # on the next recvfrom).  Every subsequent operation on that
+    # socket then fails, so the watch_for_winner loop receives zero
+    # bytes from the master.  Verified live 2026-05-24 -- the prime
+    # is the root cause of the 0/14 Windows udp_punch fail rate.
+    # Linux/macOS quietly drop ICMP for UDP and aren't affected.
+    # The 3 s spray that follows already opens the NAT mapping on
+    # its own, so the prime adds no value when it can't be done
+    # safely.
+    if not is_master and sys.platform != "win32":
         sock_family = bound_socks[0][1].family if bound_socks else socket.AF_INET
         if sock_family == socket.AF_INET6:
             # socket.IPPROTO_IPV6 / IPV6_UNICAST_HOPS are not always
