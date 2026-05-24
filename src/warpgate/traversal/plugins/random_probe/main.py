@@ -140,9 +140,11 @@ class RandomProbePlugin(Plugin):
         # observable IP, so src["ip"] is correct.
         self.peer_addr_ip = str(self.dest.get("ip") or "")
         if self.route_type == NIC_BIND:
-            self.my_addr_ip = self.src.get("ip")
+            self.my_addr_ip = str(self.src.get("ip") or "")
         else:
-           self.my_addr_ip = self.src.get("ext")
+            # src["ext"] is an IPRange object (set by topology.py); cast
+            # to str for downstream comparisons and on-wire encoding.
+            self.my_addr_ip = str(self.src.get("ext") or "")
 
         # Role assignment by NAT restrictiveness, then by IP:
         #   1. Whichever side has the *higher* NAT type number plays
@@ -315,9 +317,9 @@ class RandomProbePlugin(Plugin):
         # that lets both peers elect SLAVE.  src["ext"] is the
         # peer-visible address resolve_pair / src_map populated.
         if self.route_type == EXT_BIND:
-            own_ext_ip = self.src.get("ext")
+            own_ext_ip = str(self.src.get("ext") or bind_ip)
         else:
-            own_ext_ip = bind_ip
+            own_ext_ip = str(bind_ip)
 
 
         # Algorithm phase runs in a thread executor with PURE
