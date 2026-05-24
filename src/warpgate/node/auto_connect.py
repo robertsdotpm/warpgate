@@ -454,7 +454,31 @@ async def attempt_one_combo(
     except asyncio.TimeoutError:
         log("attempt_one_combo: plugin.result timed out for {0}".format(plugin_name))
     except asyncio.CancelledError:
-        raise
+        # Distinguish "the plugin's own future was cancelled by the
+        # cleanup loop / close_plugin" (an internal lifecycle event;
+        # treat as a normal failed-cascade-phase) from "this task is
+        # being cancelled from outside" (node_stop / KeyboardInterrupt;
+        # must propagate so shutdown unwinds cleanly).
+        #
+        # The discriminator: plugin.result.cancelled() is True only
+        # when close_plugin called plugin.result.cancel().  If it's
+        # False, the awaiting task itself was cancelled from above.
+        # Without this branch, a routine 10 s plugin expiry tore down
+        # the entire demo node -- the user picks random_probe in the
+        # menu, the cleanup loop fires past expires_at, CancelledError
+        # propagates up through gate.connect into run_node_loop, the
+        # menu's only `except TunnelFailed:` doesn't catch it, the
+        # while-loop falls through to the finally clause and
+        # node_stop runs.  Live aionetiface log on 2026-05-24 PID
+        # 2315025 confirmed the trace.
+        try:
+            cancelled_internally = plugin.result.cancelled()
+        except AttributeError:
+            cancelled_internally = False
+        if not cancelled_internally:
+            raise
+        log("attempt_one_combo: plugin.result was cancelled internally "
+            "(plugin={0}); treating as a failed phase".format(plugin_name))
     except Exception:  # pylint: disable=broad-except
         # Plugin-side failure -- race_combos sees it via plugin_pipe
         # returning None on the unresolved future.
