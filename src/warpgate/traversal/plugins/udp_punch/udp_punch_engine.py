@@ -482,16 +482,15 @@ def udp_punch_engine(
             own_ip_for_election = None
     if not own_ip_for_election:
         own_ip_for_election = src_ip
-    # ip_gt for NUMERIC IP comparison.  The raw `str(...) > str(...)`
-    # lex-comparison previously mis-elected whenever one peer's IP
-    # lex-sorts above the other's but is numerically smaller --
-    # both sides thought they were master and the role-election
-    # broke symmetry.  See ip_gt docstring in
-    # aionetiface.net.net_utils.
-    from aionetiface import ip_gt
+    # IPRange comparison for NUMERIC IP semantics.  The raw
+    # `str(...) > str(...)` lex-comparison previously mis-elected
+    # whenever one peer's IP lex-sorts above the other's but is
+    # numerically smaller -- both sides thought they were master
+    # and the role-election broke symmetry.
+    from aionetiface import IPRange
     is_master = bool(
         own_ip_for_election and dest_ip
-        and ip_gt(own_ip_for_election, dest_ip)
+        and IPRange(own_ip_for_election) > IPRange(dest_ip)
     )
 
     # Synchronised barrier: wait for the agreed punch_time so both

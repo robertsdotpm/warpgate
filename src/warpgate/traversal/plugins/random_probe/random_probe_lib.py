@@ -1311,13 +1311,13 @@ def sync_run_bidirectional_spray(
     # mixing a NAT'd and non-NAT'd peer needs own_ext_ip to be
     # populated.
     own_ip_for_election = normalize_ip6(own_ext_ip) if own_ext_ip else normalize_ip6(bind_ip)
-    # ip_gt for NUMERIC IP comparison.  The raw `>` string compare
-    # previously mis-elected whenever one peer's IP lex-sorts above
-    # the other's but is numerically smaller -- both sides thought
-    # they were master and the role-election broke symmetry.
-    # See ip_gt docstring in aionetiface.net.net_utils.
-    from aionetiface import ip_gt
-    is_master = ip_gt(own_ip_for_election, peer_ext_ip)
+    # IPRange comparison for NUMERIC IP semantics.  The raw `>`
+    # string compare previously mis-elected whenever one peer's IP
+    # lex-sorts above the other's but is numerically smaller --
+    # both sides thought they were master and the role-election
+    # broke symmetry.
+    from aionetiface import IPRange
+    is_master = IPRange(own_ip_for_election) > IPRange(peer_ext_ip)
 
     src_ports = random_probe_ports(probe_count, rng=rng)
     dst_ports = random_probe_ports(probe_count, rng=rng)
