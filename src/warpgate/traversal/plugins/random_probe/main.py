@@ -42,7 +42,7 @@ from aionetiface.net.selector_proxy import selector_proxy
 from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
 
 from .random_probe_defs import (
-    DEFAULT_PROBE_COUNT,
+    RANDOM_PROBE_DEFAULT_COUNT,
     PROBE_LISTEN_TIMEOUT,
 )
 from .random_probe_engine import sync_run_bidirectional_spray
@@ -238,7 +238,7 @@ class RandomProbePlugin(Plugin):
         # wire-advertised ext_ip -- that introduced an asymmetry
         # between what each side compared in the election.
         peer_known_port = reply.payload.known_port
-        probe_count = reply.payload.probe_count or DEFAULT_PROBE_COUNT
+        probe_count = reply.payload.probe_count or RANDOM_PROBE_DEFAULT_COUNT
         punch_time = reply.payload.punch_time
 
         # If the peer addr is a v6 link-local IP (fe80::...), bake OUR
@@ -722,7 +722,7 @@ class RandomProbePlugin(Plugin):
                 "magic": magic,
                 "ext_ip": str(ext_ip),
                 "known_port": self.our_known_port(),
-                "probe_count": DEFAULT_PROBE_COUNT,
+                "probe_count": RANDOM_PROBE_DEFAULT_COUNT,
             },
         })
 

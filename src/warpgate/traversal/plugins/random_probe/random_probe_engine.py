@@ -51,7 +51,7 @@ from aionetiface.net.address import resolve_dest_tup
 from aionetiface.utility.error_logger import log
 
 from .random_probe_defs import (
-    DEFAULT_PROBE_COUNT,
+    RANDOM_PROBE_DEFAULT_COUNT,
     PROBE_IDX_CONFIRM,
     PROBE_LISTEN_TIMEOUT,
     ROLE_SYM,
@@ -70,7 +70,7 @@ def sync_run_bidirectional_spray(
     bind_ip,
     peer_ext_ip,
     nonce,
-    probe_count=DEFAULT_PROBE_COUNT,
+    probe_count=RANDOM_PROBE_DEFAULT_COUNT,
     listen_timeout=PROBE_LISTEN_TIMEOUT,
     rng=None,
     interface=None,

@@ -31,12 +31,11 @@ if not hasattr(futures, "_chain_future"):
         source.add_done_callback(on_done)
     futures._chain_future = chain_future_35
 
-vmaj, vmin, _ = platform.python_version_tuple()
-SUPPORTS_TOP_LEVEL_AWAIT = int(vmaj) >= 3 and int(vmin) >= 8
-SUPPORTS_INTERACT_EXITMSG = int(vmaj) >= 3 and int(vmin) >= 6
-
 from . import __version__ as warpgatev  # noqa: E402
 from aionetiface import fstr, aionetiface_setup_event_loop  # noqa: E402
+from aionetiface.utility.utils import (  # noqa: E402
+    SUPPORTS_INTERACT_EXITMSG, SUPPORTS_TOP_LEVEL_AWAIT, vmaj, vmin,
+)
 
 
 class AsyncIOInteractiveConsole(code.InteractiveConsole):

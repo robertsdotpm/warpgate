@@ -57,7 +57,10 @@ IS_WINDOWS = sys.platform == "win32"
 
 # Wire-format msg_type byte for the only class we emit and accept on
 # random_probe: STUN Binding Request (Binding | Request | 0x3fff mask).
-RANDOM_PROBE_WIRE_TYPE = b"\x00\x01"
+# Aliased to STUNMsgTypes.Binding so the same single constant feeds
+# both random_probe and udp_punch's BINDING_REQUEST_WIRE_TYPE.
+from aionetiface.protocol.stun.stun_defs import STUNMsgTypes
+RANDOM_PROBE_WIRE_TYPE = STUNMsgTypes.Binding  # b"\x00\x01"
 
 # Layout offsets inside the 12-byte STUN Transaction ID.
 TXID_NONCE_LEN = 9

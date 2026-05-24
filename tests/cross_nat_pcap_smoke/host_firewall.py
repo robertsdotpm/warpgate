@@ -45,27 +45,10 @@ def sudo_argv(argv):
     return ["sudo"] + list(argv)
 
 
-def is_linux():
-    return sys.platform.startswith("linux")
-
-
-def is_darwin():
-    return sys.platform.startswith("darwin")
-
-
-def is_bsd():
-    # FreeBSD / GhostBSD / OpenBSD / NetBSD / DragonFly.
-    return (
-        sys.platform.startswith("freebsd")
-        or sys.platform.startswith("openbsd")
-        or sys.platform.startswith("netbsd")
-        or sys.platform.startswith("dragonfly")
-        or "bsd" in sys.platform
-    )
-
-
-def is_windows():
-    return sys.platform.startswith("win")
+# Platform predicates live in aionetiface (single source of truth).
+from aionetiface.net.pcap.ip.next_hop import (  # noqa: F401, E402
+    is_bsd, is_darwin, is_linux, is_windows,
+)
 
 
 def run_cmd(argv, stdin_data=None):

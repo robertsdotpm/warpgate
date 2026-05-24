@@ -33,8 +33,13 @@ from ..traversal.plugins.direct_connect.con_id_frame import CON_ID_PREFIX
 # application's first recv() (seen as echo_msg=b'WG-LIVENESS-PONG:...'
 # in failing macOS / Win10 runs).  Future-based delivery sidesteps the
 # queue entirely.
-WG_LIVENESS_PING_PREFIX = b"WG-LIVENESS-PING:"
-WG_LIVENESS_PONG_PREFIX = b"WG-LIVENESS-PONG:"
+# Single source of truth lives in aionetiface.net.pipe.pipe_events
+# (the pipe layer needs the literal to strip these control frames
+# from the application stream).  Re-import here so node_protocol's
+# encoders / decoders keep working without redefining the bytes.
+from aionetiface.net.pipe.pipe_events import (  # noqa: E402
+    WG_LIVENESS_PING_PREFIX, WG_LIVENESS_PONG_PREFIX,
+)
 
 
 def register_liveness_pong_future(pipe, nonce, fut):

@@ -11,8 +11,9 @@ TURN_MAX_DICT_LEN = 1000
 TURN_MAX_RECV_PACKETS = 100
 
 #########################################################
-TURN_MAGIC_COOKIE = b"\x21\x12\xa4\x42"
-TURN_MAGIC_XOR = b"\x00\x00\x21\x12\x21\x12\xa4\x42"
+# RFC 5389 magic cookie + XOR template live in aionetiface
+# (STUN_MAGIC_COOKIE / STUN_MAGIC_XOR in stun_defs.py).  Local
+# redefinitions were dead code; import from stun_defs if needed.
 TURN_CHANNEL = b"\x40\x02\x00\x00"
 TURN_PROTOCOL_TCP = b"\x06\x00\x00\x00"
 TURN_PROTOCOL_UDP = b"\x11\x00\x00\x00"

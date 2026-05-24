@@ -87,11 +87,13 @@ UDP_PUNCH_PARAMS["max_sleep"] = derive_max_sleep(
 
 # Wire-format msg_type bytes for the two classes we accept.  Derived
 # from STUNMsgTypes.Binding OR'd with STUNMsgCodes.{Request,SuccessResp}
-# and AND-masked to 0x3fff (RFC 5389 §6 message-type encoding).
-# Hardcoded so parse_frame's hot path doesn't reconstruct them on every
-# datagram; comment shows the derivation for anyone auditing.
-BINDING_REQUEST_WIRE_TYPE = b"\x00\x01"   # Binding | Request
-BINDING_SUCCESS_WIRE_TYPE = b"\x01\x01"   # Binding | SuccessResp
+# and AND-masked to 0x3fff (RFC 5389 §6 message-type encoding).  We
+# reuse STUNMsgTypes.Binding directly for the request shape (single
+# source of truth shared with random_probe); the success-response
+# shape stays inline because it has no central constant.
+from aionetiface.protocol.stun.stun_defs import STUNMsgTypes
+BINDING_REQUEST_WIRE_TYPE = STUNMsgTypes.Binding  # b"\x00\x01"
+BINDING_SUCCESS_WIRE_TYPE = b"\x01\x01"           # Binding | SuccessResp
 
 
 def build_frame(kind, nonce, peer_addr=None):

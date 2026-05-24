@@ -312,7 +312,7 @@ mode,
     # If we're port restricted then set our reply port to the STUN port.
     if our_nat["type"] in PREDICTABLE_NATS:
         # Calculate reply port.
-        our_reply = 3478 if our_nat["type"] == RESTRICT_PORT_NAT else 0
+        our_reply = STUN_PORT if our_nat["type"] == RESTRICT_PORT_NAT else 0
         # TODO: Could connect to STUN port in their range.
 
         # Return results.

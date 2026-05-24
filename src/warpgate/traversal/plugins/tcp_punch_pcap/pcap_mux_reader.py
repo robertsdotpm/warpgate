@@ -66,11 +66,10 @@ except ImportError:
         return template.format(*args)
 
 
-# DLT constants -- repeat here so we don't import from anywhere private.
-DLT_NULL = 0
-DLT_EN10MB = 1
-DLT_RAW = 12
-DLT_LOOP = 108
+# DLT constants live in aionetiface.net.pcap.os.libpcap_core (public).
+from aionetiface.net.pcap.os.libpcap_core import (
+    DLT_EN10MB, DLT_LOOP, DLT_NULL, DLT_RAW,
+)
 
 
 class MuxSubscriber(object):

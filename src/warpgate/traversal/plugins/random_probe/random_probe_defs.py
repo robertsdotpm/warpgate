@@ -34,7 +34,7 @@ PROBE_LEN = 20
 # pin it harder (router-side tcpdump would have); 256 is empirically
 # sufficient and the math doesn't need 512 -- bidirectional miss rate
 # at N=256 is already ~2%.
-DEFAULT_PROBE_COUNT = 256
+RANDOM_PROBE_DEFAULT_COUNT = 256
 
 # Lowest destination port we'll fire at / bind from.  Below 1024 is
 # privileged on POSIX and below 32 768 is in many OSes' static-service
