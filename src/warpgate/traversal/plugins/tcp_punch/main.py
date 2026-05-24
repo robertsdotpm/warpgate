@@ -297,10 +297,12 @@ class PunchPlugin(Plugin):
         # EXT_BIND elects on the peer-visible ext IP (the bind IP is
         # LAN-side and not symmetric across NAT); NIC_BIND elects on
         # the LAN bind IP (same-LAN, both peers see each other's).
+        # Fall back to src_ip when "ext" is missing -- OPEN_INTERNET /
+        # loopback / pre-classify src_map entries may not carry it.
         if self.route_type == NIC_BIND:
             decider_ip = self.src["ip"]
         else:
-            decider_ip = self.src["ext"]
+            decider_ip = self.src.get("ext") or self.src["ip"]
 
         # Create and configure the PunchClient.
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time

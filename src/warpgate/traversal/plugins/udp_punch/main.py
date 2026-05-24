@@ -248,7 +248,12 @@ class UdpPunchPlugin(Plugin):
         # EXT_BIND elects on peer-visible ext IP (bind IP is LAN-side
         # and not symmetric across NAT); NIC_BIND elects on the LAN
         # bind IP.  See tcp_punch/main.py for the full writeup.
-        decider_ip = self.src["ext"] if self.route_type == EXT_BIND else src_ip
+        # Fall back to src_ip when "ext" is missing -- OPEN_INTERNET /
+        # loopback / pre-classify src_map entries may not carry it.
+        if self.route_type == EXT_BIND:
+            decider_ip = self.src.get("ext") or src_ip
+        else:
+            decider_ip = src_ip
 
         puncher = PunchClient(
             dest_ip,
