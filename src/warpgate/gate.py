@@ -150,6 +150,18 @@ class Gate(object):
         # constants; both forms normalise to the aionetiface IP4 / IP6
         # constants for consistent validation against nic.supported().
         self.afs = self.normalise_afs(afs) if afs is not None else None
+        # ntp_addr: custom NTP server ("host" or "host:port"); None uses the pool default.
+        self.ntp_addr = ntp_addr
+        self.node_kwargs = {
+            "ifs": ifs,
+            "ip": ip,
+            "port": port,
+            "stop_rw": stop_rw,
+            "conf": conf,
+        }
+        self.sys_clock = sys_clock
+        self.node = None
+        self.closed = asyncio.Event()
 
     @staticmethod
     def normalise_afs(afs):
@@ -175,18 +187,6 @@ class Gate(object):
                 seen.add(a)
                 deduped.append(a)
         return tuple(deduped)
-        # ntp_addr: custom NTP server ("host" or "host:port"); None uses the pool default.
-        self.ntp_addr = ntp_addr
-        self.node_kwargs = {
-            "ifs": ifs,
-            "ip": ip,
-            "port": port,
-            "stop_rw": stop_rw,
-            "conf": conf,
-        }
-        self.sys_clock = sys_clock
-        self.node = None
-        self.closed = asyncio.Event()
 
     def add_msg_cb(self, cb):
         """Register a per-message callback before listen() is called.
