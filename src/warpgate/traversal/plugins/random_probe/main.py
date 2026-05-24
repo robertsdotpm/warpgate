@@ -313,13 +313,18 @@ class RandomProbePlugin(Plugin):
                 self.result.set_result(None)
             return
         bind_ip = self.src["ip"]
-        # Master/slave election uses the wire-advertised "address each
-        # side identifies itself by" (my_addr_ip / peer_addr_ip):
-        # for NIC_BIND that's the NIC IP, for EXT_BIND it's the
-        # externally-observable IP. Both peers see the same pair of
-        # strings, so own_ext_ip > peer_ext_ip is symmetric-decidable
-        # without coordination.
-        own_ext_ip = self.my_addr_ip or bind_ip
+        # Master/slave election: use src["ext"] on EXT_BIND, src_ip on
+        # NIC_BIND -- same pattern udp_punch's decider_ip uses (see
+        # udp_punch/main.py:248-256).  bind_ip is the LAN-side address
+        # not symmetric across NAT; the NIC IP returned by
+        # nic.route().ext() can degenerate to the LAN IP when no STUN
+        # cache exists for that NIC; both produce NIC-vs-ext asymmetry
+        # that lets both peers elect SLAVE.  src["ext"] is the
+        # peer-visible address resolve_pair / src_map populated.
+        if self.route_type == EXT_BIND:
+            own_ext_ip = self.src.get("ext") or bind_ip
+        else:
+            own_ext_ip = bind_ip
 
 
         # Algorithm phase runs in a thread executor with PURE
