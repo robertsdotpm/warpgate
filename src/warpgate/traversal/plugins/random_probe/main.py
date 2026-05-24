@@ -559,21 +559,6 @@ class RandomProbePlugin(Plugin):
                     return
                 log("[RP-WORKER] connect OK")
 
-                # Canary sanity probe: send a small marker datagram immediately
-                # post-connect. The peer's bridge_worker should see this as
-                # [BRIDGE-COPY] read N bytes from P; this cleanly isolates
-                # "punched sock pair works" from "bridge plumbing works".
-                # Marker bytes are RPCV (4) + nonce[:4] (4) = 8 bytes total --
-                # short enough not to be confused with WG-LIVENESS-PING.
-                try:
-                    canary_payload = b"RPCV" + bytes(nonce_ref[:4])
-                    punched_sock_ref.send(canary_payload)
-                    log("[RP-WORKER] canary sent {0} bytes head={1}".format(
-                        len(canary_payload), canary_payload,
-                    ))
-                except OSError as exc:
-                    log("[RP-WORKER] canary send FAILED " + repr(exc))
-
                 # Skip the post-connect stale drain entirely.  random_probe's
                 # SLAVE side enters bridge_worker noticeably later than MASTER
                 # (slave waits for CONFIRM, master commits on first PROBE) --
