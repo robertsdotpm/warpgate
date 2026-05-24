@@ -996,7 +996,24 @@ class UdpPunchPlugin(Plugin):
             ))
 
             if not self.result.done():
-                self.result.set_result(pipe if converged else None)
+                # Hand the caller the PipeEvents, not the outer Pipe
+                # wrapper.  verify_pipe_alive's liveness PING/PONG
+                # registration stores futures on the object it gets;
+                # inbound msg_cb dispatch fires on PipeEvents (the
+                # data-bearing layer), so the two sides MUST agree on
+                # which object holds liveness_pong_futures.
+                # tcp_punch already returns PipeEvents (via
+                # reverse_server.accept()); udp_punch was returning
+                # the outer Pipe, so verify registered on Pipe but
+                # PONG arrived at PipeEvents -- the future never
+                # resolved and verify_pipe_alive timed out 100% of
+                # cross-NAT punches.  pipe.pipe_events exposes the
+                # same .send() surface, so the downstream contract
+                # is unchanged.
+                returned_pipe = pipe.pipe_events if (
+                    converged and getattr(pipe, "pipe_events", None) is not None
+                ) else (pipe if converged else None)
+                self.result.set_result(returned_pipe)
         except asyncio.CancelledError:
             if not self.result.done():
                 self.result.set_result(None)
