@@ -264,7 +264,12 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
     if not established:
         return None
 
-    is_master = src_ip > dest_ip
+    # Use ip_gt for NUMERIC IP comparison; the raw `>` string compare
+    # mis-elects when one peer's first octet lex-sorts above the
+    # other's but is numerically smaller.  See ip_gt docstring in
+    # aionetiface.net.net_utils.
+    from aionetiface import ip_gt
+    is_master = ip_gt(src_ip, dest_ip)
     role = "master" if is_master else "slave"
     sorted_conns = sorted(established, key=sort_key_ft)
     log("tcp_punch_pcap: canonical-winner handshake role={0} "

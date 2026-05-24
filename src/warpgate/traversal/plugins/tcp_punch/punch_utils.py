@@ -209,9 +209,15 @@ def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None, sentinel_wait=None
     if not sock_list:
         return None
 
-    # Master side closes all others immediately
+    # Master side closes all others immediately.  Use ip_gt for
+    # NUMERIC comparison -- the old `our_ip > their_ip` was a
+    # string compare, which mis-elects when one peer's IP lex-sorts
+    # higher than the other's but is numerically smaller (a peer
+    # with a single-digit first octet vs a peer with a three-digit
+    # first octet).  See ip_gt docstring.
+    from aionetiface import ip_gt
     our_ip = our_ip or sock_list[0].getsockname()[0]
-    if our_ip > their_ip:
+    if ip_gt(our_ip, their_ip):
         sorted_socks = sorted(sock_list, key=peer_symmetric_4tuple_key)
         winner = sorted_socks[-1]
         losers = [s for s in sorted_socks if s is not winner]
