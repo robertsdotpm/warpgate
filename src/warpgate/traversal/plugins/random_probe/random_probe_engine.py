@@ -128,9 +128,22 @@ def sync_run_bidirectional_spray(
     # running the old asymmetric algorithm (they look for ROLE_SYM
     # and will treat us as the sym peer they expect).  The receive
     # side accepts any role so long as the nonce matches.
+    #
+    # Rate-governor: cap egress at PROBE_RATE_PPS pps (~10 ms apart).
+    # An unrate-limited spray of probe_count sockets * 1 probe each
+    # fires the whole burst in milliseconds.  Consumer routers and
+    # mobile carriers commonly trigger a port-scan heuristic at
+    # ~150 distinct dst-tuples and then drop inbound from the source
+    # for ~30 seconds.  That explains the symptom where verify_pipe_alive
+    # PING/PONG (right after the spray, before the heuristic fully
+    # kicks in) succeeds but the gate-echo round-trip 5 s later fails.
+    # The matching sync paths in the old random_probe_lib.py shipped
+    # the same governor; restoring it here closes the gap.
+    PROBE_RATE_PPS = 100
+    INTER_PROBE_S = 1.0 / PROBE_RATE_PPS
     probes_sent = 0
     send_failures = 0
-    for s, dp in zip(socks, dst_ports):
+    for idx, (s, dp) in enumerate(zip(socks, dst_ports)):
         try:
             s.sendto(
                 encode_probe(nonce, ROLE_SYM, probes_sent),
@@ -140,8 +153,10 @@ def sync_run_bidirectional_spray(
         except OSError:
             send_failures += 1
             continue
-    log("[RP-SPRAY] probes_sent={0} send_failures={1} dst_ports[0..4]={2}".format(
-        probes_sent, send_failures, dst_ports[:4],
+        if idx + 1 < len(socks):
+            time.sleep(INTER_PROBE_S)
+    log("[RP-SPRAY] probes_sent={0} send_failures={1} dst_ports[0..4]={2} pps={3}".format(
+        probes_sent, send_failures, dst_ports[:4], PROBE_RATE_PPS,
     ))
 
     deadline = time.time() + listen_timeout
