@@ -3,15 +3,8 @@ import time
 import random
 from aionetiface.utility.utils import log
 
-# --- NTP Constants ---
-NTP_SERVER = "pool.ntp.org"
-NTP_PORT = 123
-NTP_DELTA = 2208988800  # 70-year offset between NTP epoch (1900) and Unix epoch (1970)
-NTP_PACKET_SIZE = 48
-MAX_NTP_RETRIES = 5
-NTP_TIMEOUT = 1.0
+from .punch_defs import CONNECT_TIMEOUT, RETRY_INTERVAL
 
-# --------------------------
 # --- Time Rendezvous Constants ---
 # WINDOW must be > 2 * MAX_CLOCK_ERROR (2 * 20 = 40) to guarantee both hosts
 # select the same time bucket/boundary despite the clock offset.
@@ -69,8 +62,6 @@ PLUGIN_PIN_OFFSET_PREDICT = 3.0
 # which makes collisions across back-to-back runs in the same NTP bucket
 # significantly less likely.
 PORT_RANGE = 50000
-CONNECT_TIMEOUT = 5.0
-RETRY_INTERVAL = 0.05
 # Slack added on top of worst-case rendezvous wait (window +
 # max_clock_error) to produce the max_sleep cap.  max_sleep is the
 # upper bound on sleep_until()'s blocking wait -- it must sit above

@@ -25,19 +25,15 @@ aionetiface_setup_event_loop()
 sys.argv = [sys.argv[0]]
 
 from warpgate.gate import Gate, peer
+from warpgate.tools.sweep_utils import parse_afs as parse_afs_ints, first_msg
 
 
 def parse_afs(env_value):
-    """Parse WG_AFS env: '4' / '6' / '4,6' / unset -> None (both)."""
-    if not env_value:
+    """Parse WG_AFS to (IP4|IP6, ...) -- aionetiface constants, not ints."""
+    ints = parse_afs_ints(env_value)
+    if ints is None:
         return None
-    out = []
-    for tok in env_value.replace(" ", "").split(","):
-        if tok == "4":
-            out.append(IP4)
-        elif tok == "6":
-            out.append(IP6)
-    return tuple(out) if out else None
+    return tuple((IP4 if v == 4 else IP6) for v in ints)
 
 
 async def main():
@@ -94,11 +90,7 @@ async def main():
             async with link:
                 await link.send(b"PING:gate_sweep")
 
-                async def one():
-                    async for m in link:
-                        return m
-
-                msg = await asyncio.wait_for(one(), timeout=10.0)
+                msg = await first_msg(link, timeout=10.0)
                 ok = msg is not None and msg.startswith(b"PONG:")
 
                 if ok and hold_s > 0:

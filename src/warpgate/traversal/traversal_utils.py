@@ -23,8 +23,18 @@ def f_path_txt(x):
 # that remain are "ip" + "port" -- the resolved local-bind / peer-dial
 # pair for the chosen route_type.  Peer metadata (if_index, nat,
 # netiface_index, machine_id, pub_key_hex, …) stays.
+# Routing-decision keys that get stripped from the per-side dict
+# resolve_pair hands to plugins.  Plugins should read the resolved
+# (ip, port) and let the route layer make the binding decisions.
+#
+# NOTE: "ext" deliberately stays IN the resolved dict (i.e. not in
+# this drop set) -- the punch family's master/slave election uses
+# src["ext"] as the peer-observable identifier for the comparison.
+# It is NOT a routing decision; it is a symmetric peer ID.  Stripping
+# it caused every election to silently fall back to bind_ip and
+# could land both peers on the same role.
 RESOLVE_DROP_KEYS = (
-    "nic", "ext", "loopback",
+    "nic", "loopback",
     "nic_port", "ext_port",
     "loopback_candidates",
 )

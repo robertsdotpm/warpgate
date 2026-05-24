@@ -21,12 +21,12 @@ import json
 import os
 
 from aionetiface import IP4, PNP_SERVERS
+from aionetiface.keystore import KEYSTORE_DIR
 from ecdsa import SECP256k1, SigningKey
 
 from .utils import ainput, cout
 
 
-KEYSTORE_DIR = os.path.expanduser(os.path.join("~", "aionetiface"))
 # Files in ~/aionetiface/ that aren't keystores and must be skipped.
 KEYSTORE_DIR_BLACKLIST = {
     "servers.json",

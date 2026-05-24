@@ -22,19 +22,7 @@ aionetiface_setup_event_loop()
 sys.argv = [sys.argv[0]]
 
 from warpgate.gate import Gate, GateAfNotSupported
-
-
-def parse_afs(env_value):
-    """Parse WG_AFS env: '4' / '6' / '4,6' / unset -> None (no expectation)."""
-    if not env_value:
-        return None
-    out = []
-    for tok in env_value.replace(" ", "").split(","):
-        if tok == "4":
-            out.append(4)
-        elif tok == "6":
-            out.append(6)
-    return tuple(out) if out else None
+from warpgate.tools.sweep_utils import parse_afs
 
 
 async def handle(pipe, msg):

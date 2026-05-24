@@ -17,6 +17,7 @@ aionetiface_setup_event_loop()
 sys.argv = [sys.argv[0]]
 
 from warpgate.gate import Gate, peer
+from warpgate.tools.sweep_utils import first_msg
 
 
 async def main():
@@ -46,11 +47,7 @@ async def main():
             async with link:
                 await link.send(b"PING:" + plugin_name.encode())
 
-                async def one():
-                    async for m in link:
-                        return m
-
-                msg = await asyncio.wait_for(one(), timeout=10.0)
+                msg = await first_msg(link, timeout=10.0)
                 ok = msg is not None and msg.startswith(b"PONG:")
                 print("OUTCOME echo_ok={0} msg={1!r}".format(
                     "true" if ok else "false", msg,

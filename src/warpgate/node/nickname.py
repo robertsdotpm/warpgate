@@ -10,9 +10,9 @@ from aionetiface import (
     to_s, to_b, fstr, log, log_exception, h_to_b,
     DUEL_STACK, IP4, IP6, PNP_SERVERS, VALID_AFS,
     strip_none, async_wrap_errors, SigningKey,
+    StartNodeNicknameFailed,
 )
 import namebump
-from ..errors import StartNodeNicknameFailed
 
 
 # Timestamp envelope for PNP record values. Wraps the payload with a

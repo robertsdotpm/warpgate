@@ -45,11 +45,7 @@ import time
 from aionetiface import log, log_exception
 from .tcp_punch_utils import bind_tcp_sockets, connect_on_tcp_sockets
 from .punch_utils import choose_winning_tcp_sock
-
-# Module-level fallback defaults (used when params is None).
-# The per-call values from params dicts take precedence.
-CONNECT_TIMEOUT = 5.0
-RETRY_INTERVAL = 0.05
+from .punch_defs import CONNECT_TIMEOUT, RETRY_INTERVAL  # noqa: F401  re-exported via module namespace for params= callers
 
 
 def setup_engine(af, port_allocs, src_ip, nic_id, route=None):

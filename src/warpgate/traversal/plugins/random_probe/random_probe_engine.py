@@ -92,6 +92,8 @@ def sync_run_bidirectional_spray(
     own_ip_for_election = (
         normalize_ip6(own_ext_ip) if own_ext_ip else normalize_ip6(bind_ip)
     )
+
+
     # IPRange comparison for NUMERIC IP semantics.  Raw `>` on string
     # form mis-elects whenever one peer's IP lex-sorts above the
     # other's but is numerically smaller.

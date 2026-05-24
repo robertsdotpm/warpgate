@@ -40,26 +40,10 @@ except ImportError:
         pass
 
 
-def is_linux():
-    return sys.platform.startswith("linux")
-
-
-def is_darwin():
-    return sys.platform.startswith("darwin")
-
-
-def is_bsd():
-    return (
-        sys.platform.startswith("freebsd")
-        or sys.platform.startswith("openbsd")
-        or sys.platform.startswith("netbsd")
-        or sys.platform.startswith("dragonfly")
-        or ("bsd" in sys.platform and not sys.platform.startswith("win"))
-    )
-
-
-def is_windows():
-    return sys.platform.startswith("win")
+# Platform predicates live in aionetiface (single source of truth).
+from aionetiface.net.pcap.ip.next_hop import (  # noqa: E402
+    is_bsd, is_darwin, is_linux, is_windows,
+)
 
 
 def need_sudo():

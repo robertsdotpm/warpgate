@@ -251,7 +251,7 @@ class UdpPunchPlugin(Plugin):
         # Fall back to src_ip when "ext" is missing -- OPEN_INTERNET /
         # loopback / pre-classify src_map entries may not carry it.
         if self.route_type == EXT_BIND:
-            decider_ip = self.src.get("ext") or src_ip
+            decider_ip = self.src.get("ext")
         else:
             decider_ip = src_ip
 

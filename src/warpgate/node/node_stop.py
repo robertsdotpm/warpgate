@@ -3,8 +3,7 @@ import asyncio
 import glob
 import os
 from contextlib import suppress
-from aionetiface import log, log_exception, Daemon
-from ..errors import AlreadyClosedError
+from aionetiface import log, log_exception, Daemon, AlreadyClosedError
 
 
 def cleanup_stale_pidfiles(install_path):

@@ -5,15 +5,18 @@ import struct
 import selectors
 import asyncio
 from aionetiface import IPRange, fstr, log, SysClock
-from .punch_defs import PUNCH_END, TCP_PUNCH_REMOTE, TCP_PUNCH_SELF, TCP_PUNCH_LAN
-
-# --- NTP Constants ---
-NTP_SERVER = "pool.ntp.org"
-NTP_PORT = 123
-NTP_DELTA = 2208988800  # 70-year offset between NTP epoch (1900) and Unix epoch (1970)
-NTP_PACKET_SIZE = 48
-MAX_NTP_RETRIES = 5
-NTP_TIMEOUT = 1.0
+from .punch_defs import (
+    MAX_NTP_RETRIES,
+    NTP_DELTA,
+    NTP_PACKET_SIZE,
+    NTP_PORT,
+    NTP_SERVER,
+    NTP_TIMEOUT,
+    PUNCH_END,
+    TCP_PUNCH_LAN,
+    TCP_PUNCH_REMOTE,
+    TCP_PUNCH_SELF,
+)
 
 
 def timestamp_from_ntp(

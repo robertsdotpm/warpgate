@@ -11,13 +11,9 @@ from aionetiface import (
     RANDOM_DELTA, PREDICTABLE_NATS,
 )
 
-MAX_PREDICT_NO = 100
+from .punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE, TCP_PUNCH_SELF
 
-# Duplicate defs
-# TODO: should this module be moved into nat lib? probably.
-TCP_PUNCH_LAN = 1
-TCP_PUNCH_REMOTE = 2
-TCP_PUNCH_SELF = 3
+MAX_PREDICT_NO = 100
 
 
 class NATMapping:

@@ -14,15 +14,6 @@ from aionetiface import (
 )
 from .proto_defs import P2P_DIRECT
 
-# Backwards compat: a couple of legacy callers still reference these
-# from this module. Defining them here as plain ints means we don't
-# break the import while the migration to plugin-owned proto.py
-# completes. Once those callers are updated to import from the
-# tcp_punch.proto module these can be deleted.
-TCP_PUNCH_LAN = 1
-TCP_PUNCH_REMOTE = 2
-TCP_PUNCH_SELF = 3
-
 
 class ProtoMsg:
     """Base class for all P2P traversal protocol messages."""

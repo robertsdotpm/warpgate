@@ -5,10 +5,14 @@ import os
 if __name__ != "__main__":
     os.environ["PYTHONIOENCODING"] = "utf-8"
     from aionetiface import *  # noqa: F401, F403  # pylint: disable=wildcard-import,unused-wildcard-import
-    from .errors import *  # noqa: F401, F403  # pylint: disable=wildcard-import,unused-wildcard-import
+    # warpgate.errors removed: every exception class previously defined
+    # here also lives in aionetiface.errors and is already re-exported
+    # by the `from aionetiface import *` line above.  Importers should
+    # do `from aionetiface import StartNodeNicknameFailed` etc.
     from .traversal.plugins.upnp.main import port_forward  # noqa: F401  # pylint: disable=unused-import
     from .traversal.plugins.turn.turn_client import TURNClient  # noqa: F401  # pylint: disable=unused-import
-    from .protocol.echo.echo_server import *  # noqa: F401, F403  # pylint: disable=wildcard-import,unused-wildcard-import
+    # warpgate.protocol.echo.echo_server removed: aionetiface's
+    # do_imports.py already re-exports EchoServer through the wildcard above.
     from .node.node import Node, NODE_CONF, NODE_PORT, get_warpgate_install_root  # noqa: F401  # pylint: disable=unused-import
     from .node.node_defs import make_stop_pipe  # noqa: F401  # pylint: disable=unused-import
     from .node.node_utils import get_pp_executors, load_signing_key, load_stun_clients  # noqa: F401  # pylint: disable=unused-import

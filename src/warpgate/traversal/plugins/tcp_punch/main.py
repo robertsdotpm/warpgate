@@ -302,7 +302,7 @@ class PunchPlugin(Plugin):
         if self.route_type == NIC_BIND:
             decider_ip = self.src["ip"]
         else:
-            decider_ip = self.src.get("ext") or self.src["ip"]
+            decider_ip = self.src.get("ext")
 
         # Create and configure the PunchClient.
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time

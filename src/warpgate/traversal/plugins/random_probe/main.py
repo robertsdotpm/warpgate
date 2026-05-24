@@ -139,13 +139,10 @@ class RandomProbePlugin(Plugin):
         # For NIC_BIND / same_machine the bind IP is also the peer-
         # observable IP, so src["ip"] is correct.
         self.peer_addr_ip = str(self.dest.get("ip") or "")
-        if self.route_type == NIC_BIND or self.same_machine:
-            self.my_addr_ip = str(self.src.get("ip") or "")
+        if self.route_type == NIC_BIND:
+            self.my_addr_ip = self.src.get("ip")
         else:
-            try:
-                self.my_addr_ip = str(self.nic.route(self.af).ext())
-            except (AttributeError, OSError, ValueError):
-                self.my_addr_ip = str(self.src.get("ip") or "")
+           self.my_addr_ip = self.src.get("ext")
 
         # Role assignment by NAT restrictiveness, then by IP:
         #   1. Whichever side has the *higher* NAT type number plays
@@ -234,32 +231,28 @@ class RandomProbePlugin(Plugin):
                 self.result.set_result(None)
             return
 
-        # Trust the peer's advertised addr if it's a usable string;
-        # otherwise fall back to whatever we computed locally for
-        # peer_addr_ip (NIC if same_machine, ext otherwise).  This
-        # matters because the responder side may have computed its
-        # own ext from a fresher set of fields than the initiator
-        # parsed out of the on-wire addr_bytes.
-        peer_addr_ip = reply.payload.ext_ip or self.peer_addr_ip
+        # We use self.peer_addr_ip = self.dest["ip"] (set in the
+        # initial run() block).  Don't override from the peer's
+        # wire-advertised ext_ip -- that introduced an asymmetry
+        # between what each side compared in the election.
         peer_known_port = reply.payload.known_port
         probe_count = reply.payload.probe_count or DEFAULT_PROBE_COUNT
         punch_time = reply.payload.punch_time
 
-        # If the peer advertised a v6 link-local IP (fe80::...), bake
-        # OUR local scope_id into it so resolve_dest_tup downstream
-        # produces the (host, port, flowinfo, scope_id) 4-tuple Windows
-        # needs to actually send to the right interface. Same fix
-        # applied to tcp_punch (commits 10f4977 + 87148ae) and
-        # udp_punch -- without it Windows sendto silently lands on the
-        # OS-default NIC and the probes never reach the peer. Use
-        # get_nic_id(af) so XP's split TCPIP/TCPIP6 ifindex spaces
-        # are handled correctly.
-        if peer_addr_ip and peer_addr_ip.lower().startswith("fe80"):
+        # If the peer addr is a v6 link-local IP (fe80::...), bake OUR
+        # local scope_id into it so resolve_dest_tup downstream produces
+        # the (host, port, flowinfo, scope_id) 4-tuple Windows needs to
+        # actually send to the right interface.  Same fix applied to
+        # tcp_punch (commits 10f4977 + 87148ae) and udp_punch -- without
+        # it Windows sendto silently lands on the OS-default NIC and
+        # the probes never reach the peer.  get_nic_id(af) handles XP's
+        # split TCPIP / TCPIP6 ifindex spaces correctly.
+        if self.peer_addr_ip and self.peer_addr_ip.lower().startswith("fe80"):
             try:
                 from aionetiface.net.bind.bind_utils import ip6_patch_bind_ip
                 v6_scope = self.nic.get_nic_id(self.af)
-                peer_addr_ip = ip6_patch_bind_ip(
-                    peer_addr_ip.split("%", 1)[0], v6_scope,
+                self.peer_addr_ip = ip6_patch_bind_ip(
+                    self.peer_addr_ip.split("%", 1)[0], v6_scope,
                 )
             except (ImportError, AttributeError, OSError):
                 pass
@@ -311,6 +304,8 @@ class RandomProbePlugin(Plugin):
                 self.result.set_result(None)
             return
         bind_ip = self.src["ip"]
+
+
         # Master/slave election: use src["ext"] on EXT_BIND, src_ip on
         # NIC_BIND -- same pattern udp_punch's decider_ip uses (see
         # udp_punch/main.py:248-256).  bind_ip is the LAN-side address
@@ -320,7 +315,7 @@ class RandomProbePlugin(Plugin):
         # that lets both peers elect SLAVE.  src["ext"] is the
         # peer-visible address resolve_pair / src_map populated.
         if self.route_type == EXT_BIND:
-            own_ext_ip = self.src.get("ext") or bind_ip
+            own_ext_ip = self.src.get("ext")
         else:
             own_ext_ip = bind_ip
 
@@ -353,7 +348,7 @@ class RandomProbePlugin(Plugin):
             None,
             lambda: sync_run_bidirectional_spray(
                 bind_ip=bind_ip,
-                peer_ext_ip=peer_addr_ip,
+                peer_ext_ip=self.peer_addr_ip,
                 nonce=nonce,
                 probe_count=probe_count,
                 listen_timeout=PROBE_LISTEN_TIMEOUT,

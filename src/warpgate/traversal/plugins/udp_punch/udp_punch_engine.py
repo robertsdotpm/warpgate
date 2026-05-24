@@ -55,7 +55,7 @@ PUNCH_RECV_BUFLEN = UDP_PUNCH_MAX_FRAME_LEN
 # Module-level fallbacks. Per-call params dicts override these.
 SPRAY_DURATION = 5.0
 LISTEN_DURATION = 6.0
-RETRY_INTERVAL = 0.05
+from ..tcp_punch.punch_defs import RETRY_INTERVAL  # noqa: E402 reuse tcp_punch's value
 # Aggressive 50 Hz (0.02s) sprayed 17 sockets * 50 * 3s = 2550 packets total,
 # triggering router UDP-burst caps on the inbound side -- wire capture showed
 # master sending 2437 Out and slave receiving 17 (~0.7% delivery).  Drop to
