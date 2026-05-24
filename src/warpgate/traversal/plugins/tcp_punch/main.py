@@ -294,29 +294,10 @@ class PunchPlugin(Plugin):
             log("PunchPlugin: dest matches own bind IP ({0}); aborting".format(dest_ip))
             return None, None
 
-        # Master/slave role election needs a peer-symmetric quantity:
-        # both peers must compare the SAME two IPs from opposite ends.
-        #
-        # NIC_BIND: both peers are on the same LAN segment, so their
-        # bind IPs are mutually visible -- src_ip is the right input.
-        # The kernel-routed connect lands on a matching peer src and
-        # the pair (our_lan, their_lan) is the same value from either
-        # side's perspective.
-        #
-        # EXT_BIND: the local bind IP is the LAN-side address (we can
-        # only bind to a local NIC IP), but the OTHER side is dialing
-        # our external/NAT'd address.  Using src_ip means the listener
-        # compares (its LAN ip, peer WAN ip) while the connector
-        # compares (its WAN ip, listener WAN ip) -- ASYMMETRIC -- so
-        # both can end up self-electing as master.  The right input is
-        # the external IP that the peer actually observes; self.src
-        # ["ext"] holds it (populated by parse_node_addr from the
-        # addr_buf field 2).  Falls back to src_ip when ext isn't
-        # available (loopback / pre-classify edge cases).
-        if self.route_type == EXT_BIND:
-            decider_ip = self.src.get("ext") or src_ip
-        else:
-            decider_ip = src_ip
+        # EXT_BIND elects on the peer-visible ext IP (the bind IP is
+        # LAN-side and not symmetric across NAT); NIC_BIND elects on
+        # the LAN bind IP (same-LAN, both peers see each other's).
+        decider_ip = self.src["ext"] if self.route_type == EXT_BIND else src_ip
 
         # Create and configure the PunchClient.
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time
