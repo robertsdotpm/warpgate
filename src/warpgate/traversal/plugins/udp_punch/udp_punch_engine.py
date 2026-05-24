@@ -430,6 +430,7 @@ def udp_punch_engine(
     params=None,
     stop_reader=None,
     route=None,
+    decider_ip=None,
 ):
     """Drive a full UDP punch: bind, barrier-sleep, fire, watch, return winner.
 
@@ -460,33 +461,16 @@ def udp_punch_engine(
         log("udp_punch_engine: NO sockets bound; aborting")
         return None
 
-    # Master/slave election by external-IP comparison.  Same trick
-    # tcp_punch's choose_winning_tcp_sock uses (`our_ip > their_ip`).
-    # Master locks on first PROBE/CONFIRM arrival and signals via a
-    # 5x CONFIRM burst from that socket; slave waits for the master's
-    # CONFIRM to commit.  Without the election, multi-socket cases
-    # (boundary + STUN-derived ports) raced on first-arrival and ended
-    # up with mismatched winner sockets on each side -- caller's
-    # selector_proxy then sent into a closed peer port and ECONNREFUSED
-    # killed the bridge.  External IP (route.ext()) is what the peer
-    # actually observes and is the only quantity that gives a
-    # symmetric-decidable answer when one side is behind NAT.  Falls
-    # back to src_ip when route.ext() is unavailable -- works for
-    # public-public pairs (where src_ip == ext_ip) but degrades to a
-    # coin flip when one side is NAT'd.
-    own_ip_for_election = None
-    if route is not None:
-        try:
-            own_ip_for_election = str(route.ext())
-        except (AttributeError, OSError, ValueError):
-            own_ip_for_election = None
-    if not own_ip_for_election:
-        own_ip_for_election = src_ip
-    # IPRange comparison for NUMERIC IP semantics.  The raw
-    # `str(...) > str(...)` lex-comparison previously mis-elected
-    # whenever one peer's IP lex-sorts above the other's but is
-    # numerically smaller -- both sides thought they were master
-    # and the role-election broke symmetry.
+    # Master/slave election: same `our_ip > their_ip` trick tcp_punch
+    # uses.  Caller (udp_punch/main.py) computes decider_ip with the
+    # route-type branch (ext for EXT_BIND, src for NIC_BIND) so both
+    # peers compare the same peer-symmetric quantity.  Engine no
+    # longer runs its own route.ext()-always heuristic which was
+    # wrong for NIC_BIND peers behind a shared NAT (both peers' ext
+    # was identical → equality → both went slave → deadlock).
+    # Falls back to src_ip if the caller didn't pass decider_ip
+    # (legacy callers / standalone CLI).
+    own_ip_for_election = decider_ip or src_ip
     from aionetiface import IPRange
     is_master = bool(
         own_ip_for_election and dest_ip

@@ -245,11 +245,10 @@ class UdpPunchPlugin(Plugin):
         # already-resolved src_ip.
         route = await self.bind()
 
-        # Master/slave role selection works fine off the local bind IP
-        # for both NIC_BIND and EXT_BIND -- both peers see the same
-        # (src_ip, dest_ip) pair from opposite ends and pick the same
-        # role deterministically.
-        decider_ip = src_ip
+        # EXT_BIND elects on peer-visible ext IP (bind IP is LAN-side
+        # and not symmetric across NAT); NIC_BIND elects on the LAN
+        # bind IP.  See tcp_punch/main.py for the full writeup.
+        decider_ip = self.src["ext"] if self.route_type == EXT_BIND else src_ip
 
         puncher = PunchClient(
             dest_ip,
@@ -729,11 +728,15 @@ class UdpPunchPlugin(Plugin):
                          f_sleep_until, our_ip, same_machine, params,
                          route=None):
                 # Adapter: PunchClient.run_engine calls f_engine with
-                # the tcp_punch signature (our_ip + route).  We close
-                # over the UDP-specific extras (nonce, stop_reader) and
-                # ignore our_ip.  Prefer the route the client passes;
-                # fall back to the closed-over puncher_route.
-                del our_ip
+                # the tcp_punch signature (our_ip + route).  our_ip is
+                # the decider IP main.py computed -- pass it through to
+                # the engine so master/slave election sees the right
+                # peer-symmetric quantity (ext for EXT_BIND, src for
+                # NIC_BIND) rather than the engine running its own
+                # always-route.ext() heuristic which is wrong for
+                # NIC_BIND peers behind a shared NAT.  Prefer the
+                # route the client passes; fall back to the closed-
+                # over puncher_route.
                 return udp_punch_engine(
                     af=af,
                     nic_id=nic_id,
@@ -746,6 +749,7 @@ class UdpPunchPlugin(Plugin):
                     params=params,
                     stop_reader=stop_reader,
                     route=route if route is not None else puncher_route,
+                    decider_ip=our_ip,
                 )
 
             def punch_and_bridge():
