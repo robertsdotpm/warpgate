@@ -65,6 +65,57 @@ def sock_opt_voodoo(s):
     """
 
 
+def disable_udp_connreset_on_windows(sock):
+    """Tell Winsock to NOT surface ICMP errors on a UDP socket.
+
+    Windows reflects ICMP unreachable / time-exceeded back to the
+    originating UDP socket via WSAECONNRESET (10054) on the next
+    recvfrom, and broken-socket errors via WSAEINVAL (10038) on
+    subsequent calls.  RFC 1122 says UDP MAY surface these but the
+    common Unix convention is to swallow them silently, which is
+    what we want for the punch family -- the spray ALWAYS hits
+    closed peer ports (we're predicting), so ICMP backwash is
+    normal and should not pollute recv.
+
+    SIO_UDP_CONNRESET (0x9800000C) controls this.  Setting the
+    BOOL value to FALSE tells Winsock to suppress the errors and
+    just drop the ICMP info.
+
+    Python's socket.ioctl whitelists ioctl commands and rejects
+    SIO_UDP_CONNRESET, so we call WSAIoctl via ctypes.  Best-
+    effort: any failure is logged and the socket continues with
+    legacy ICMP-surfacing behaviour (which matches XP / pre-fix
+    behaviour and only hurts modern Windows under heavy spray).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+        SIO_UDP_CONNRESET = 0x9800000C
+        WSAIoctl = ctypes.windll.ws2_32.WSAIoctl
+        bytes_returned = ctypes.wintypes.DWORD()
+        inbuf = ctypes.wintypes.BOOL(False)
+        ret = WSAIoctl(
+            sock.fileno(),
+            ctypes.c_ulong(SIO_UDP_CONNRESET),
+            ctypes.byref(inbuf),
+            ctypes.sizeof(inbuf),
+            None, 0,
+            ctypes.byref(bytes_returned),
+            None, None,
+        )
+        if ret != 0:
+            try:
+                err = ctypes.windll.ws2_32.WSAGetLastError()
+            except Exception:  # pylint: disable=broad-except
+                err = "?"
+            log("disable_udp_connreset_on_windows: WSAIoctl failed "
+                "ret={0} WSAGetLastError={1}".format(ret, err))
+    except (OSError, AttributeError, OSError):
+        log_exception()
+
+
 def bind_punch_sockets(
     af,
     nic_id,
@@ -100,6 +151,25 @@ def bind_punch_sockets(
         s = socket.socket(af, sock_type)
         sock_opt_voodoo(s)
         apply_nic_pin_sockopts(s, route)
+        # Windows-only: suppress ICMP-error surfacing on UDP sockets.
+        # The punch family sprays to many predicted ports; on Windows
+        # every ICMP unreachable / time-exceeded reply gets surfaced on
+        # the NEXT recvfrom as ConnectionResetError (WinError 10054) or
+        # marks the socket broken (WinError 10052), so the engine /
+        # bridge / selector_proxy keeps eating phantom errors instead
+        # of the real data we're waiting for.  SIO_UDP_CONNRESET=FALSE
+        # tells Winsock to silently drop the ICMP error info per RFC --
+        # matching what Linux/macOS do by default.  Best-effort; old
+        # XP Winsock doesn't support the ioctl, in which case the
+        # WSAEINVAL is swallowed and the socket runs in the legacy
+        # ICMP-surfacing mode (which is fine for XP because XP's
+        # carrier path doesn't pile up ICMP errors the way modern
+        # Windows + multi-port spray does).
+        if (
+            sock_type == socket.SOCK_DGRAM
+            and sys.platform == "win32"
+        ):
+            disable_udp_connreset_on_windows(s)
         # Bump the receive buffer so burst arrivals during executor
         # stall don't overflow the default 64 KB Windows socket buffer.
         # Applies to both DGRAM (PROBE bursts) and STREAM (SYN-ACK DATA

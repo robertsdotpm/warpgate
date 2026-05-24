@@ -227,6 +227,14 @@ def make_udp_socket(
     """
     fam = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_DGRAM)
+    # Windows: suppress ICMP-error surfacing on UDP sockets.  Without
+    # this the random spray (256 ports, most closed) generates a
+    # cascade of ICMP unreachables that Windows reflects as
+    # ConnectionResetError on every recvfrom, poisoning the bridge /
+    # selector_proxy before any real CONFIRM can arrive.  See helper
+    # docstring for the full writeup.
+    from ..tcp_punch.tcp_punch_utils import disable_udp_connreset_on_windows
+    disable_udp_connreset_on_windows(s)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     if hasattr(socket, "SO_REUSEPORT"):
         try:
