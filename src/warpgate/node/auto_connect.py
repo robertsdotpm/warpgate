@@ -114,15 +114,18 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
             time.monotonic(), nonce, id(pipe), type(pipe).__name__,
         ))
 
-    # TCP fires one PING (TCP retransmits handle datagram loss); UDP
-    # retries.  The freshly-punched-pipe warm-up race -- verify firing
-    # before the worker's selector_proxy copy loop is pumping -- is
-    # NOT handled here: start_punching_process now withholds the pipe
-    # until the bridge signals ready (its ready socketpair), so by the
-    # time verify runs the copy loop is guaranteed live.  Retrying the
-    # PING on TCP only re-introduced duplicate PONGs that leaked into
-    # the application recv queue, so it stays UDP-only.
-    attempts = retries if transport == UDP else 1
+    # Single PING for both transports.  UDP previously fired up to
+    # `retries` PINGs to compensate for datagram loss, but the
+    # follow-up PONGs leaked into the application recv queue exactly
+    # the same way they did when TCP was retrying (the documented
+    # reason TCP went to single-shot in the first place).  The udp_
+    # punch engine has its own multi-PROBE rendezvous and the bridge
+    # signals ready via its socketpair, so by the time verify fires
+    # the path is already warm -- packet loss on a freshly-punched
+    # warm UDP path is rare enough that single-shot is the better
+    # trade-off than queue pollution.  If the PING does get lost the
+    # cascade falls through to phase4/turn, no session-level damage.
+    attempts = 1
     try:
         for attempt in range(attempts):
             try:
