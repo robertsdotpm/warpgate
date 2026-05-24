@@ -613,7 +613,18 @@ class RandomProbePlugin(Plugin):
             bridge_ready = False
 
         if not self.result.done():
-            self.result.set_result(pipe if bridge_ready else None)
+            # Return PipeEvents (not the outer Pipe wrapper) so
+            # verify_pipe_alive's liveness-future registration and the
+            # subsequent inbound-msg_cb dispatch agree on which object
+            # holds liveness_pong_futures.  Same fix as udp_punch's
+            # set_result; see that plugin for the full writeup.  Without
+            # it, PONG arrives at PipeEvents (data-bearing layer) but
+            # the future was registered on the outer Pipe, never
+            # resolves, verify_pipe_alive times out -> DEAD.
+            returned_pipe = pipe.pipe_events if (
+                bridge_ready and getattr(pipe, "pipe_events", None) is not None
+            ) else (pipe if bridge_ready else None)
+            self.result.set_result(returned_pipe)
 
         # Diagnostic: send a literal RAW-SOCK probe directly on
         # the underlying sock (bypassing the Pipe entirely) to
