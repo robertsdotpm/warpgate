@@ -228,7 +228,10 @@ class PunchPcapPlugin(Plugin):
                 "aborting".format(dest_ip))
             return None, None
 
-        decider_ip = src_ip
+        # EXT_BIND elects on peer-visible ext IP (bind IP is LAN-side
+        # and not symmetric across NAT); NIC_BIND elects on the LAN
+        # bind IP.  See tcp_punch/main.py for the full writeup.
+        decider_ip = self.src["ext"] if self.route_type == EXT_BIND else src_ip
         puncher = PunchClient(
             dest_ip,
             src_ip,
