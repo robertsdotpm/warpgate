@@ -64,6 +64,20 @@ async def get_updated_addr_from_mqtt(node, dest_bytes):
     except asyncio.TimeoutError:
         log("get_updated_addr_from_mqtt timed out waiting for reply")
         return None
+    except asyncio.CancelledError:
+        # Same lifecycle distinction as auto_connect.attempt_one_combo:
+        # only propagate if the OUTER task is being cancelled.  If the
+        # cleanup loop cancelled plugin.result internally, treat as a
+        # failed-but-recoverable fetch and return None so the caller
+        # (typically node-startup address refresh) carries on.
+        try:
+            cancelled_internally = plugin.result.cancelled()
+        except AttributeError:
+            cancelled_internally = False
+        if not cancelled_internally:
+            raise
+        log("get_updated_addr_from_mqtt: plugin.result cancelled internally")
+        return None
     finally:
         try:
             await plugin.close()

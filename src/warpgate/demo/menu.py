@@ -158,7 +158,22 @@ async def connect_option(node, con_opts):
     # the TM's finally guarantee, any failure -- caught, raised, or
     # silent early-return -- resolves the future immediately, so this
     # outer wait only hits its ceiling on a legitimate long success.
-    pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
+    #
+    # CancelledError handling mirrors auto_connect.attempt_one_combo:
+    # async_wrap_errors re-raises CancelledError unconditionally, but
+    # a cleanup-loop-driven plugin.result.cancel() should NOT tear
+    # down the interactive menu.  Distinguish via plugin.result.cancelled().
+    try:
+        pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
+    except asyncio.CancelledError:
+        try:
+            cancelled_internally = plugin.result.cancelled()
+        except AttributeError:
+            cancelled_internally = False
+        if not cancelled_internally:
+            raise
+        log("menu connect: plugin.result cancelled internally; treating as failure")
+        pipe = None
 
     # Failure-only cleanup: cancels any still-running punch task and removes
     # the plugin from the traversal manager's registry so the next attempt
