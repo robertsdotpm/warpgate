@@ -73,7 +73,7 @@ def sync_run_bidirectional_spray(
     probe_count=RANDOM_PROBE_DEFAULT_COUNT,
     listen_timeout=PROBE_LISTEN_TIMEOUT,
     rng=None,
-    interface=None,
+    route=None,
     own_ext_ip=None,
 ):
     """Direction-agnostic random-probe punch.
@@ -109,7 +109,7 @@ def sync_run_bidirectional_spray(
     socks = []
     for sp in src_ports:
         try:
-            socks.append(make_udp_socket(bind_ip, sp, interface=interface))
+            socks.append(make_udp_socket(bind_ip, sp, route=route))
         except OSError:
             continue
     if not socks:

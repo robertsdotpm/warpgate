@@ -354,7 +354,7 @@ class RandomProbePlugin(Plugin):
                 nonce=nonce,
                 probe_count=probe_count,
                 listen_timeout=PROBE_LISTEN_TIMEOUT,
-                interface=self.nic,
+                route=route,
                 own_ext_ip=own_ext_ip,
             ),
         )
@@ -731,13 +731,13 @@ class RandomProbePlugin(Plugin):
         still useful for same-machine / loopback testing.
         """
         try:
-            await self.bind()
+            route = await self.bind()
         except (OSError, ValueError):
             log("RandomProbePlugin: pre-bind route bind failed")
             return
         try:
             self.prebound_sock = make_udp_socket(
-                self.src["ip"], 0, interface=self.nic,
+                self.src["ip"], 0, route=route,
             )
             self.prebound_port = self.prebound_sock.getsockname()[1]
         except OSError:

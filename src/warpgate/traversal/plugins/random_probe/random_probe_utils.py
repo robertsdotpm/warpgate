@@ -186,28 +186,26 @@ def random_probe_ports(count, rng=None):
 # ─────────────────────────────────────────────────────────────────
 
 
-def make_udp_socket(bind_ip, bind_port=0, interface=None):
-    """
-    Create a non-blocking UDP socket bound to (bind_ip, bind_port).
+def make_udp_socket(bind_ip, bind_port=0, route=None):
+    """Create a non-blocking UDP socket bound to (bind_ip, bind_port).
 
-    On a multi-NIC host plain ``bind((ip, port))`` is *not* enough
-    to force packets to egress through the right interface --
-    Linux routes by destination IP, not source bind, so packets
-    sourced from NIC2's IP can still leave via NIC1's gateway and
-    hairpin.  When *interface* is provided and isn't the default
-    NIC, this also sets SO_BINDTODEVICE (sockopt 25) which pins
-    egress to that interface regardless of the routing table.
-    Mirrors aionetiface's socket_factory.
+    The cross-platform NIC-egress pinning (Linux SO_BINDTODEVICE,
+    macOS IP_BOUND_IF, BSD, Windows IP_UNICAST_IF) lives in
+    ``aionetiface.net.socket.apply_nic_pin_sockopts`` -- we delegate
+    to it instead of re-implementing.  The same helper backs the
+    async socket_factory + the sync tcp_punch path; this is the
+    single source of truth for "bind a socket to a specific NIC".
 
-    Uses SO_REUSEADDR (and SO_REUSEPORT where available) so the
-    symmetric side can bind many sockets in close succession even
-    if the kernel hasn't yet released TIME_WAIT entries from a
-    previous run.
+    *route* is the Route object the caller obtained from
+    ``await self.bind()`` -- it carries both .interface and .af and
+    is what apply_nic_pin_sockopts needs.
+
+    SO_REUSEADDR (+ SO_REUSEPORT where available) so the symmetric
+    side can bind many sockets in close succession even when the
+    kernel still holds TIME_WAIT entries from prior runs.
 
     Windows-only: SIO_UDP_CONNRESET=FALSE silences ICMP-unreachable
-    backwash from spray probes that hit closed ports -- without it
-    every recv() on a connected UDP sock surfaces phantom
-    ConnectionResetError until a real datagram drains the queue.
+    backwash from spray probes that hit closed ports.
     """
     fam = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_DGRAM)
@@ -220,29 +218,9 @@ def make_udp_socket(bind_ip, bind_port=0, interface=None):
         except (OSError, AttributeError):
             pass
 
-    # Force interface egress.  Skipped on Windows (no
-    # SO_BINDTODEVICE) and when the NIC is the default route (no
-    # need to override + may need root on Linux for non-default).
-    if interface is not None and not IS_WINDOWS:
-        try:
-            af = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
-            is_default = interface.is_default(af)
-        except (OSError, AttributeError):
-            is_default = True
-        if not is_default:
-            try:
-                iface_bytes = (
-                    interface.id
-                    if isinstance(interface.id, bytes)
-                    else str(interface.id).encode("ascii", "ignore")
-                )
-                if iface_bytes:
-                    s.setsockopt(socket.SOL_SOCKET, 25, iface_bytes)
-            except OSError:
-                # EPERM on Linux without CAP_NET_RAW.  Egress falls
-                # back to the default route; on multi-NIC hosts this
-                # can hairpin off the wrong interface.
-                pass
+    if route is not None:
+        from aionetiface.net.socket import apply_nic_pin_sockopts
+        apply_nic_pin_sockopts(s, route)
 
     s.setblocking(False)
     s.bind((bind_ip, bind_port))
