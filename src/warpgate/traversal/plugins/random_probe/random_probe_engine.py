@@ -207,8 +207,20 @@ def sync_run_bidirectional_spray(
                 s.recvfrom(2048)
             except (BlockingIOError, OSError):
                 continue
-            if peer_ext_ip and peer[0] != peer_ext_ip:
-                peer_ip_mismatch += 1
+            # Self-loop guard only.  Don't reject by "peer IP doesn't
+            # match the expected ext IP" -- CGNAT-style mobile carriers
+            # pool multiple WAN egress IPs and pick per-flow by hash, so
+            # the IP STUN reported (against a third-party STUN server)
+            # is often NOT the IP that's actually used for traffic to
+            # the peer's specific dest.  The 16-byte nonce already
+            # provides 2^72 collision space for peer identification --
+            # IP matching is redundant defense AND blocks legitimate
+            # convergence on CGNAT pools (observed live: 2026-05-25
+            # local 2-NIC demo run, mobile-side spray arrived at LAN
+            # from an unexpected pool IP and got rejected by this
+            # filter; both sides ended at FAIL no_winner).
+            if own_ip_for_election and peer[0] == own_ip_for_election:
+                peer_ip_mismatch += 1  # reused counter: now "self-loop count"
                 continue
 
             is_confirm = parsed["idx"] == PROBE_IDX_CONFIRM
