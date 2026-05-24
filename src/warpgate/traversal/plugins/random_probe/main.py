@@ -132,14 +132,22 @@ class RandomProbePlugin(Plugin):
 
         # Wire-advertised "address each side identifies itself by" --
         # used for the role-decider comparison and as the value placed
-        # on RandomProbeMsg.payload.ext_ip.  Trust whatever the route
-        # resolver populated for src["ip"] / dest["ip"]: resolve_pair
-        # is responsible for setting these to the peer-visible address
-        # for each route_type (NIC IP for NIC_BIND / same_machine, ext
-        # IP for EXT_BIND).  Both peers see the matching (my, their)
-        # pair because resolve_pair ran the same logic on both sides.
+        # on RandomProbeMsg.payload.ext_ip.  This is NOT necessarily
+        # self.src["ip"]: resolve_pair leaves src["ip"] as the local
+        # *bind* IP, which is the LAN IP even on the EXT_BIND path.
+        # For EXT_BIND we need the route's external (NAT-observable)
+        # IP so the peer fires probes at something reachable across
+        # the internet -- self.nic.route(af).ext() returns that.
+        # For NIC_BIND / same_machine the bind IP is also the peer-
+        # observable IP, so src["ip"] is correct.
         self.peer_addr_ip = str(self.dest.get("ip") or "")
-        self.my_addr_ip = str(self.src.get("ip") or "")
+        if self.route_type == NIC_BIND or self.same_machine:
+            self.my_addr_ip = str(self.src.get("ip") or "")
+        else:
+            try:
+                self.my_addr_ip = str(self.nic.route(self.af).ext())
+            except (AttributeError, OSError, ValueError):
+                self.my_addr_ip = str(self.src.get("ip") or "")
 
         # Role assignment by NAT restrictiveness, then by IP:
         #   1. Whichever side has the *higher* NAT type number plays
