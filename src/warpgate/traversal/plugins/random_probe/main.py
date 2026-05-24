@@ -578,30 +578,26 @@ class RandomProbePlugin(Plugin):
                 except OSError as exc:
                     log("[RP-WORKER] canary send FAILED " + repr(exc))
 
-                # Drain stale ICMP errors queued on the winner socket
-                # from the probe spray phase (same as udp_punch's
-                # post-connect drain). Probes to wrong predicted ports
-                # generate ICMP unreachable which queue as async errors;
-                # connect() does not clear them and the first recv() in
-                # selector_proxy returns ECONNREFUSED, tripping the
-                # streak counter. recv() consumes one item per call.
-                rp_stale_drained = 0
-                rp_stale_errors = 0
-                rp_stale_heads = []
-                for _ in range(256):
-                    try:
-                        d = punched_sock_ref.recv(4096)
-                        rp_stale_drained += 1
-                        if len(rp_stale_heads) < 6:
-                            rp_stale_heads.append(bytes(d[:32]))
-                    except BlockingIOError:
-                        break
-                    except (ConnectionRefusedError, OSError):
-                        rp_stale_errors += 1
-                log("[RP-WORKER] post-connect stale drain: {0} frames {1} errors "
-                    "heads={2}".format(
-                        rp_stale_drained, rp_stale_errors, rp_stale_heads,
-                    ))
+                # Skip the post-connect stale drain entirely.  random_probe's
+                # SLAVE side enters bridge_worker noticeably later than MASTER
+                # (slave waits for CONFIRM, master commits on first PROBE) --
+                # by the time slave reaches "post-connect", the peer has
+                # already sent its WG-LIVENESS-PING through the bridge.  On
+                # Windows that PING sits in the punched_sock recv queue;
+                # SIO_UDP_CONNRESET=FALSE silently suppresses the ICMP
+                # backwash this drain was originally meant to consume, so
+                # recv() returns *real bytes* and the drain happily eats the
+                # incoming PING (confirmed live with head-byte logging:
+                # heads=[b'RPCV...canary', b'WG-LIVENESS-PING:...']).  On
+                # Linux/BSD, ICMP-unreachable from stale spray probes does
+                # surface as ConnectionRefusedError on the next recv, but
+                # selector_proxy already handles that via its
+                # UDP_ECONNREFUSED_LIMIT=8 streak counter -- so we can leave
+                # the cleanup to selector_proxy on all platforms and avoid
+                # ever consuming legitimate inbound here.
+                log("[RP-WORKER] skipping post-connect stale drain "
+                    "(SIO_UDP_CONNRESET=FALSE on Windows / selector_proxy "
+                    "ECONNREFUSED streak handles Linux)")
 
                 # Signal convergence BEFORE entering selector_proxy so
                 # main can resolve result and the demo can start sending.
