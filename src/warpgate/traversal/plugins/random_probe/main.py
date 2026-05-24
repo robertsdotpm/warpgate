@@ -519,7 +519,15 @@ class RandomProbePlugin(Plugin):
 
         def bridge_worker():
             try:
+                try:
+                    bw_local = punched_sock_ref.getsockname()
+                except OSError:
+                    bw_local = None
+                log("[RP-WORKER] enter local={0} peer_ref={1} fd={2}".format(
+                    bw_local, peer_ref, punched_sock_ref.fileno(),
+                ))
                 drained = drain_probe_residue(punched_sock_ref, nonce_ref)
+                log("[RP-WORKER] drained {0} residual frames".format(drained))
                 # Short polling window (~0.8s) to absorb late probes
                 # the carrier buffered between sym's last send and
                 # arrival on the cone's NIC.
@@ -543,15 +551,32 @@ class RandomProbePlugin(Plugin):
                     except OSError:
                         break
 
+                log("[RP-WORKER] late_probes={0}; about to connect punched_sock "
+                    "to peer_ref={1}".format(late, peer_ref))
                 try:
                     punched_sock_ref.connect(peer_ref)
                 except OSError as exc:
-                    log("RandomProbePlugin: punched_sock.connect "
-                        "failed: " + repr(exc))
+                    log("[RP-WORKER] punched_sock.connect FAILED " + repr(exc))
                     loop_for_bridge.call_soon_threadsafe(
                         signal_bridge_ready, False,
                     )
                     return
+                log("[RP-WORKER] connect OK")
+
+                # Canary sanity probe: send a small marker datagram immediately
+                # post-connect. The peer's bridge_worker should see this as
+                # [BRIDGE-COPY] read N bytes from P; this cleanly isolates
+                # "punched sock pair works" from "bridge plumbing works".
+                # Marker bytes are RPCV (4) + nonce[:4] (4) = 8 bytes total --
+                # short enough not to be confused with WG-LIVENESS-PING.
+                try:
+                    canary_payload = b"RPCV" + bytes(nonce_ref[:4])
+                    punched_sock_ref.send(canary_payload)
+                    log("[RP-WORKER] canary sent {0} bytes head={1}".format(
+                        len(canary_payload), canary_payload,
+                    ))
+                except OSError as exc:
+                    log("[RP-WORKER] canary send FAILED " + repr(exc))
 
                 # Drain stale ICMP errors queued on the winner socket
                 # from the probe spray phase (same as udp_punch's
@@ -570,8 +595,9 @@ class RandomProbePlugin(Plugin):
                         break
                     except (ConnectionRefusedError, OSError):
                         rp_stale_errors += 1
-                if rp_stale_drained or rp_stale_errors:
-                    pass
+                log("[RP-WORKER] post-connect stale drain: {0} frames {1} errors".format(
+                    rp_stale_drained, rp_stale_errors,
+                ))
 
                 # Signal convergence BEFORE entering selector_proxy so
                 # main can resolve result and the demo can start sending.
@@ -581,6 +607,7 @@ class RandomProbePlugin(Plugin):
                 loop_for_bridge.call_soon_threadsafe(
                     signal_bridge_ready, True,
                 )
+                log("[RP-WORKER] entering selector_proxy")
                 selector_proxy(
                     punched_sock_ref,
                     listener_addr_ref,
@@ -588,7 +615,9 @@ class RandomProbePlugin(Plugin):
                     sock_proto=socket_mod.SOCK_DGRAM,
                     socket_r=worker_sock_ref,
                 )
+                log("[RP-WORKER] selector_proxy returned; worker exiting")
             except Exception:  # pylint: disable=broad-except
+                log("[RP-WORKER] worker EXC")
                 log_exception()
                 loop_for_bridge.call_soon_threadsafe(
                     signal_bridge_ready, False,

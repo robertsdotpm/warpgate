@@ -1301,7 +1301,13 @@ def sync_run_bidirectional_spray(
     on success, or None on timeout. Caller closes the returned sock.
     """
     import select as select_mod
+    from aionetiface.utility.error_logger import log as _spray_log
     peer_ext_ip = normalize_ip6(peer_ext_ip)
+
+    _spray_log("[RP-SPRAY] enter bind_ip={0} peer_ext_ip={1} own_ext_ip={2} "
+        "probe_count={3} listen_timeout={4}".format(
+            bind_ip, peer_ext_ip, own_ext_ip, probe_count, listen_timeout,
+        ))
 
     # Master/slave election by IP comparison: same symmetry-breaker
     # tcp_punch's choose_winning_tcp_sock uses (`our_ip > their_ip`).
@@ -1327,6 +1333,10 @@ def sync_run_bidirectional_spray(
     from aionetiface import IPRange
     is_master = IPRange(own_ip_for_election) > IPRange(peer_ext_ip)
 
+    _spray_log("[RP-SPRAY] role={0} (own_ip_for_election={1} vs peer_ext_ip={2})".format(
+        "MASTER" if is_master else "SLAVE", own_ip_for_election, peer_ext_ip,
+    ))
+
     src_ports = random_probe_ports(probe_count, rng=rng)
     dst_ports = random_probe_ports(probe_count, rng=rng)
     socks = []
@@ -1336,9 +1346,15 @@ def sync_run_bidirectional_spray(
         except OSError:
             continue
     if not socks:
+        _spray_log("[RP-SPRAY] FAIL no sockets bound out of {0} attempts".format(
+            probe_count,
+        ))
         return None
     for s in socks:
         s.setblocking(False)
+    _spray_log("[RP-SPRAY] bound {0} sockets src_ports[0..4]={1}".format(
+        len(socks), src_ports[:4],
+    ))
 
 
     # Fire one probe from each socket to a random destination port.
@@ -1349,6 +1365,7 @@ def sync_run_bidirectional_spray(
     # (they look for ROLE_SYM and will still treat us as the sym
     # peer they expect).
     probes_sent = 0
+    send_failures = 0
     for s, dp in zip(socks, dst_ports):
         try:
             s.sendto(
@@ -1357,7 +1374,11 @@ def sync_run_bidirectional_spray(
             )
             probes_sent += 1
         except OSError:
+            send_failures += 1
             continue
+    _spray_log("[RP-SPRAY] probes_sent={0} send_failures={1} dst_ports[0..4]={2}".format(
+        probes_sent, send_failures, dst_ports[:4],
+    ))
 
     # Convergence protocol (master/slave, modelled on tcp_punch):
     #
@@ -1464,8 +1485,24 @@ def sync_run_bidirectional_spray(
             break
 
     if winner is None:
+        _spray_log("[RP-SPRAY] FAIL no_winner datagrams_seen={0} parsed_ok={1} "
+            "parsed_fail={2} peer_ip_mismatch={3} is_master={4}".format(
+                datagrams_seen, parsed_ok, parsed_fail,
+                peer_ip_mismatch, is_master,
+            ))
         close_all(socks)
         return None
+
+    try:
+        winner_local = winner["sock"].getsockname()
+    except OSError:
+        winner_local = None
+    _spray_log("[RP-SPRAY] WINNER role={0} datagrams_seen={1} parsed_ok={2} "
+        "parsed_fail={3} peer_ip_mismatch={4} winner_local={5} winner_peer={6} "
+        "is_master={7}".format(
+            winner["role"], datagrams_seen, parsed_ok, parsed_fail,
+            peer_ip_mismatch, winner_local, winner["peer"], is_master,
+        ))
 
     # Close losers.
     for s in socks:
