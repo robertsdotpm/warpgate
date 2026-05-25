@@ -460,11 +460,8 @@ def udp_punch_engine(
     # Falls back to src_ip if the caller didn't pass decider_ip
     # (legacy callers / standalone CLI).
     own_ip_for_election = decider_ip or src_ip
-    from aionetiface import IPRange
-    is_master = bool(
-        own_ip_for_election and dest_ip
-        and IPRange(own_ip_for_election) > IPRange(dest_ip)
-    )
+    from ..tcp_punch.punch_utils import is_master_by_ext
+    is_master = is_master_by_ext(own_ip_for_election, dest_ip)
 
     # Synchronised barrier: wait for the agreed punch_time so both
     # sides spray in the same window.

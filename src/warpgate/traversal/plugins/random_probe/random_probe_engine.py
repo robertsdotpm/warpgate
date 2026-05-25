@@ -95,11 +95,8 @@ def sync_run_bidirectional_spray(
     )
 
 
-    # IPRange comparison for NUMERIC IP semantics.  Raw `>` on string
-    # form mis-elects whenever one peer's IP lex-sorts above the
-    # other's but is numerically smaller.
-    from aionetiface import IPRange
-    is_master = IPRange(own_ip_for_election) > IPRange(peer_ext_ip)
+    from ..tcp_punch.punch_utils import is_master_by_ext
+    is_master = is_master_by_ext(own_ip_for_election, peer_ext_ip)
 
     log("[RP-SPRAY] role={0} (own_ip_for_election={1} vs peer_ext_ip={2})".format(
         "MASTER" if is_master else "SLAVE", own_ip_for_election, peer_ext_ip,

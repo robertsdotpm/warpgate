@@ -63,6 +63,7 @@ from .boundary_alloc import boundary_port_alloc
 from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from .nat_predict_alloc import NATPredictAlloc
 from .punch_defs import TCP_PUNCH_LAN
+from .punch_utils import compute_decider_ip
 from .punch_process import start_punching_process
 from .nat_predict import NATMapping
 from ...traversal_plugin import Plugin
@@ -294,15 +295,7 @@ class PunchPlugin(Plugin):
             log("PunchPlugin: dest matches own bind IP ({0}); aborting".format(dest_ip))
             return None, None
 
-        # EXT_BIND elects on the peer-visible ext IP (the bind IP is
-        # LAN-side and not symmetric across NAT); NIC_BIND elects on
-        # the LAN bind IP (same-LAN, both peers see each other's).
-        # Fall back to src_ip when "ext" is missing -- OPEN_INTERNET /
-        # loopback / pre-classify src_map entries may not carry it.
-        if self.route_type == NIC_BIND:
-            decider_ip = self.src["ip"]
-        else:
-            decider_ip = self.src.get("ext")
+        decider_ip = compute_decider_ip(self.route_type, self.src)
 
         # Create and configure the PunchClient.
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time

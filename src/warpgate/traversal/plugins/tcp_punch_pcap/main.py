@@ -43,6 +43,7 @@ from ..tcp_punch.proto import PunchMsg
 from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
 from ..tcp_punch.punch_client import PunchClient
+from ..tcp_punch.punch_utils import compute_decider_ip
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
@@ -228,15 +229,7 @@ class PunchPcapPlugin(Plugin):
                 "aborting".format(dest_ip))
             return None, None
 
-        # EXT_BIND elects on peer-visible ext IP (bind IP is LAN-side
-        # and not symmetric across NAT); NIC_BIND elects on the LAN
-        # bind IP.  See tcp_punch/main.py for the full writeup.
-        # Fall back to src_ip when "ext" is missing -- OPEN_INTERNET /
-        # loopback / pre-classify src_map entries may not carry it.
-        if self.route_type == EXT_BIND:
-            decider_ip = self.src.get("ext") or src_ip
-        else:
-            decider_ip = src_ip
+        decider_ip = compute_decider_ip(self.route_type, self.src)
         puncher = PunchClient(
             dest_ip,
             src_ip,

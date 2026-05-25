@@ -264,11 +264,8 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
     if not established:
         return None
 
-    # Wrap both IPs in IPRange for NUMERIC comparison; the raw `>`
-    # string compare mis-elects when one peer's first octet
-    # lex-sorts above the other's but is numerically smaller.
-    from aionetiface import IPRange
-    is_master = IPRange(src_ip) > IPRange(dest_ip)
+    from ..tcp_punch.punch_utils import is_master_by_ext
+    is_master = is_master_by_ext(src_ip, dest_ip)
     role = "master" if is_master else "slave"
     sorted_conns = sorted(established, key=sort_key_ft)
     log("tcp_punch_pcap: canonical-winner handshake role={0} "
