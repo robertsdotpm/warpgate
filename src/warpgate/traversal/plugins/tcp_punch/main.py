@@ -103,7 +103,6 @@ class PunchPlugin(Plugin):
                 t, elapsed_ms, label, self.plugin_id, extras,
             )
             log(line)
-            print(line, flush=True)
         self.stamp = stamp
         stamp("run_enter", reply=(reply is not None))
         log("[PUNCH-RUN] enter plugin_id={0} reply={1} completed={2}".format(
