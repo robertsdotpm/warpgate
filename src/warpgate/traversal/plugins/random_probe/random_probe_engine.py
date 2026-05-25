@@ -157,14 +157,14 @@ def sync_run_bidirectional_spray(
         probes_sent, send_failures, dst_ports[:4], PROBE_RATE_PPS,
     ))
 
-    deadline = time.time() + listen_timeout
+    deadline = time.monotonic() + listen_timeout
     winner = None
     datagrams_seen = 0
     parsed_ok = 0
     parsed_fail = 0
     peer_ip_mismatch = 0
-    while time.time() < deadline:
-        remaining = deadline - time.time()
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         try:

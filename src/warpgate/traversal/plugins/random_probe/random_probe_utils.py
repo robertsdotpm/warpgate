@@ -322,9 +322,9 @@ def sync_stun_discover_mapping(sock, stun_server, af, timeout=3.0, retries=3):
             sock.sendto(msg.pack(), stun_server)
         except OSError:
             return None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            remaining = deadline - time.time()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:

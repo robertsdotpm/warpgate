@@ -474,7 +474,7 @@ class Nickname:
         # seconds and tighter polling just hammers the servers
         # without changing the answer.
         
-        deadline = time.time() + max_wait_secs
+        deadline = time.monotonic() + max_wait_secs
         attempt = 0
         while True:
             attempt += 1
@@ -485,7 +485,7 @@ class Nickname:
                     (attempt, getattr(ret, "pnp_ts", 0)),
                 ))
                 return ret
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
                 log(fstr(
                     "Nickname.get: wait_for_fresh exhausted attempts={0} "
                     "max_wait={1}s name={2}",
