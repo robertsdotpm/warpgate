@@ -30,6 +30,7 @@ import time
 
 from aionetiface import fstr, log, sock_has_data
 from aionetiface.net.address import resolve_dest_tup
+from aionetiface.net.net_utils import zero_v6_flowinfo
 
 from ..tcp_punch.tcp_punch_utils import bind_punch_sockets
 from .udp_punch_defs import (
@@ -244,13 +245,8 @@ def watch_for_winner(
             except OSError:
                 continue
 
-            # Normalize v6 addr: XP's stack stuffs garbage into
-            # flowinfo on recvfrom (observed flowinfo=3824046100,
-            # well over the 20-bit max of 1048575). Any subsequent
-            # sendto / connect with that addr raises OverflowError.
-            # Zero flowinfo here so the addr is reusable downstream.
-            if len(addr) == 4:
-                addr = (addr[0], addr[1], 0, addr[3])
+            # Zero v6 flowinfo for XP-stack OverflowError protection.
+            addr = zero_v6_flowinfo(addr)
 
             kind, recv_nonce = parse_frame(buf)
             if kind is None or recv_nonce[:12] != nonce[:12]:
@@ -272,12 +268,8 @@ def watch_for_winner(
             except OSError:
                 continue
 
-            # Normalise the peer addr for sendto (XP flowinfo workaround
-            # already applied above when len(addr) == 4).
-            if len(addr) == 4:
-                sendto_addr = (addr[0], addr[1], 0, addr[3])
-            else:
-                sendto_addr = addr
+            # XP flowinfo already zeroed above; reuse the same addr.
+            sendto_addr = addr
 
             if kind == UDP_PUNCH_KIND_PROBE:
                 probes_seen += 1
@@ -370,11 +362,7 @@ def watch_for_winner(
             buf, addr = s.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
         except OSError:
             continue
-        # Same flowinfo normalization as the main loop -- XP's
-        # stack returns bogus flowinfo on recvfrom and any
-        # subsequent connect/sendto on that addr raises.
-        if len(addr) == 4:
-            addr = (addr[0], addr[1], 0, addr[3])
+        addr = zero_v6_flowinfo(addr)
         kind, recv_nonce = parse_frame(buf)
         if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce[:12] == nonce[:12]:
             try:

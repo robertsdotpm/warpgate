@@ -48,6 +48,7 @@ import socket
 import time
 
 from aionetiface.net.address import resolve_dest_tup
+from aionetiface.net.net_utils import zero_v6_flowinfo
 from aionetiface.utility.error_logger import log
 
 from .random_probe_defs import (
@@ -189,10 +190,15 @@ def sync_run_bidirectional_spray(
                 continue
             except (BlockingIOError, InterruptedError, OSError):
                 continue
-            # Normalize v6 peer addr (XP flowinfo workaround).
+            # Zero v6 flowinfo (XP OverflowError workaround) + compress
+            # the v6 IP for reuse downstream.  zero_v6_flowinfo handles
+            # the universal flowinfo+scope_id concern; normalize_ip6 is
+            # random_probe-specific (the udp_punch site leaves the IP
+            # un-normalised because the existing kernel-returned form
+            # is fine for its sendto path).
+            peer = zero_v6_flowinfo(peer)
             if len(peer) == 4:
-                scope_id = peer[3] if str(peer[0]).lower().startswith("fe80") else 0
-                peer = (normalize_ip6(peer[0]), peer[1], 0, scope_id)
+                peer = (normalize_ip6(peer[0]), peer[1], peer[2], peer[3])
             datagrams_seen += 1
             parsed = decode_probe(data, nonce)
             if parsed is None:
