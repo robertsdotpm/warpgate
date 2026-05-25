@@ -39,6 +39,7 @@ from aionetiface import (
     af_bitlen, fstr, log, log_exception, parse_node_addr,
 )
 from aionetiface.nic.nat.nat_defs import SYMMETRIC_NAT
+from aionetiface.utility.utils import rand_nonce_hex
 from .node_connect import resolve_pnp_addr
 from .node_protocol import (
     WG_LIVENESS_PING_PREFIX,
@@ -103,7 +104,7 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
         log("[AC-VERIFY] WG_SKIP_VERIFY=1; skipping liveness check")
         return True
 
-    nonce = os.urandom(8).hex().encode("ascii")
+    nonce = rand_nonce_hex(8).encode("ascii")
     ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
 
     loop = asyncio.get_event_loop()

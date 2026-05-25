@@ -17,10 +17,10 @@ runs on the same host with the same NIC selection share an identity
 while different hosts get distinct identities without coordination.
 """
 import asyncio
-import hashlib
 import time
 
 from aionetiface import TCP, log, fstr
+from aionetiface.utility.hashing import sha256_hex_short
 
 from .node.node import Node
 from .node.node_start import load_network_interfaces, load_machine_identity
@@ -63,7 +63,7 @@ def derive_default_pnp_digest(nic_macs, listen_port, listen_ips=None):
     if listen_ips:
         parts.extend(sorted(str(ip) for ip in listen_ips if ip))
     payload = ":".join(parts).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:16]
+    return sha256_hex_short(payload, 16)
 
 
 def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):

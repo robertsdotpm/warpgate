@@ -4,7 +4,6 @@ Reusing address can hide socket errors and
 make servers appear broken when they're not.
 """
 import asyncio
-import hashlib
 import time
 from aionetiface import (
     fstr, log, log_exception, log_p2p, async_wrap_errors,
@@ -14,6 +13,7 @@ from aionetiface import (
     ErrorCantLoadNATInfo, aionetiface_setup_netifaces,
 )
 from aionetiface.nic.nat.nat_utils import nat_info
+from aionetiface.utility.hashing import sha256_hex_short
 from aionetiface.nic.nat.nat_cache import (
     network_fingerprint, nat_cache_get, nat_cache_put, nat_cache_invalidate,
 )
@@ -450,7 +450,7 @@ def load_cryptography_and_auth(node):
         )
     node.vk = node.sk.verifying_key
 
-    node.node_id = hashlib.sha256(node.vk.to_string("compressed")).hexdigest()[:25]
+    node.node_id = sha256_hex_short(node.vk.to_string("compressed"), 25)
 
     # Table of authenticated users
     node.auth = {
