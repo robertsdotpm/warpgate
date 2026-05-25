@@ -213,20 +213,6 @@ def bind_tcp_sockets(
     )
 
 
-def listen_on_tcp_sockets(bound_infos):
-    """Call listen() on each bound socket, returning those that succeed."""
-    listen_infos = []
-    for bound_info in bound_infos:
-        p, s = bound_info
-        try:
-            s.listen(1)
-            listen_infos.append((p, s))
-        except OSError:
-            s.close()
-
-    return listen_infos
-
-
 def connect_on_tcp_sockets(
     same_machine,
     bound_infos,

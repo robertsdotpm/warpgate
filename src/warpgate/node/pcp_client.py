@@ -44,7 +44,6 @@ RESPONSE_BIT = 0x80
 DEFAULT_LIFETIME = 7200  # 2 hours; matches PCP spec recommendation.
 
 PROTOCOL_TCP = 6
-PROTOCOL_UDP = 17
 
 RESULT_CODES = {
     0: "SUCCESS",

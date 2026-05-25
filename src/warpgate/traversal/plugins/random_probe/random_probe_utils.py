@@ -34,7 +34,6 @@ run from a thread executor without interacting with the asyncio loop.
 """
 import socket
 import struct
-import sys
 import time
 
 from .random_probe_defs import (
@@ -45,9 +44,6 @@ from .random_probe_defs import (
     ROLE_CONE,
     ROLE_SYM,
 )
-
-
-IS_WINDOWS = sys.platform == "win32"
 
 
 # ─────────────────────────────────────────────────────────────────

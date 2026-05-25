@@ -6,8 +6,8 @@ from aionetiface import (
     IP4, IP6, NIC_BIND, EXT_BIND, LOOPBACK_BIND,
 )
 from .node_utils import enrich_addr_map_with_loopback
-from .nickname import pnp_unwrap_ts
-from ..traversal.traversal_address import get_updated_addr_from_mqtt, pnp_name_has_tld
+from .nickname import pnp_unwrap_ts, pnp_name_has_tld
+from ..traversal.traversal_address import get_updated_addr_from_mqtt
 
 
 def apply_listen_ips(node):
@@ -122,18 +122,6 @@ def iter_viable_pairs(
             if int(src["ext"]) == int(dest["ext"]):
                 continue
         yield src, dest
-
-
-def select_first_viable_pair(
-    af,
-    route_type,
-    src_map,
-    dest_map,
-):
-    """First-only convenience wrapper around iter_viable_pairs."""
-    for pair in iter_viable_pairs(af, route_type, src_map, dest_map):
-        return pair
-    return None
 
 
 async def connect(node, af, route_type, pnp_addr, plugin_name=None):

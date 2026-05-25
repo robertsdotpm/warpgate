@@ -853,18 +853,6 @@ def p_or_default(key):
     return float(FAST_PUNCH_PARAMS.get(key, 8.0))
 
 
-def drain_queue(q):
-    """Drain an asyncio.Queue without blocking; return count drained."""
-    n = 0
-    while True:
-        try:
-            q.get_nowait()
-            n += 1
-        except asyncio.QueueEmpty:
-            break
-    return n
-
-
 class RandomProbePluginFactory:
     """Builds RandomProbePlugin instances with a shared SysClock.
 

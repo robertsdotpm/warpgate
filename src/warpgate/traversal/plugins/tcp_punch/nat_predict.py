@@ -61,24 +61,6 @@ class NATMapping:
         return NATMapping([d["local"], d["reply"], d["remote"]], d["sock"])
 
 
-def mappings_dicts_to_objs(mappings):
-    """Convert a list of mapping dicts to NATMapping objects."""
-    ret = []
-    for d in mappings:
-        ret.append(NATMapping.from_dict(d))
-
-    return ret
-
-
-def mappings_objs_to_dicts(mappings):
-    """Convert a list of NATMapping objects to serialisable dicts."""
-    ret = []
-    for m in mappings:
-        ret.append(m.to_dict())
-
-    return ret
-
-
 async def get_high_port_mapping(stun_client):
     """Bind to a high-numbered port via STUN and return the resulting NAT mapping."""
     assert stun_client.conf["reuse_addr"]

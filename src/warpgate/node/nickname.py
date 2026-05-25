@@ -109,10 +109,6 @@ NAMING_TIMEOUT = 10
 # NAMING_TIMEOUT bound here applies across all of namebump's retries.
 
 
-class PartialNameSuccess(Exception):
-    """Raised when a nickname was registered on some but not all PNP servers."""
-
-
 class FullNameFailure(Exception):
     """Raised when a nickname registration failed on all PNP servers."""
 
