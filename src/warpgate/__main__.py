@@ -5,6 +5,7 @@ import code
 import concurrent.futures
 import inspect
 import sys
+import textwrap
 import threading
 import types
 import warnings
@@ -81,7 +82,6 @@ class AsyncIOInteractiveConsole(code.InteractiveConsole):
 
     def run_as_async(self, source, filename):
         """Wrap source in an async def, run it on the loop, merge locals back."""
-        import textwrap
         ns = "repl_ns_a7c2"
         indented = textwrap.indent(source.rstrip(), "    ")
         wrapper = (

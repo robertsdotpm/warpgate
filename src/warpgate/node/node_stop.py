@@ -2,6 +2,7 @@
 import asyncio
 import glob
 import os
+import time
 from contextlib import suppress
 from aionetiface import log, log_exception, Daemon, AlreadyClosedError
 
@@ -55,9 +56,8 @@ from aionetiface.utility.cleanup import (  # noqa: F401, E402
 # Shutdown the node server and do cleanup.
 async def node_stop(node):
     """Shut down the node, closing traversal plugins, resources, the daemon, and the stop socket pair."""
-    import time as time_mod
     log("[NODE-STOP] mono={0:.4f} node_stop entered".format(
-        time_mod.monotonic()
+        time.monotonic()
     ))
     # Send stop signal (any amount of data.)
     try:

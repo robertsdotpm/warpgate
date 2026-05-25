@@ -1,5 +1,6 @@
 """Miscellaneous helpers for node startup and operation."""
 import asyncio
+import copy
 import hashlib
 import os
 import socket
@@ -573,8 +574,7 @@ async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     and is shared by every IPR on that route, so two fe80s on one NIC
     would otherwise bind/mutate the same object concurrently.
     """
-    import copy as copy_mod
-    route = copy_mod.deepcopy(fe80_ipr.route)
+    route = copy.deepcopy(fe80_ipr.route)
     port = await soft_bind_and_listen(
         node, route, label, ips=ipr_norm(fe80_ipr),
     )
@@ -590,7 +590,6 @@ async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
     a copy the next iteration's bind(ips=...) would mutate the previous
     listener's route in place.
     """
-    import copy as copy_mod
     try:
         # Use Interface("default") rather than node.ifs[0] so the
         # listen socket isn't SO_BINDTODEVICE-pinned to a physical
