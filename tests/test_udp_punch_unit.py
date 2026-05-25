@@ -23,14 +23,21 @@ from aionetiface.testing import AsyncTestCase
 
 from warpgate.traversal.plugins.tcp_punch.punch_defs import PortAlloc
 from warpgate.traversal.plugins.udp_punch.udp_punch_defs import (
-    UDP_PUNCH_FRAME_LEN,
     UDP_PUNCH_KIND_CONFIRM,
     UDP_PUNCH_KIND_PROBE,
+    UDP_PUNCH_MAX_FRAME_LEN,
     UDP_PUNCH_NONCE_LEN,
+    STUN_TXID_LEN,
     build_frame,
     parse_frame,
 )
 from warpgate.traversal.plugins.udp_punch.udp_punch_engine import udp_punch_engine
+
+
+# Bare STUN Binding Request length (no attributes).  PROBE frames are
+# always exactly this; CONFIRM frames can be larger when an
+# XOR-MAPPED-ADDRESS attribute is included.
+STUN_BINDING_REQUEST_LEN = 20
 
 
 class TestUdpPunchFrame(unittest.TestCase):
@@ -39,10 +46,14 @@ class TestUdpPunchFrame(unittest.TestCase):
     def test_round_trip(self):
         nonce = os.urandom(UDP_PUNCH_NONCE_LEN)
         f = build_frame(UDP_PUNCH_KIND_PROBE, nonce)
-        self.assertEqual(len(f), UDP_PUNCH_FRAME_LEN)
+        # Bare STUN Binding Request: 20 bytes.
+        self.assertEqual(len(f), STUN_BINDING_REQUEST_LEN)
         kind, recv = parse_frame(f)
         self.assertEqual(kind, UDP_PUNCH_KIND_PROBE)
-        self.assertEqual(recv, nonce)
+        # STUN's 12-byte Transaction ID carries the first 12 bytes of
+        # our 16-byte nonce; the remaining 4 bytes stay node-local.
+        # Receivers compare on the TXID-width prefix only.
+        self.assertEqual(recv[:STUN_TXID_LEN], nonce[:STUN_TXID_LEN])
 
     def test_short_buffer_rejected(self):
         kind, nonce = parse_frame(b"P2UP")
@@ -50,12 +61,26 @@ class TestUdpPunchFrame(unittest.TestCase):
         self.assertIsNone(nonce)
 
     def test_bad_magic_rejected(self):
-        nonce = os.urandom(UDP_PUNCH_NONCE_LEN)
-        bad = b"XXXX" + bytes([UDP_PUNCH_KIND_PROBE]) + nonce
-        self.assertEqual(len(bad), UDP_PUNCH_FRAME_LEN)
+        # 20 bytes but no STUN magic cookie at offset 4-8.
+        bad = b"XXXX" * 5
+        self.assertEqual(len(bad), STUN_BINDING_REQUEST_LEN)
         kind, recv = parse_frame(bad)
         self.assertIsNone(kind)
         self.assertIsNone(recv)
+
+    def test_confirm_with_peer_addr_fits_in_max(self):
+        # CONFIRM with XOR-MAPPED-ADDRESS for v4 = 20 + 12 = 32 bytes;
+        # for v6 = 20 + 24 = 44 bytes.  Both fit under
+        # UDP_PUNCH_MAX_FRAME_LEN which sizes recv buffers.
+        nonce = os.urandom(UDP_PUNCH_NONCE_LEN)
+        v4 = build_frame(UDP_PUNCH_KIND_CONFIRM, nonce, peer_addr=("10.0.1.76", 31704))
+        v6 = build_frame(UDP_PUNCH_KIND_CONFIRM, nonce, peer_addr=("2001:db8::1", 31704))
+        self.assertLessEqual(len(v4), UDP_PUNCH_MAX_FRAME_LEN)
+        self.assertLessEqual(len(v6), UDP_PUNCH_MAX_FRAME_LEN)
+        k4, _ = parse_frame(v4)
+        k6, _ = parse_frame(v6)
+        self.assertEqual(k4, UDP_PUNCH_KIND_CONFIRM)
+        self.assertEqual(k6, UDP_PUNCH_KIND_CONFIRM)
 
     def test_nonce_length_validated(self):
         with self.assertRaises(ValueError):

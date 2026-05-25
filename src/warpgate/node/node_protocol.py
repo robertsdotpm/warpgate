@@ -33,8 +33,13 @@ from ..traversal.plugins.direct_connect.con_id_frame import CON_ID_PREFIX
 # application's first recv() (seen as echo_msg=b'WG-LIVENESS-PONG:...'
 # in failing macOS / Win10 runs).  Future-based delivery sidesteps the
 # queue entirely.
-WG_LIVENESS_PING_PREFIX = b"WG-LIVENESS-PING:"
-WG_LIVENESS_PONG_PREFIX = b"WG-LIVENESS-PONG:"
+# Single source of truth lives in aionetiface.net.pipe.pipe_events
+# (the pipe layer needs the literal to strip these control frames
+# from the application stream).  Re-import here so node_protocol's
+# encoders / decoders keep working without redefining the bytes.
+from aionetiface.net.pipe.pipe_events import (  # noqa: E402
+    WG_LIVENESS_PING_PREFIX, WG_LIVENESS_PONG_PREFIX,
+)
 
 
 def register_liveness_pong_future(pipe, nonce, fut):
@@ -55,27 +60,28 @@ def unregister_liveness_pong_future(pipe, nonce):
     futures = getattr(pipe, "liveness_pong_futures", None)
     if futures is not None:
         futures.pop(nonce, None)
-from ..traversal.plugins.random_probe.random_probe_defs import (
-    PROBE_LEN,
-    PROBE_MAGIC,
+from ..traversal.plugins.random_probe.random_probe_utils import (
+    looks_like_random_probe,
 )
 from ..traversal.plugins.udp_punch.udp_punch_defs import (
-    UDP_PUNCH_FRAME_LEN,
-    UDP_PUNCH_MAGIC,
+    parse_frame as udp_punch_parse_frame,
 )
 
 
 def is_random_probe_datagram(msg):
     """True iff *msg* looks like a stray random_probe probe.
 
-    Probe datagrams have a fixed length and a fixed 4-byte magic
-    prefix.  After convergence the symmetric side's 256-pack can
-    keep arriving for hundreds of ms (CGNAT / mobile-carrier
-    paths) and the cone's NIC keeps queueing them on the live
-    Pipe; without this filter pipe.recv() returns those raw
-    bytes to the application instead of the first real payload.
+    Probe datagrams have a fixed length and a fixed STUN shape
+    (Binding Request, magic cookie at offset 4).  After convergence
+    the symmetric side's 256-pack can keep arriving for hundreds of
+    ms (CGNAT / mobile-carrier paths) and the cone's NIC keeps
+    queueing them on the live Pipe; without this filter pipe.recv()
+    returns those raw bytes to the application instead of the first
+    real payload.  Defers to random_probe_lib.looks_like_random_probe
+    so this filter and the plugin's own stream filter stay in sync
+    about what counts as a probe frame.
     """
-    return len(msg) == PROBE_LEN and msg[:4] == PROBE_MAGIC
+    return looks_like_random_probe(bytes(msg))
 
 
 def is_udp_punch_datagram(msg):
@@ -84,10 +90,14 @@ def is_udp_punch_datagram(msg):
     Same shape problem as random_probe: after convergence the engine's
     spray keeps arriving on the winning socket for hundreds of ms;
     those frames get queued on the wrapped Pipe and dispatched to
-    application msg_cbs unless we filter them out here. Cheap predicate
-    (fixed length + 4-byte magic) so it's safe to run on every inbound.
+    application msg_cbs unless we filter them out here.  Frames are
+    STUN Binding Request / Success Response now, so we defer to
+    udp_punch_defs.parse_frame for the recognition predicate -- same
+    decoder the engine uses, no risk of the filter and the engine
+    disagreeing on what counts as a punch frame.
     """
-    return len(msg) == UDP_PUNCH_FRAME_LEN and msg[:4] == UDP_PUNCH_MAGIC
+    kind, _nonce = udp_punch_parse_frame(msg)
+    return kind is not None
 
 
 async def node_protocol(node, msg, client_tup, pipe):

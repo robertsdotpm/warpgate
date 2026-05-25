@@ -17,10 +17,10 @@ runs on the same host with the same NIC selection share an identity
 while different hosts get distinct identities without coordination.
 """
 import asyncio
-import hashlib
 import time
 
 from aionetiface import TCP, log, fstr
+from aionetiface.utility.hashing import sha256_hex_short
 
 from .node.node import Node
 from .node.node_start import load_network_interfaces, load_machine_identity
@@ -63,7 +63,7 @@ def derive_default_pnp_digest(nic_macs, listen_port, listen_ips=None):
     if listen_ips:
         parts.extend(sorted(str(ip) for ip in listen_ips if ip))
     payload = ":".join(parts).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:16]
+    return sha256_hex_short(payload, 16)
 
 
 def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
@@ -97,11 +97,34 @@ def derive_default_pnp_name(nic_macs, listen_port, listen_ips=None):
     )
 
 
+class GateAfNotSupported(RuntimeError):
+    """Raised when Gate(afs=...) requires an AF that no loaded NIC supports.
+
+    Carries the requested + available AF sets so orchestrators can
+    distinguish this from a generic runtime error and emit a clean
+    SKIP_AF outcome rather than misreport it as a punch failure.
+    """
+
+    def __init__(self, requested, available):
+        self.requested = tuple(requested)
+        self.available = tuple(available)
+        msg = (
+            "Gate(afs={0}) requires address families not supported by any "
+            "loaded NIC; available across loaded NICs: {1}.  This is an "
+            "environment mismatch -- orchestrator should categorise as "
+            "SKIP_AF, not as a connection failure.".format(
+                list(self.requested), list(self.available),
+            )
+        )
+        super(GateAfNotSupported, self).__init__(msg)
+
+
 class Gate(object):
     """Async-context wrapper around a Node with keystore-managed identity."""
 
     def __init__(self, name=None, ifs=None, nic_names=None, ip=None, port=0,
-                 stop_rw=None, conf=None, sys_clock=None, ntp_addr=None):
+                 stop_rw=None, conf=None, sys_clock=None, ntp_addr=None,
+                 afs=None):
         # port=0 by default so two Gate instances on the same machine
         # (the canonical "run the echo listener, then run a connector
         # in another terminal" first-use pattern) don't collide on the
@@ -113,6 +136,20 @@ class Gate(object):
         self.requested_name = name
         # nic_names: list of interface names to load, or None/[] to discover all.
         self.nic_names = list(nic_names) if nic_names else []
+        # afs: optional set of address families this Gate REQUIRES support
+        # for.  When None (default) the gate accepts whatever its loaded
+        # NICs provide -- existing permissive behaviour.  When set (e.g.
+        # (IP4,) or (IP4, IP6)), __aenter__ validates that every
+        # requested AF is supported by at least one loaded NIC and
+        # raises GateAfNotSupported if not.  Orchestrators (matrix_full,
+        # gate_sweep) MUST always pass this explicitly so a v4-only NIC
+        # paired with a v6-requesting test fails loudly and is correctly
+        # categorised as SKIP_AF rather than as a punch failure.
+        #
+        # Accepts both shorthand 4/6 and the socket AF_INET / AF_INET6
+        # constants; both forms normalise to the aionetiface IP4 / IP6
+        # constants for consistent validation against nic.supported().
+        self.afs = self.normalise_afs(afs) if afs is not None else None
         # ntp_addr: custom NTP server ("host" or "host:port"); None uses the pool default.
         self.ntp_addr = ntp_addr
         self.node_kwargs = {
@@ -125,6 +162,31 @@ class Gate(object):
         self.sys_clock = sys_clock
         self.node = None
         self.closed = asyncio.Event()
+
+    @staticmethod
+    def normalise_afs(afs):
+        """Map shorthand 4/6 or AF_INET/AF_INET6 to a tuple of (IP4, IP6) constants."""
+        from aionetiface import IP4, IP6
+        out = []
+        for a in afs:
+            ai = int(a)
+            if ai == 4 or ai == int(IP4):
+                out.append(IP4)
+            elif ai == 6 or ai == int(IP6):
+                out.append(IP6)
+            else:
+                raise ValueError(
+                    "Gate(afs=...): unknown address family {0!r}; "
+                    "expected 4, 6, IP4, or IP6.".format(a)
+                )
+        # Dedup while preserving determinism for the error message.
+        seen = set()
+        deduped = []
+        for a in out:
+            if a not in seen:
+                seen.add(a)
+                deduped.append(a)
+        return tuple(deduped)
 
     def add_msg_cb(self, cb):
         """Register a per-message callback before listen() is called.
@@ -184,6 +246,30 @@ class Gate(object):
             )
         else:
             self.node.pnp_name = self.requested_name
+
+        # Validate explicit AF expectations BEFORE the expensive
+        # node.start().  When the requested_name path is taken,
+        # node.ifs are already loaded above.  When a name was passed,
+        # node.start() does the interface load itself, so we have to
+        # force it here to validate first.  The load is idempotent
+        # (skips on already-populated node.ifs) so the subsequent
+        # node.start() doesn't repeat the work.
+        if self.afs is not None:
+            if not self.node.ifs:
+                await load_network_interfaces(self.node)
+            available = set()
+            for nic in self.node.ifs:
+                try:
+                    for af in nic.supported():
+                        available.add(af)
+                except (ValueError, AttributeError):
+                    continue
+            missing = [a for a in self.afs if a not in available]
+            if missing:
+                raise GateAfNotSupported(
+                    requested=self.afs,
+                    available=sorted(available),
+                )
 
         gate_mark("prestart")
 

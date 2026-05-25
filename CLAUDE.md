@@ -1,5 +1,15 @@
 # warpgate — project instructions
 
+## Orchestrators MUST pass explicit `afs` to `Gate`
+
+When the matrix runner / gate_sweep / any test harness constructs a `Gate`, it must pass `afs=(...)` (or set `WG_AFS` on the spawned subprocess) naming exactly the address families that iteration intends to exercise. The Gate validates the requested AFs against the loaded NICs' `nic.supported()` and raises `GateAfNotSupported` if any requested AF can't be served.
+
+The orchestrator side then maps that exception (signalled via the `WG_AF_NOT_SUPPORTED requested=... available=...` sentinel line from `gate_listen`) to a `SKIP_AF` outcome — distinct from `READY_FAIL` and from `echo=fail`. Aggregated reports separate **real failures** (broken cascade) from **environment-skips** (the NIC literally can't speak that AF).
+
+Default `afs=None` keeps the historical permissive behaviour for interactive demo / single-user invocations — only the orchestrator path is constrained to explicit AFs. Without the explicit afs gate, a v6-iteration against a v4-only mobile NIC silently binds whatever the NIC offers, the cascade then fails for env-not-bug reasons, and aggregated stats misreport the env-skip as a punch regression.
+
+Per-NIC AF capability lives in `warpgate_test_run/plugin_sweep.py:VMS[<vm>]["nic_ext_afs"]` (Windows mobile NICs are all `(4,)` — IPv4-only) and `anchor_sweep.py:VMS[<vm>]["nic_afs"]` (defaults to `(4, 6)` when absent). `matrix_full` reads these and filters its task list so the structurally-impossible combinations never even fire.
+
 ## Python compatibility
 
 `requires-python = ">=3.5"` is intentional and must not be changed. Do not raise the minimum Python version under any circumstances.
@@ -160,14 +170,34 @@ XP's TCP/IP stack has two legacy quirks that any tcp_punch-related constant must
 
 The corollary for `interface_utils` and `socket.py`: do not hand XP a deterministic-bind port outside `[1025, 5000]` if the path needs the NAT mapping to match the classifier's reading. For tcp_punch the bucket math + `BASE_PORT=2024` already handles this; other code paths that pin specific source ports on XP need to be range-aware.
 
-## Windows XP cross-NAT tcp_punch is not fixable from user-space (`tcpip.sys` simul-open RST)
+## Windows XP cross-NAT tcp_punch — original "tcpip.sys RST" diagnosis was confounded by DNS
 
-Pcap forensics on XP-as-listener cross-NAT tcp_punch shows the wire-level handshake completing in full (SYN crossover, SYN-ACK both directions, final ACK), the engine catching `successful=N/N`, the plugin returning `pipe=True` — and then ~140 ms after the handshake XP's `tcpip.sys` unilaterally RSTs the connection. `selector_proxy` on the bridged socket reports `ConnectionResetError(104)` and the demo's echo round-trip fails.
+**Status (2026-05-24)**: The earlier conclusion that XP cross-NAT tcp_punch was fundamentally broken by a tcpip.sys 174 ms RST after simul-open is **no longer supported by live tests**. With working DNS (see below) XP cross-NAT tcp_punch passes 2/2 against the p2pd.net connector — both IPv4 and IPv6, both with `echo_ok=true` and ALIVE liveness check passing.
 
-**The 174 ms RST is intrinsic to XP's TCP/IP stack** and not preventable from app code. Tested and ruled out as causes: TCP SACK / timestamps on the Linux peer (sysctl), `SO_LINGER` on Windows close, repeated `connect_ex` calls (strict one-shot didn't change it), the half-open SYN cap (Tcpip Event 4226), TCP task offload (`DisableTaskOffload=1`), TCP Large Send Offload (`TsoEnable=0`), per-NIC checksum offload (`TcpipOffload=0`), AV / NDIS filter drivers (none loaded; `PSched\Linkage` empty), NIC bindings (only IPv4/IPv6 left). Every variant produces the same deterministic 174 ms RST.
+The likely real cause of the original 2026-05-08 observation: **XP's per-NIC static DNS gets cleared by disable/re-enable cycles**, which means an XP listener whose NIC was toggled during testing ends up with no DNS, can't resolve MQTT broker hostnames, has `protected_clients=0` after `get_dest_clients` admits zero, and never receives the connector's PunchMsg. The connector still fires its punch on schedule and reports `successful=0/24` — looks identical to "RST after handshake" if you weren't looking at the listener-side broker-walk logs.
 
-XP-SP3 with the final QFE patches (POSReady 2009, build 2600.xpsp_sp3_qfe) is the most-patched XP that exists, so this is the final form of the stack — not a regression that was fixed in a later XP update.
+To test XP cross-NAT tcp_punch correctly:
 
-**The only known way to make TCP simul-open work on XP is to bypass `tcpip.sys`.** Hamachi shipped a kernel-level NDIS filter driver (or a TDI hook) that intercepted packets before XP's stack saw them, performed the simul-open handshake out-of-stack, and only injected the connection up to user-space once it was already established. That path is not reachable from a Python library: it requires a signed Windows kernel driver (WHQL or a CA-signed cross-cert valid for XP), per-platform builds, and a userspace↔kernel IPC layer.
+```cmd
+:: pin DNS before any test run that disabled/enabled NICs
+netsh interface ip set dns name="Local Area Connection" source=static addr=8.8.8.8 register=primary
+netsh interface ip add dns name="Local Area Connection" addr=1.1.1.1 index=2
+ping github.com  :: should resolve; if not, DNS is still broken
+```
 
-**Routing recommendation**: when the dest peer's `os_token` matches `XP` or `Windows-2000`, the connection planner should deprioritise `tcp_punch` and prefer `udp_punch` → `turn`. UDP has no simul-open RST issue and the NAT mappings persist for minutes, so the same use case routes cleanly. This is the same lesson Skype landed on in the XP era — direct P2P went over UDP, TCP only for supernode/relay hops where one end had a reachable IP. tcp_punch remains correct for non-XP-listener pairs and stays in the matrix.
+**Routing recommendation revision**: the auto_connect XP-deprioritisation logic (preferring `udp_punch` / `turn` over `tcp_punch` when dest is Windows-XP/2000) **may no longer be warranted**. Until more cross-peer combinations are tested with the DNS-fix in place, keep the deprioritisation for safety, but flag it for removal pending broader validation.
+
+**Engine improvements that stay regardless** (independently confirmed correctness/speed wins):
+
+- `NUM_PORTS=8` (under XP's 10-half-open cap)
+- Two-bucket overlap port pool (eliminates bucket-fork failure)
+- Dual-fire rendezvous (primary + secondary punch_time)
+- NAT-predict bypass in `advance_punching_protocol` (STUN-discovered ports never converged between independent peers)
+- Strict one-shot `connect_ex` per socket (kernel handles retransmits)
+- Early-exit monitor with 50 ms grace after first ESTABLISHED
+- Drop spray sleep before monitor (the 5 s sleep blocked monitor)
+- `SO_LINGER {1,0}` off on Windows post-success (revert at choose_winning_tcp_sock; default linger for the application-bytes phase)
+
+**Do NOT reintroduce**:
+- recreate-on-RST mid-spray (based on the now-revised RST diagnosis; never fired in any real test)
+- cycling spray with fresh sockets + jitter (narrowed simul-open windows)

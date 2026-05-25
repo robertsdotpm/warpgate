@@ -11,14 +11,7 @@ loader patches WIRE_NAME onto the class at install time.
 """
 
 from ....protocol.proto_msg import ProtoMsg
-
-
-# Punch-mode discriminators -- application-level, NOT wire-level.
-# Stay here because they only apply to the punch exchange but are
-# referenced from the engine.
-TCP_PUNCH_LAN = 1
-TCP_PUNCH_REMOTE = 2
-TCP_PUNCH_SELF = 3
+from .punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE, TCP_PUNCH_SELF  # noqa: F401  re-exported for downstream importers
 
 
 class PunchMsg(ProtoMsg):

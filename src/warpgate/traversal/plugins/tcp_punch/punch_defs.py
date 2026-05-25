@@ -6,6 +6,21 @@ TCP_PUNCH_LAN = 1
 TCP_PUNCH_REMOTE = 2
 TCP_PUNCH_SELF = 3
 
+# Connection timing.  Shared by boundary_lib (FAST_PUNCH_PARAMS),
+# tcp_punch_engine (spray + monitor windows), and udp_punch_engine
+# (UDP RETRY_INTERVAL).
+CONNECT_TIMEOUT = 5.0
+RETRY_INTERVAL = 0.05
+
+# NTP rendezvous.  Used by punch_utils.fetch_ntp_time to bound the
+# pool.ntp.org round-trip and convert the response to a Unix epoch.
+NTP_SERVER = "pool.ntp.org"
+NTP_PORT = 123
+NTP_DELTA = 2208988800  # 70-year offset between NTP epoch (1900) and Unix epoch (1970)
+NTP_PACKET_SIZE = 48
+MAX_NTP_RETRIES = 5
+NTP_TIMEOUT = 1.0
+
 PUNCH_ALIVE = b"234o2jdjf\n"
 PUNCH_END = b"qwekl2k343ok\n"
 INITIATED_PREDICTIONS = 1

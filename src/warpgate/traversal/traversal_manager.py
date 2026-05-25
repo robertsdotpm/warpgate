@@ -158,14 +158,22 @@ class TraversalManager:
         try:
             await asyncio.wait_for(plugin.run(reply), timeout=plugin.timeout)
         except asyncio.CancelledError:
+            log("[TM] run_plugin CancelledError plugin={0} id={1} -- "
+                "cancelling plugin.result".format(
+                    getattr(plugin, "name", "?"),
+                    getattr(plugin, "plugin_id", "?"),
+                ))
             if not plugin.result.done():
                 plugin.result.cancel()
             asyncio.ensure_future(async_wrap_errors(close_plugin(plugin, self.plugins, self.inbound_pipes)))
             raise
         except (asyncio.TimeoutError, OSError, ConnectionError) as exc:
-            log("[TM] run_plugin caught {0}: {1}".format(
-                type(exc).__name__, repr(exc),
-            ))
+            log("[TM] run_plugin caught {0}: {1} plugin={2} id={3} -- "
+                "setting plugin.result=None".format(
+                    type(exc).__name__, repr(exc),
+                    getattr(plugin, "name", "?"),
+                    getattr(plugin, "plugin_id", "?"),
+                ))
             log_exception()
             if not plugin.result.done():
                 plugin.result.set_result(None)
@@ -294,6 +302,25 @@ class TraversalManager:
         if self.done_callback:
             plugin.result.add_done_callback(self.done_callback)
 
+        # Extend expires_at when the result resolves successfully, regardless of
+        # whether the resolution happened synchronously inside run_plugin or
+        # later from a background worker.  Without this, plugins with delayed
+        # convergence (udp_punch's delayed_run_engine, random_probe's worker,
+        # tcp_punch's punch_process) succeed AFTER plugin.timeout elapses;
+        # cleanup_loop then reaps the pipe within ~5s and any ECHO bytes the
+        # peer sends after convergence land on an already-closed plugin.
+        def extend_on_success(fut, plugin=plugin):
+            try:
+                if fut.result() is not None:
+                    plugin.expires_at = get_running_loop().time() + 3600
+                    log("[TM] result-done callback: extended expires_at by "
+                        "3600s for plugin={0}".format(
+                            getattr(plugin, "plugin_id", "?"),
+                        ))
+            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-except
+                pass
+        plugin.result.add_done_callback(extend_on_success)
+
         # Schedule cleanup loop if needed.
         if not self.cleanup_task or self.cleanup_task.done():
             self.cleanup_task = get_running_loop().create_task(self.cleanup_loop())
@@ -358,34 +385,20 @@ class TraversalManager:
         if isinstance(msg, ConMsg):
             msg.meta.plugin_name = "direct_connect"
 
-        # Asymmetric tcp_punch -> tcp_punch_pcap override:
-        # When the peer sends a PunchMsg labelled plugin_name="tcp_punch"
-        # but OUR local OS is NT-5 (XP / 2000) AND we have the
-        # tcp_punch_pcap plugin installed, redirect locally to
-        # tcp_punch_pcap.  The peer can't know our OS at signal-
-        # dispatch time (they pick their plugin from THEIR OS), so
-        # the redirection must happen here, on the receiver side.
-        # The wire bytes are identical (both plugins share
-        # tcp_punch.PunchMsg) -- only the local plugin instantiated
-        # to handle the message changes.
-        # See warpgate/src/warpgate/traversal/plugins/tcp_punch_pcap/__init__.py
-        # for the full design rationale.
-        if (
-            msg.meta.plugin_name == "tcp_punch"
-            and "tcp_punch_pcap" in self.plugin_loaders
-        ):
-            try:
-                from aionetiface import os_id
-                local_os = os_id() or ""
-            except ImportError:
-                local_os = ""
-            if (
-                local_os.startswith("Windows-XP")
-                or local_os.startswith("Windows-2000")
-            ):
-                log("create_inbound_plugin: redirecting tcp_punch -> "
-                    "tcp_punch_pcap (local OS {0!r})".format(local_os))
-                msg.meta.plugin_name = "tcp_punch_pcap"
+        # Note: prior versions redirected tcp_punch -> tcp_punch_pcap
+        # on Windows-XP / Windows-2000 receivers whenever pcap was
+        # installed.  That redirect was rationalised by the now-revised
+        # "XP cross-NAT tcp_punch is broken at tcpip.sys" claim
+        # (see warpgate/CLAUDE.md "Windows XP cross-NAT tcp_punch"
+        # section -- the original observation was confounded by XP's
+        # DNS-clears-on-NIC-disable bug, not a stack-level RST).
+        # Live test 2026-05-24 shows XP cross-NAT tcp_punch passes
+        # 2/2 against p2pd.net with working DNS, so the redirect was
+        # both unnecessary and actively harmful when pcap is enabled
+        # (it would steal traffic from the working native path).
+        # tcp_punch_pcap stays opt-in for users who explicitly target
+        # it in plugins=[...] -- this just removes the automatic
+        # hijack of the inbound tcp_punch path.
 
         if msg.meta.plugin_name not in self.plugin_loaders:
             raise ValueError("Plugin not installed.")
@@ -571,6 +584,12 @@ class TraversalManager:
                         log("[TM] cleanup_loop: plugin missing expires_at, skipping")
                         continue
                     if now >= expires_at:
+                        log("[TM] cleanup_loop: expiring plugin={0} id={1} "
+                            "now={2:.3f} expires_at={3:.3f} overdue={4:.3f}s".format(
+                                getattr(plugin, "name", "?"),
+                                getattr(plugin, "plugin_id", "?"),
+                                now, expires_at, now - expires_at,
+                            ))
                         try:
                             await close_plugin(plugin, self.plugins, self.inbound_pipes)
                         except asyncio.CancelledError:

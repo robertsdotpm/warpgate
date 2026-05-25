@@ -128,12 +128,6 @@ async def add_echo_support(msg, client_tup, pipe):
             return
 
 
-def patch_log_p2p(m, node_id=""):
-    """Format and print a P2P log line prefixed with the node ID via cout."""
-    out = fstr("p2p: <{0}> ", (node_id,)) + to_s(m)
-    cout(out)
-
-
 def get_req_serv_parts(parts):
     """Parse a comma-separated server spec into (offset, af, ip, port) tuple."""
     ip = parts[2]

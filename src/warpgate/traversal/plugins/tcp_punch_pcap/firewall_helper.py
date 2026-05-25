@@ -30,8 +30,9 @@ process can manipulate its own firewall as long as it
 restores state. Mirror the host_firewall.py try/finally contract.
 """
 import os
-import subprocess
 import sys
+
+from aionetiface.utility.cmd_tools import cmd_sync
 
 try:
     from aionetiface import log
@@ -40,26 +41,10 @@ except ImportError:
         pass
 
 
-def is_linux():
-    return sys.platform.startswith("linux")
-
-
-def is_darwin():
-    return sys.platform.startswith("darwin")
-
-
-def is_bsd():
-    return (
-        sys.platform.startswith("freebsd")
-        or sys.platform.startswith("openbsd")
-        or sys.platform.startswith("netbsd")
-        or sys.platform.startswith("dragonfly")
-        or ("bsd" in sys.platform and not sys.platform.startswith("win"))
-    )
-
-
-def is_windows():
-    return sys.platform.startswith("win")
+# Platform predicates live in aionetiface (single source of truth).
+from aionetiface.net.pcap.ip.next_hop import (  # noqa: E402
+    is_bsd, is_darwin, is_linux, is_windows,
+)
 
 
 def need_sudo():
@@ -82,34 +67,15 @@ def sudo_argv(argv):
 
 
 def run_cmd(argv, stdin_data=None, timeout=10):
-    """Run a command. Returns (rc, stdout, stderr). Never raises."""
+    """Run a command. Returns (rc, stdout, stderr). Never raises.
+
+    Thin logging shim around aionetiface.utility.cmd_tools.cmd_sync; the
+    raw subprocess plumbing lives there.  Kept as a named function so
+    the rest of firewall_helper can stay decoupled from the helper
+    module's name.
+    """
     log("firewall_helper: exec: {0}".format(" ".join(argv)))
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE if stdin_data is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError as exc:
-        log("firewall_helper: spawn failed: {0}".format(exc))
-        return (127, "", str(exc))
-    if stdin_data is not None:
-        stdin_bytes = stdin_data.encode("ascii")
-    else:
-        stdin_bytes = None
-    try:
-        out_b, err_b = proc.communicate(input=stdin_bytes, timeout=timeout)
-    except Exception as exc:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        log("firewall_helper: communicate failed: {0}".format(exc))
-        return (124, "", str(exc))
-    out = out_b.decode("utf-8", errors="replace") if out_b else ""
-    err = err_b.decode("utf-8", errors="replace") if err_b else ""
-    rc = proc.returncode
+    rc, out, err = cmd_sync(list(argv), stdin_data=stdin_data, timeout=timeout)
     log("firewall_helper: rc={0} stdout={1} stderr={2}".format(
         rc, out.strip(), err.strip(),
     ))

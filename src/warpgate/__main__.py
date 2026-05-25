@@ -5,6 +5,7 @@ import code
 import concurrent.futures
 import inspect
 import sys
+import textwrap
 import threading
 import types
 import warnings
@@ -31,12 +32,11 @@ if not hasattr(futures, "_chain_future"):
         source.add_done_callback(on_done)
     futures._chain_future = chain_future_35
 
-vmaj, vmin, _ = platform.python_version_tuple()
-SUPPORTS_TOP_LEVEL_AWAIT = int(vmaj) >= 3 and int(vmin) >= 8
-SUPPORTS_INTERACT_EXITMSG = int(vmaj) >= 3 and int(vmin) >= 6
-
 from . import __version__ as warpgatev  # noqa: E402
-from aionetiface import fstr  # noqa: E402
+from aionetiface import fstr, aionetiface_setup_event_loop  # noqa: E402
+from aionetiface.utility.utils import (  # noqa: E402
+    SUPPORTS_INTERACT_EXITMSG, SUPPORTS_TOP_LEVEL_AWAIT, vmaj, vmin,
+)
 
 
 class AsyncIOInteractiveConsole(code.InteractiveConsole):
@@ -82,7 +82,6 @@ class AsyncIOInteractiveConsole(code.InteractiveConsole):
 
     def run_as_async(self, source, filename):
         """Wrap source in an async def, run it on the loop, merge locals back."""
-        import textwrap
         ns = "repl_ns_a7c2"
         indented = textwrap.indent(source.rstrip(), "    ")
         wrapper = (
@@ -195,9 +194,13 @@ class REPLThread(threading.Thread):
     def run(self):
         """Drive the interactive REPL console until the user exits."""
         try:
-            loop_policy = str(asyncio.get_event_loop_policy())
-            if "elector" in loop_policy:
-                loop_policy = "selector"
+            # Show the actual policy class name -- previously this mapped
+            # to a friendly "selector" / "proactor" label, but that
+            # collapsed CustomEventLoopPolicy and asyncio.DefaultEventLoopPolicy
+            # to the same string, making it impossible to tell from the
+            # banner whether aionetiface_setup_event_loop() had actually
+            # run.  type(policy).__name__ is unambiguous.
+            loop_policy = type(asyncio.get_event_loop_policy()).__name__
 
             spawn_method = multiprocessing.get_start_method()
             vmaj, vmin, _ = platform.python_version_tuple()
@@ -239,7 +242,13 @@ class REPLThread(threading.Thread):
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+    # Install CustomEventLoopPolicy BEFORE touching the loop. Without this, on
+    # Python 3.8+ Windows the default WindowsProactorEventLoopPolicy is still
+    # active and get_event_loop() returns a ProactorEventLoop -- which the rest
+    # of the stack is not built for (see aionetiface entrypoint.py).
+    aionetiface_setup_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     repl_locals = {"asyncio": asyncio}
     for key in {
         "__name__",

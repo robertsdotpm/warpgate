@@ -60,10 +60,4 @@ async def start_demo_node(port, ifs=None):
     return node
 
 
-async def close_nodes(*nodes):
-    for node in nodes:
-        if node is not None:
-            try:
-                await asyncio.wait_for(node.close(), timeout=10)
-            except Exception:
-                pass
+from .auto_connect_helpers import close_nodes  # noqa: F401 — single source of truth

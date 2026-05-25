@@ -25,26 +25,46 @@ Lessons re-applied from random_probe:
 """
 import select
 import socket
+import sys
 import time
 
 from aionetiface import fstr, log, sock_has_data
 from aionetiface.net.address import resolve_dest_tup
+from aionetiface.net.net_utils import zero_v6_flowinfo
 
 from ..tcp_punch.tcp_punch_utils import bind_punch_sockets
 from .udp_punch_defs import (
-    UDP_PUNCH_FRAME_LEN,
     UDP_PUNCH_KIND_CONFIRM,
     UDP_PUNCH_KIND_PROBE,
+    UDP_PUNCH_MAX_FRAME_LEN,
     build_frame,
     parse_frame,
 )
 
 
+# Peek / drain buffer wide enough for the longest punch frame we
+# accept.  All frames are STUN now (Binding Request 20 bytes or
+# Binding Success Response with optional XOR-MAPPED-ADDRESS up to
+# ~44 bytes for IPv6); UDP_PUNCH_MAX_FRAME_LEN gives generous
+# headroom.  Sizing too small would: (a) truncate STUN frames on
+# MSG_PEEK so parse_frame rejects them on length, and (b) on Windows
+# trigger WSAEMSGSIZE on the drain recvfrom because the kernel
+# discards the unread tail.
+PUNCH_RECV_BUFLEN = UDP_PUNCH_MAX_FRAME_LEN
+
+
 # Module-level fallbacks. Per-call params dicts override these.
 SPRAY_DURATION = 5.0
 LISTEN_DURATION = 6.0
-RETRY_INTERVAL = 0.05
-SPRAY_INTERVAL = 0.02
+from ..tcp_punch.punch_defs import RETRY_INTERVAL  # noqa: E402 reuse tcp_punch's value
+# Aggressive 50 Hz (0.02s) sprayed 17 sockets * 50 * 3s = 2550 packets total,
+# triggering router UDP-burst caps on the inbound side -- wire capture showed
+# master sending 2437 Out and slave receiving 17 (~0.7% delivery).  Drop to
+# 0.5s (2 Hz) -- 17 sockets * 2 Hz * 3s = ~102 packets total, well under
+# any consumer-router burst threshold while still giving each socket 6 PROBE
+# retransmits.  Convergence only needs ONE PROBE through each direction +
+# one CONFIRM back; the CONFIRM-spread above provides 10 reply attempts.
+SPRAY_INTERVAL = 0.5
 
 
 def fire_probes(
@@ -192,7 +212,11 @@ def watch_for_winner(
         log("udp_punch.watch_for_winner: no bound sockets; nothing to watch")
         return None
 
-    confirm_frame = build_frame(UDP_PUNCH_KIND_CONFIRM, nonce)
+    # confirm_frame is built per-PROBE arrival in the loop below.  A
+    # STUN Binding Success Response must carry an XOR-MAPPED-ADDRESS
+    # attribute describing the peer's reflexive address (RFC 5389
+    # §6.3.3), so the frame depends on the peer addr we just learned
+    # from recvfrom -- can't be precomputed.
     end = time.monotonic() + listen_duration
     log(fstr(
         "udp_punch.watch_for_winner: watching {0} sockets at {1} duration={2}s nonce={3}",
@@ -217,20 +241,15 @@ def watch_for_winner(
         for s in ready:
             # MSG_PEEK: don't drain unrecognised data.
             try:
-                buf, addr = s.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+                buf, addr = s.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
             except OSError:
                 continue
 
-            # Normalize v6 addr: XP's stack stuffs garbage into
-            # flowinfo on recvfrom (observed flowinfo=3824046100,
-            # well over the 20-bit max of 1048575). Any subsequent
-            # sendto / connect with that addr raises OverflowError.
-            # Zero flowinfo here so the addr is reusable downstream.
-            if len(addr) == 4:
-                addr = (addr[0], addr[1], 0, addr[3])
+            # Zero v6 flowinfo for XP-stack OverflowError protection.
+            addr = zero_v6_flowinfo(addr)
 
             kind, recv_nonce = parse_frame(buf)
-            if kind is None or recv_nonce != nonce:
+            if kind is None or recv_nonce[:12] != nonce[:12]:
                 # Not a punch frame from this session (wrong nonce or format).
                 # Drain it so the queue advances to real punch frames.
                 # MSG_PEEK always surfaces the oldest datagram — a stuck
@@ -245,16 +264,12 @@ def watch_for_winner(
 
             # It IS a punch frame -- consume the bytes off the queue.
             try:
-                s.recvfrom(UDP_PUNCH_FRAME_LEN)
+                s.recvfrom(PUNCH_RECV_BUFLEN)
             except OSError:
                 continue
 
-            # Normalise the peer addr for sendto (XP flowinfo workaround
-            # already applied above when len(addr) == 4).
-            if len(addr) == 4:
-                sendto_addr = (addr[0], addr[1], 0, addr[3])
-            else:
-                sendto_addr = addr
+            # XP flowinfo already zeroed above; reuse the same addr.
+            sendto_addr = addr
 
             if kind == UDP_PUNCH_KIND_PROBE:
                 probes_seen += 1
@@ -264,10 +279,31 @@ def watch_for_winner(
                 ))
                 # Reflect a CONFIRM so the peer sees this path.  Slave
                 # only sends one (master-driven path is enough); master
-                # blasts 5x as the "I picked this path" marker for the
-                # slave to lock onto.
-                burst = 5 if is_master else 1
-                for _ in range(burst):
+                # sprays the CONFIRM over time so the slave's recv loop
+                # has multiple chances to land one through high inbound
+                # UDP loss on the slave's NAT.  A tight 5x burst at
+                # ~0.7% delivery (observed on consumer-router LAN here)
+                # has expected = 0 CONFIRMs through; spreading the
+                # CONFIRMs across ~1s with 100ms gaps gives the slave's
+                # 3s watch window 10 separate landing opportunities and
+                # stays well under any burst-rate cap.  Slave's reply
+                # stays at burst=1 -- master locks on the FIRST PROBE
+                # arrival, so it doesn't need a long reply window.
+                if is_master:
+                    confirm_burst = 10
+                    confirm_interval = 0.1
+                else:
+                    confirm_burst = 1
+                    confirm_interval = 0.0
+                # Build CONFIRM per peer addr -- STUN Binding Success
+                # Response needs an XOR-MAPPED-ADDRESS attribute pointing
+                # at the peer's reflexive transport address (the addr we
+                # just got from recvfrom).  Native P2UP mode ignores
+                # peer_addr.
+                confirm_frame = build_frame(
+                    UDP_PUNCH_KIND_CONFIRM, nonce, peer_addr=sendto_addr,
+                )
+                for i in range(confirm_burst):
                     try:
                         s.sendto(confirm_frame, sendto_addr)
                     except OSError as exc:
@@ -276,6 +312,8 @@ def watch_for_winner(
                             (log_sock_addr(s), sendto_addr, repr(exc)),
                         ))
                         break
+                    if confirm_interval and i < confirm_burst - 1:
+                        time.sleep(confirm_interval)
                 if is_master:
                     log(fstr(
                         "udp_punch.watch_for_winner: MASTER locking on PROBE arrival; sock={0} peer={1}",
@@ -321,18 +359,14 @@ def watch_for_winner(
         ready = []
     for s in ready:
         try:
-            buf, addr = s.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+            buf, addr = s.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
         except OSError:
             continue
-        # Same flowinfo normalization as the main loop -- XP's
-        # stack returns bogus flowinfo on recvfrom and any
-        # subsequent connect/sendto on that addr raises.
-        if len(addr) == 4:
-            addr = (addr[0], addr[1], 0, addr[3])
+        addr = zero_v6_flowinfo(addr)
         kind, recv_nonce = parse_frame(buf)
-        if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce == nonce:
+        if kind == UDP_PUNCH_KIND_CONFIRM and recv_nonce[:12] == nonce[:12]:
             try:
-                s.recvfrom(UDP_PUNCH_FRAME_LEN)
+                s.recvfrom(PUNCH_RECV_BUFLEN)
             except OSError:
                 pass
             return (s, addr)
@@ -359,14 +393,14 @@ def drain_punch_residue(sock, nonce):
     drained = 0
     while True:
         try:
-            buf, _ = sock.recvfrom(UDP_PUNCH_FRAME_LEN, socket.MSG_PEEK)
+            buf, _ = sock.recvfrom(PUNCH_RECV_BUFLEN, socket.MSG_PEEK)
         except (BlockingIOError, OSError):
             break
         kind, recv_nonce = parse_frame(buf)
-        if kind is None or recv_nonce != nonce:
+        if kind is None or recv_nonce[:12] != nonce[:12]:
             break
         try:
-            sock.recvfrom(UDP_PUNCH_FRAME_LEN)
+            sock.recvfrom(PUNCH_RECV_BUFLEN)
         except OSError:
             break
         drained += 1
@@ -385,6 +419,7 @@ def udp_punch_engine(
     params=None,
     stop_reader=None,
     route=None,
+    decider_ip=None,
 ):
     """Drive a full UDP punch: bind, barrier-sleep, fire, watch, return winner.
 
@@ -415,32 +450,18 @@ def udp_punch_engine(
         log("udp_punch_engine: NO sockets bound; aborting")
         return None
 
-    # Master/slave election by external-IP comparison.  Same trick
-    # tcp_punch's choose_winning_tcp_sock uses (`our_ip > their_ip`).
-    # Master locks on first PROBE/CONFIRM arrival and signals via a
-    # 5x CONFIRM burst from that socket; slave waits for the master's
-    # CONFIRM to commit.  Without the election, multi-socket cases
-    # (boundary + STUN-derived ports) raced on first-arrival and ended
-    # up with mismatched winner sockets on each side -- caller's
-    # selector_proxy then sent into a closed peer port and ECONNREFUSED
-    # killed the bridge.  External IP (route.ext()) is what the peer
-    # actually observes and is the only quantity that gives a
-    # symmetric-decidable answer when one side is behind NAT.  Falls
-    # back to src_ip when route.ext() is unavailable -- works for
-    # public-public pairs (where src_ip == ext_ip) but degrades to a
-    # coin flip when one side is NAT'd.
-    own_ip_for_election = None
-    if route is not None:
-        try:
-            own_ip_for_election = str(route.ext())
-        except (AttributeError, OSError, ValueError):
-            own_ip_for_election = None
-    if not own_ip_for_election:
-        own_ip_for_election = src_ip
-    is_master = bool(
-        own_ip_for_election and dest_ip
-        and str(own_ip_for_election) > str(dest_ip)
-    )
+    # Master/slave election: same `our_ip > their_ip` trick tcp_punch
+    # uses.  Caller (udp_punch/main.py) computes decider_ip with the
+    # route-type branch (ext for EXT_BIND, src for NIC_BIND) so both
+    # peers compare the same peer-symmetric quantity.  Engine no
+    # longer runs its own route.ext()-always heuristic which was
+    # wrong for NIC_BIND peers behind a shared NAT (both peers' ext
+    # was identical → equality → both went slave → deadlock).
+    # Falls back to src_ip if the caller didn't pass decider_ip
+    # (legacy callers / standalone CLI).
+    own_ip_for_election = decider_ip or src_ip
+    from ..tcp_punch.punch_utils import is_master_by_ext
+    is_master = is_master_by_ext(own_ip_for_election, dest_ip)
 
     # Synchronised barrier: wait for the agreed punch_time so both
     # sides spray in the same window.
@@ -455,7 +476,19 @@ def udp_punch_engine(
     # instead of hitting a closed port-restricted entry.  The master does
     # NOT prime: its role is to be the first to send the real probes that
     # the slave's pinhole will accept.
-    if not is_master:
+    #
+    # SKIP ON WINDOWS: when the TTL-expired router replies with ICMP
+    # Time Exceeded, Windows marks the originating UDP socket as
+    # broken (WinError 10052 "keep-alive activity detected failure"
+    # on the next recvfrom).  Every subsequent operation on that
+    # socket then fails, so the watch_for_winner loop receives zero
+    # bytes from the master.  Verified live 2026-05-24 -- the prime
+    # is the root cause of the 0/14 Windows udp_punch fail rate.
+    # Linux/macOS quietly drop ICMP for UDP and aren't affected.
+    # The 3 s spray that follows already opens the NAT mapping on
+    # its own, so the prime adds no value when it can't be done
+    # safely.
+    if not is_master and sys.platform != "win32":
         sock_family = bound_socks[0][1].family if bound_socks else socket.AF_INET
         if sock_family == socket.AF_INET6:
             # socket.IPPROTO_IPV6 / IPV6_UNICAST_HOPS are not always

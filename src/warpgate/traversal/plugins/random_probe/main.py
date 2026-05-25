@@ -42,20 +42,16 @@ from aionetiface.net.selector_proxy import selector_proxy
 from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
 
 from .random_probe_defs import (
-    DEFAULT_PROBE_COUNT,
-    PROBE_LEN,
+    RANDOM_PROBE_DEFAULT_COUNT,
     PROBE_LISTEN_TIMEOUT,
-    PROBE_MAGIC,
 )
-from .random_probe_lib import (
-    async_drain_probe_residue,
+from .random_probe_engine import sync_run_bidirectional_spray
+from .random_probe_utils import (
+    decode_probe,
     drain_probe_residue,
+    looks_like_random_probe,
     make_udp_socket,
-    sync_run_bidirectional_spray,
-    sync_run_non_sym_side,
-    sync_run_symmetric_side,
     sync_stun_discover_mapping,
-    wait_until,
 )
 
 
@@ -107,7 +103,7 @@ class RandomProbePlugin(Plugin):
     # LOOPBACK_BIND stays out -- random_probe over loopback is
     # degenerate (kernel short-circuit, nothing to verify).
     route_types = (EXT_BIND, NIC_BIND)
-    conf = {"timeout": 5}
+    conf = {"timeout": 10}
     proto_messages = (
         (RandomProbeMsg, P2P_RANDOM_PROBE, 18),
     )
@@ -134,24 +130,24 @@ class RandomProbePlugin(Plugin):
 
         # Wire-advertised "address each side identifies itself by" --
         # used for the role-decider comparison and as the value placed
-        # on RandomProbeMsg.payload.ext_ip. NOT necessarily the local
-        # bind IP -- for EXT_BIND it's the route's external IP, what
-        # the peer actually observes through NAT.
-        #
-        # peer_addr_ip is always self.dest["ip"]: resolve_pair set
-        # that to the peer's NIC IP for NIC_BIND / same_machine and
-        # to the peer's ext IP for EXT_BIND, which is exactly what
-        # the peer's view of "their own" address matches -- so both
-        # peers compute the same (my, their) pair and the role
-        # decider stays symmetric.
+        # on RandomProbeMsg.payload.ext_ip.  This is NOT necessarily
+        # self.src["ip"]: resolve_pair leaves src["ip"] as the local
+        # *bind* IP, which is the LAN IP even on the EXT_BIND path.
+        # For EXT_BIND we need the route's external (NAT-observable)
+        # IP so the peer fires probes at something reachable across
+        # the internet -- self.nic.route(af).ext() returns that.
+        # For NIC_BIND / same_machine the bind IP is also the peer-
+        # observable IP, so src["ip"] is correct.
         self.peer_addr_ip = str(self.dest.get("ip") or "")
-        if self.route_type == NIC_BIND or self.same_machine:
+        if self.route_type == NIC_BIND:
             self.my_addr_ip = str(self.src.get("ip") or "")
         else:
-            try:
-                self.my_addr_ip = str(self.nic.route(self.af).ext())
-            except (AttributeError, OSError, ValueError):
-                self.my_addr_ip = str(self.src.get("ip") or "")
+            # src["ext"] is an IPRange object (set by topology.py); cast
+            # to str for downstream comparisons and on-wire encoding.
+            # The combo generator guarantees src["ext"] is populated for
+            # EXT_BIND combos and that the two sides' ext IPs differ;
+            # see the combo-level validation in traversal_utils.
+            self.my_addr_ip = str(self.src["ext"])
 
         # Role assignment by NAT restrictiveness, then by IP:
         #   1. Whichever side has the *higher* NAT type number plays
@@ -174,15 +170,11 @@ class RandomProbePlugin(Plugin):
         elif my_nat_n < peer_nat_n:
             my_role = "non_sym"
         else:
-            # Tie-breaker on missing / equal addr: fall back to who
-            # initiated (initiator = non_sym, responder = sym).
-            if (
-                self.my_addr_ip == self.peer_addr_ip
-                or not self.my_addr_ip
-                or not self.peer_addr_ip
-            ):
-                my_role = "non_sym" if reply is None else "sym"
-            elif self.my_addr_ip < self.peer_addr_ip:
+            # NAT-type tie.  Decide by IP order so both peers pick
+            # opposite roles deterministically.  The combo generator
+            # guarantees the two sides' addr_ips differ, so the IP
+            # compare always picks a definite role.
+            if self.my_addr_ip < self.peer_addr_ip:
                 my_role = "non_sym"
             else:
                 my_role = "sym"
@@ -223,16 +215,16 @@ class RandomProbePlugin(Plugin):
             return
 
         # Responder: extract peer's params, lock our role, fire.
+        #
+        # The previous code aborted when peer_role == my_role.  That was
+        # a real failure mode when NAT-info propagation races mean each
+        # side computes its role from a partially-populated peer_nat
+        # dict and both pick "sym" (or both pick "non_sym").  But the
+        # spray engine is direction-agnostic: it converges as long as
+        # both sides actually fire, regardless of which role label they
+        # carry.  Letting the round proceed is strictly better than
+        # giving up.
         peer_role = reply.payload.role
-        if peer_role == my_role:
-            log(
-                "RandomProbePlugin: peer claimed role={0} but I'm also "
-                "{0}; aborting".format(peer_role)
-            )
-            if not self.result.done():
-                self.result.set_result(None)
-            return
-
         nonce = bytes.fromhex(reply.payload.magic)
         if len(nonce) != 16:
             log("RandomProbePlugin: bad nonce length in peer reply")
@@ -240,32 +232,28 @@ class RandomProbePlugin(Plugin):
                 self.result.set_result(None)
             return
 
-        # Trust the peer's advertised addr if it's a usable string;
-        # otherwise fall back to whatever we computed locally for
-        # peer_addr_ip (NIC if same_machine, ext otherwise).  This
-        # matters because the responder side may have computed its
-        # own ext from a fresher set of fields than the initiator
-        # parsed out of the on-wire addr_bytes.
-        peer_addr_ip = reply.payload.ext_ip or self.peer_addr_ip
+        # We use self.peer_addr_ip = self.dest["ip"] (set in the
+        # initial run() block).  Don't override from the peer's
+        # wire-advertised ext_ip -- that introduced an asymmetry
+        # between what each side compared in the election.
         peer_known_port = reply.payload.known_port
-        probe_count = reply.payload.probe_count or DEFAULT_PROBE_COUNT
+        probe_count = reply.payload.probe_count or RANDOM_PROBE_DEFAULT_COUNT
         punch_time = reply.payload.punch_time
 
-        # If the peer advertised a v6 link-local IP (fe80::...), bake
-        # OUR local scope_id into it so resolve_dest_tup downstream
-        # produces the (host, port, flowinfo, scope_id) 4-tuple Windows
-        # needs to actually send to the right interface. Same fix
-        # applied to tcp_punch (commits 10f4977 + 87148ae) and
-        # udp_punch -- without it Windows sendto silently lands on the
-        # OS-default NIC and the probes never reach the peer. Use
-        # get_nic_id(af) so XP's split TCPIP/TCPIP6 ifindex spaces
-        # are handled correctly.
-        if peer_addr_ip and peer_addr_ip.lower().startswith("fe80"):
+        # If the peer addr is a v6 link-local IP (fe80::...), bake OUR
+        # local scope_id into it so resolve_dest_tup downstream produces
+        # the (host, port, flowinfo, scope_id) 4-tuple Windows needs to
+        # actually send to the right interface.  Same fix applied to
+        # tcp_punch (commits 10f4977 + 87148ae) and udp_punch -- without
+        # it Windows sendto silently lands on the OS-default NIC and
+        # the probes never reach the peer.  get_nic_id(af) handles XP's
+        # split TCPIP / TCPIP6 ifindex spaces correctly.
+        if self.peer_addr_ip and self.peer_addr_ip.lower().startswith("fe80"):
             try:
                 from aionetiface.net.bind.bind_utils import ip6_patch_bind_ip
                 v6_scope = self.nic.get_nic_id(self.af)
-                peer_addr_ip = ip6_patch_bind_ip(
-                    peer_addr_ip.split("%", 1)[0], v6_scope,
+                self.peer_addr_ip = ip6_patch_bind_ip(
+                    self.peer_addr_ip.split("%", 1)[0], v6_scope,
                 )
             except (ImportError, AttributeError, OSError):
                 pass
@@ -305,7 +293,11 @@ class RandomProbePlugin(Plugin):
         # ~39 s fast, Vista: ~22 s fast) fire at the agreed rendezvous
         # instead of too early.  wait_until() uses time.time() which
         # reflects the raw OS clock and fires immediately on skewed hosts.
-        ntp_delay = punch_time - int(self.sys_clock.time())
+        #
+        # Use float subtraction (not int(sys_clock.time())) so we don't
+        # truncate up to a full second of pre-rendezvous wait and fire
+        # too early near the boundary.
+        ntp_delay = punch_time - self.sys_clock.time()
         if 0 < ntp_delay <= p_or_default("max_sleep"):
             await asyncio.sleep(ntp_delay)
 
@@ -317,13 +309,18 @@ class RandomProbePlugin(Plugin):
                 self.result.set_result(None)
             return
         bind_ip = self.src["ip"]
-        # Master/slave election uses the wire-advertised "address each
-        # side identifies itself by" (my_addr_ip / peer_addr_ip):
-        # for NIC_BIND that's the NIC IP, for EXT_BIND it's the
-        # externally-observable IP. Both peers see the same pair of
-        # strings, so own_ext_ip > peer_ext_ip is symmetric-decidable
-        # without coordination.
-        own_ext_ip = self.my_addr_ip or bind_ip
+
+
+        # Master/slave election: strict per-route_type IP source so both
+        # peers compare the SAME class of address.  Mixing NIC-vs-ext
+        # across peers used to let both elect SLAVE (live failure 2026-
+        # 05-25 on CGNAT pool: src["ext"] missing -> fell back to bind_ip
+        # locally, peer still compared against STUN-mapped WAN).  Combo
+        # generator guarantees src["ext"] is populated for EXT_BIND.
+        if self.route_type == EXT_BIND:
+            own_ext_ip = str(self.src["ext"])
+        else:
+            own_ext_ip = str(bind_ip)
 
 
         # Algorithm phase runs in a thread executor with PURE
@@ -354,11 +351,11 @@ class RandomProbePlugin(Plugin):
             None,
             lambda: sync_run_bidirectional_spray(
                 bind_ip=bind_ip,
-                peer_ext_ip=peer_addr_ip,
+                peer_ext_ip=self.peer_addr_ip,
                 nonce=nonce,
                 probe_count=probe_count,
                 listen_timeout=PROBE_LISTEN_TIMEOUT,
-                interface=self.nic,
+                route=route,
                 own_ext_ip=own_ext_ip,
             ),
         )
@@ -484,11 +481,10 @@ class RandomProbePlugin(Plugin):
             stream = pipe.pipe_events.stream
             stream.subs = {}
             pipe.subscribe(SUB_ALL)
-            from .random_probe_defs import PROBE_LEN, PROBE_MAGIC
             original_add_msg = stream.add_msg
 
             def filtered_add_msg(data, client_tup):
-                if len(data) == PROBE_LEN and bytes(data[:4]) == PROBE_MAGIC:
+                if looks_like_random_probe(bytes(data)):
                     return
                 return original_add_msg(data, client_tup)
 
@@ -521,7 +517,15 @@ class RandomProbePlugin(Plugin):
 
         def bridge_worker():
             try:
+                try:
+                    bw_local = punched_sock_ref.getsockname()
+                except OSError:
+                    bw_local = None
+                log("[RP-WORKER] enter local={0} peer_ref={1} fd={2}".format(
+                    bw_local, peer_ref, punched_sock_ref.fileno(),
+                ))
                 drained = drain_probe_residue(punched_sock_ref, nonce_ref)
+                log("[RP-WORKER] drained {0} residual frames".format(drained))
                 # Short polling window (~0.8s) to absorb late probes
                 # the carrier buffered between sym's last send and
                 # arrival on the cone's NIC.
@@ -535,7 +539,6 @@ class RandomProbePlugin(Plugin):
                     except (BlockingIOError, OSError):
                         time.sleep(0.05)
                         continue
-                    from .random_probe_lib import decode_probe
                     if decode_probe(data, nonce_ref) is None:
                         time.sleep(0.05)
                         continue
@@ -545,35 +548,38 @@ class RandomProbePlugin(Plugin):
                     except OSError:
                         break
 
+                log("[RP-WORKER] late_probes={0}; about to connect punched_sock "
+                    "to peer_ref={1}".format(late, peer_ref))
                 try:
                     punched_sock_ref.connect(peer_ref)
                 except OSError as exc:
-                    log("RandomProbePlugin: punched_sock.connect "
-                        "failed: " + repr(exc))
+                    log("[RP-WORKER] punched_sock.connect FAILED " + repr(exc))
                     loop_for_bridge.call_soon_threadsafe(
                         signal_bridge_ready, False,
                     )
                     return
+                log("[RP-WORKER] connect OK")
 
-                # Drain stale ICMP errors queued on the winner socket
-                # from the probe spray phase (same as udp_punch's
-                # post-connect drain). Probes to wrong predicted ports
-                # generate ICMP unreachable which queue as async errors;
-                # connect() does not clear them and the first recv() in
-                # selector_proxy returns ECONNREFUSED, tripping the
-                # streak counter. recv() consumes one item per call.
-                rp_stale_drained = 0
-                rp_stale_errors = 0
-                for _ in range(256):
-                    try:
-                        punched_sock_ref.recv(4096)
-                        rp_stale_drained += 1
-                    except BlockingIOError:
-                        break
-                    except (ConnectionRefusedError, OSError):
-                        rp_stale_errors += 1
-                if rp_stale_drained or rp_stale_errors:
-                    pass
+                # Skip the post-connect stale drain entirely.  random_probe's
+                # SLAVE side enters bridge_worker noticeably later than MASTER
+                # (slave waits for CONFIRM, master commits on first PROBE) --
+                # by the time slave reaches "post-connect", the peer has
+                # already sent its WG-LIVENESS-PING through the bridge.  On
+                # Windows that PING sits in the punched_sock recv queue;
+                # SIO_UDP_CONNRESET=FALSE silently suppresses the ICMP
+                # backwash this drain was originally meant to consume, so
+                # recv() returns *real bytes* and the drain happily eats the
+                # incoming PING (confirmed live with head-byte logging:
+                # heads=[b'RPCV...canary', b'WG-LIVENESS-PING:...']).  On
+                # Linux/BSD, ICMP-unreachable from stale spray probes does
+                # surface as ConnectionRefusedError on the next recv, but
+                # selector_proxy already handles that via its
+                # UDP_ECONNREFUSED_LIMIT=8 streak counter -- so we can leave
+                # the cleanup to selector_proxy on all platforms and avoid
+                # ever consuming legitimate inbound here.
+                log("[RP-WORKER] skipping post-connect stale drain "
+                    "(SIO_UDP_CONNRESET=FALSE on Windows / selector_proxy "
+                    "ECONNREFUSED streak handles Linux)")
 
                 # Signal convergence BEFORE entering selector_proxy so
                 # main can resolve result and the demo can start sending.
@@ -583,6 +589,7 @@ class RandomProbePlugin(Plugin):
                 loop_for_bridge.call_soon_threadsafe(
                     signal_bridge_ready, True,
                 )
+                log("[RP-WORKER] entering selector_proxy")
                 selector_proxy(
                     punched_sock_ref,
                     listener_addr_ref,
@@ -590,7 +597,9 @@ class RandomProbePlugin(Plugin):
                     sock_proto=socket_mod.SOCK_DGRAM,
                     socket_r=worker_sock_ref,
                 )
+                log("[RP-WORKER] selector_proxy returned; worker exiting")
             except Exception:  # pylint: disable=broad-except
+                log("[RP-WORKER] worker EXC")
                 log_exception()
                 loop_for_bridge.call_soon_threadsafe(
                     signal_bridge_ready, False,
@@ -615,7 +624,18 @@ class RandomProbePlugin(Plugin):
             bridge_ready = False
 
         if not self.result.done():
-            self.result.set_result(pipe if bridge_ready else None)
+            # Return PipeEvents (not the outer Pipe wrapper) so
+            # verify_pipe_alive's liveness-future registration and the
+            # subsequent inbound-msg_cb dispatch agree on which object
+            # holds liveness_pong_futures.  Same fix as udp_punch's
+            # set_result; see that plugin for the full writeup.  Without
+            # it, PONG arrives at PipeEvents (data-bearing layer) but
+            # the future was registered on the outer Pipe, never
+            # resolves, verify_pipe_alive times out -> DEAD.
+            returned_pipe = pipe.pipe_events if (
+                bridge_ready and getattr(pipe, "pipe_events", None) is not None
+            ) else (pipe if bridge_ready else None)
+            self.result.set_result(returned_pipe)
 
         # Diagnostic: send a literal RAW-SOCK probe directly on
         # the underlying sock (bypassing the Pipe entirely) to
@@ -688,7 +708,7 @@ class RandomProbePlugin(Plugin):
                 "magic": magic,
                 "ext_ip": str(ext_ip),
                 "known_port": self.our_known_port(),
-                "probe_count": DEFAULT_PROBE_COUNT,
+                "probe_count": RANDOM_PROBE_DEFAULT_COUNT,
             },
         })
 
@@ -705,6 +725,14 @@ class RandomProbePlugin(Plugin):
         one gets dropped at the cone's NAT, and the round can never
         converge.
 
+        Deadlined against ``self.punch_time``: STUN discovery is on the
+        critical path between "send the signal" and "fire the spray",
+        and a slow-responding STUN pool used to burn up to 16 s here
+        (4 servers * 2.0 s timeout * 2 retries) while the rendezvous
+        ticked by silently.  We give STUN at most STUN_SAFETY seconds
+        less than the time until punch_time, fail-fast on the remainder,
+        and fall back to local port if nothing replied in time.
+
         Falls back to (local_ip, local_port) when no STUN servers are
         available or the queries time out -- in that case the
         algorithm only works on full-cone NATs that happen to do port
@@ -712,13 +740,13 @@ class RandomProbePlugin(Plugin):
         still useful for same-machine / loopback testing.
         """
         try:
-            await self.bind()
+            route = await self.bind()
         except (OSError, ValueError):
             log("RandomProbePlugin: pre-bind route bind failed")
             return
         try:
             self.prebound_sock = make_udp_socket(
-                self.src["ip"], 0, interface=self.nic,
+                self.src["ip"], 0, route=route,
             )
             self.prebound_port = self.prebound_sock.getsockname()[1]
         except OSError:
@@ -743,23 +771,59 @@ class RandomProbePlugin(Plugin):
                 "for full-cone-with-port-preservation peers)")
             return
 
+        # Deadline STUN discovery against the rendezvous: STUN must
+        # finish in time to advertise the mapping in the outgoing
+        # RandomProbeMsg, which we only get to send if punch_time is
+        # still ahead.  STUN_SAFETY leaves the post-STUN signal+settle
+        # window of the punch protocol.  Without this gate a slow STUN
+        # pool burned up to 16s here while punch_time ticked by silently
+        # (4 servers * 2s timeout * 2 retries) and we missed the bucket.
+        STUN_SAFETY = 2.0
+        punch_time = getattr(self, "punch_time", None)
+        if punch_time is None:
+            stun_budget = None
+        else:
+            stun_budget = punch_time - self.sys_clock.time() - STUN_SAFETY
+            if stun_budget <= 0:
+                log("RandomProbePlugin: no STUN budget; punch_time too "
+                    "close (rendezvous in {0:.1f}s); skipping STUN".format(
+                        punch_time - self.sys_clock.time(),
+                    ))
+                return
+
         loop = get_running_loop()
         for stun_server in stun_servers:
+            if stun_budget is not None and stun_budget <= 0:
+                log("RandomProbePlugin: STUN budget exhausted before "
+                    "trying all servers; falling back to local port")
+                break
             try:
+                t0 = self.sys_clock.time()
                 resolved = await self.resolve_stun_dest(stun_server)
             except (OSError, ConnectionError, asyncio.TimeoutError):
+                if stun_budget is not None:
+                    stun_budget -= self.sys_clock.time() - t0
                 continue
+            # Per-server timeout: bound to whichever is smaller -- the
+            # default 2s probe budget or the remaining STUN_BUDGET so
+            # we never bleed into the punch_time window.
+            if stun_budget is not None:
+                per_server_timeout = max(0.5, min(2.0, stun_budget))
+            else:
+                per_server_timeout = 2.0
             # Run the STUN query in a thread executor using
             # sync blocking I/O -- the prebound sock should
             # never get touched by asyncio.add_reader before
             # Pipe.connect takes ownership post-algorithm.
             mapping = await loop.run_in_executor(
                 None,
-                lambda srv=resolved: sync_stun_discover_mapping(
+                lambda srv=resolved, t=per_server_timeout: sync_stun_discover_mapping(
                     self.prebound_sock, srv, self.af,
-                    timeout=2.0, retries=2,
+                    timeout=t, retries=2,
                 ),
             )
+            if stun_budget is not None:
+                stun_budget -= self.sys_clock.time() - t0
             if mapping is not None:
                 self.mapped_ip, self.mapped_port = mapping
                 log("RandomProbePlugin: STUN discovered mapping "
@@ -832,18 +896,6 @@ class RandomProbePlugin(Plugin):
 def p_or_default(key):
     """Look up *key* in FAST_PUNCH_PARAMS with a sensible fallback."""
     return float(FAST_PUNCH_PARAMS.get(key, 8.0))
-
-
-def drain_queue(q):
-    """Drain an asyncio.Queue without blocking; return count drained."""
-    n = 0
-    while True:
-        try:
-            q.get_nowait()
-            n += 1
-        except asyncio.QueueEmpty:
-            break
-    return n
 
 
 class RandomProbePluginFactory:

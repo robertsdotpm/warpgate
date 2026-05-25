@@ -264,7 +264,8 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
     if not established:
         return None
 
-    is_master = src_ip > dest_ip
+    from ..tcp_punch.punch_utils import is_master_by_ext
+    is_master = is_master_by_ext(src_ip, dest_ip)
     role = "master" if is_master else "slave"
     sorted_conns = sorted(established, key=sort_key_ft)
     log("tcp_punch_pcap: canonical-winner handshake role={0} "

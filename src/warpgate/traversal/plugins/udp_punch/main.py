@@ -32,9 +32,15 @@ from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.punch_client import PunchClient
-from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
+from ..tcp_punch.punch_utils import compute_decider_ip
+from ..tcp_punch.punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE
 from .proto import UdpPunchMsg
-from .udp_punch_defs import UDP_PUNCH_FRAME_LEN, UDP_PUNCH_MAGIC, UDP_PUNCH_NONCE_LEN, UDP_PUNCH_PARAMS
+from .udp_punch_defs import (
+    UDP_PUNCH_MAX_FRAME_LEN,
+    UDP_PUNCH_NONCE_LEN,
+    UDP_PUNCH_PARAMS,
+    parse_frame,
+)
 from .udp_punch_engine import drain_punch_residue, udp_punch_engine
 
 
@@ -48,7 +54,18 @@ class UdpPunchPlugin(Plugin):
     # does no useful work over it. Symmetric NAT goes to random_probe,
     # not here.
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 5}
+    # 10s normalises with the other punch-family plugins (tcp_punch,
+    # tcp_punch_pcap, random_probe).  Actual budget needed: spray (1.5s)
+    # + watch (1.5s) + signal_rtt (~1s) + clock_settle (~0.6s) ~= 5s on
+    # a healthy WAN; 10s leaves 2x headroom for Windows + mobile-NIC
+    # paths where each leg can stretch.  The 5s value was historically
+    # right at the edge: cleanup_loop checks expires_at every 5s and
+    # reaped the plugin mid-bridge when the engine ran long, killing
+    # master's CONFIRM-send before the wire got it.  Wire capture
+    # showed Win10's PROBEs arriving at p2pd.net but zero Out packets
+    # from p2pd.net in response.  15s was a safe pessimistic value;
+    # 10s is the calibrated normal.
+    conf = {"timeout": 10}
     proto_messages = (
         (UdpPunchMsg, P2P_PUNCH, 20),
     )
@@ -229,11 +246,7 @@ class UdpPunchPlugin(Plugin):
         # already-resolved src_ip.
         route = await self.bind()
 
-        # Master/slave role selection works fine off the local bind IP
-        # for both NIC_BIND and EXT_BIND -- both peers see the same
-        # (src_ip, dest_ip) pair from opposite ends and pick the same
-        # role deterministically.
-        decider_ip = src_ip
+        decider_ip = compute_decider_ip(self.route_type, self.src)
 
         puncher = PunchClient(
             dest_ip,
@@ -317,6 +330,21 @@ class UdpPunchPlugin(Plugin):
             # verbatim) derive the same bucket regardless of local-
             # clock skew between their create_puncher calls.
             puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
+        elif os.environ.get("WG_DISABLE_PREDICT", "").strip() == "1":
+            # Predictor is also disabled, so without forcing the boundary
+            # allocator we'd end up with port_allocs=[] and the engine
+            # would bind 0/0 sockets and abort.  Force the deterministic
+            # boundary path even though delta != EQUAL/NA so the punch
+            # still has SOMETHING to fire from.  The candidate port may
+            # not match what the peer's actual NAT picks (because the
+            # delta isn't EQUAL), so this is best-effort -- it's the
+            # only path we have under WG_DISABLE_PREDICT.
+            log(fstr(
+                "[UDP-PUNCH] WG_DISABLE_PREDICT=1 forces boundary_port_alloc "
+                "despite non-EQUAL delta (src={0} dest={1})",
+                (src_delta.get("type"), dest_delta.get("type")),
+            ))
+            puncher.add_port_allocator(boundary_port_alloc, n=1, seed=punch_time)
         else:
             log(fstr(
                 "[UDP-PUNCH] non-deterministic NAT delta "
@@ -331,9 +359,26 @@ class UdpPunchPlugin(Plugin):
         """Register the puncher and schedule the in-process punch engine."""
         self.punch_clients[self.plugin_id] = puncher
 
-        self.nat_alloc = NATPredictAlloc(stuns)
-        self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
-        self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
+        # WG_DISABLE_PREDICT=1 skips the STUN-based NAT predictor, so the
+        # punch runs with the boundary_port_alloc fast-path only (n=1
+        # deterministic socket per side derived from the NTP bucket).
+        # Diagnostic: predictor adds 8 socket spray with multi-port
+        # destinations, which on consumer routers / lossy paths produces
+        # n*sprays packets that overshoot per-host UDP burst thresholds
+        # and starve out the boundary socket's traffic.  With predictor
+        # off, master sprays 1 socket * 50Hz * 3s = 150 packets total
+        # instead of ~2550; the one deterministic candidate is enough
+        # for EQUAL+EQUAL or EQUAL+NA pairs (boundary_port_alloc's
+        # supported set).  Punches that genuinely need predictor (PRESERV
+        # / INDEPENDENT / DEPENDENT / RANDOM on either side) will fail
+        # under this flag; that's the trade-off for a clean test signal.
+        if os.environ.get("WG_DISABLE_PREDICT", "").strip() == "1":
+            log("[UDP-PUNCH] WG_DISABLE_PREDICT=1; skipping NATPredictAlloc")
+            self.nat_alloc = None
+        else:
+            self.nat_alloc = NATPredictAlloc(stuns)
+            self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
+            self.nat_alloc.set_punch_mode(self.same_machine, self.dest["ip"])
 
         # Future the engine task waits on instead of sleeping a fixed
         # interval.  advance_punching_protocol resolves it the moment
@@ -366,12 +411,22 @@ class UdpPunchPlugin(Plugin):
         # None on any reply. Mirrors tcp_punch's LAN short-circuit
         # (commit cb7a765). Nonce stays in payload.nonce so the
         # responder still sees it without the mappings round-trip.
-        if self.nat_alloc.punch_mode == TCP_PUNCH_LAN:
+        #
+        # WG_DISABLE_PREDICT=1 takes the same short-circuit path
+        # regardless of punch_mode -- with nat_alloc=None we have no
+        # STUN-predicted mappings to fold; the boundary_port_alloc
+        # socket added in setup_puncher_client carries the entire punch.
+        if self.nat_alloc is None or self.nat_alloc.punch_mode == TCP_PUNCH_LAN:
             if reply is not None:
                 return None
+            # Use mode=2 (REMOTE) as default when nat_alloc was disabled.
+            punch_mode_for_msg = (
+                self.nat_alloc.punch_mode if self.nat_alloc is not None
+                else TCP_PUNCH_REMOTE
+            )
             msg = UdpPunchMsg({
                 "payload": {
-                    "punch_mode": self.nat_alloc.punch_mode,
+                    "punch_mode": punch_mode_for_msg,
                     "mappings": [],
                     "ntp": punch_time,
                     "nonce": puncher.udp_nonce.hex(),
@@ -416,18 +471,32 @@ class UdpPunchPlugin(Plugin):
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        # Only fold-then-signal when recv_mappings was supplied: for
+        # the INITIATOR's first call we've only sent OUR predictions
+        # out and the peer hasn't responded yet, so puncher.port_allocs
+        # contains only our initial template / WE-DICTATE values.
+        # Releasing the worker at that point binds sockets to those
+        # values and fires PROBE bursts before update_for_reply_ports
+        # has a chance to re-target them at the peer's actual reply-
+        # ports.  This is the asymmetric-direction bug tcp_punch had
+        # (EQUAL-initiator / PRESERV-responder failed) -- same shared
+        # NATPredictAlloc state machine here.  The PRESERV-initiator
+        # case is unaffected (its first send_mappings are already the
+        # WE-DICTATE answer), and the reply_delay fallback timeout in
+        # delayed_run_engine still fires the worker if the peer never
+        # replies.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the engine task: the peer's mappings have been folded
-        # in and port_allocs is now valid for spawning the worker.
-        # Guarded by not done() because configure_puncher_process /
-        # advance_punching_protocol may be re-entered across signal
-        # rounds (mapping refresh), and resolving an already-resolved
-        # future raises InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the engine task: the peer's mappings have been folded
+            # in and port_allocs is now valid for spawning the worker.
+            # Guarded by not done() because configure_puncher_process /
+            # advance_punching_protocol may be re-entered across signal
+            # rounds (mapping refresh), and resolving an already-resolved
+            # future raises InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         if is_end == 1:
             return None
@@ -654,12 +723,18 @@ class UdpPunchPlugin(Plugin):
                     convergence.set_result(success)
 
             def f_engine(af, nic_id, port_allocs, src_ip, dest_ip,
-                         f_sleep_until, our_ip, same_machine, params):
+                         f_sleep_until, our_ip, same_machine, params,
+                         route=None):
                 # Adapter: PunchClient.run_engine calls f_engine with
-                # the tcp_punch signature (which includes our_ip and
-                # excludes nonce / stop_reader / route).  We close
-                # over the UDP-specific extras and ignore our_ip.
-                _ = our_ip
+                # the tcp_punch signature (our_ip + route).  our_ip is
+                # the decider IP main.py computed -- pass it through to
+                # the engine so master/slave election sees the right
+                # peer-symmetric quantity (ext for EXT_BIND, src for
+                # NIC_BIND) rather than the engine running its own
+                # always-route.ext() heuristic which is wrong for
+                # NIC_BIND peers behind a shared NAT.  Prefer the
+                # route the client passes; fall back to the closed-
+                # over puncher_route.
                 return udp_punch_engine(
                     af=af,
                     nic_id=nic_id,
@@ -671,7 +746,8 @@ class UdpPunchPlugin(Plugin):
                     same_machine=same_machine,
                     params=params,
                     stop_reader=stop_reader,
-                    route=puncher_route,
+                    route=route if route is not None else puncher_route,
+                    decider_ip=our_ip,
                 )
 
             def punch_and_bridge():
@@ -741,7 +817,7 @@ class UdpPunchPlugin(Plugin):
                 stale_errors = 0
                 for _ in range(256):
                     try:
-                        punched_sock.recv(UDP_PUNCH_FRAME_LEN + 64)
+                        punched_sock.recv(UDP_PUNCH_MAX_FRAME_LEN + 64)
                         stale_drained += 1
                     except BlockingIOError:
                         break
@@ -848,11 +924,16 @@ class UdpPunchPlugin(Plugin):
                     nonce_bytes = puncher.udp_nonce
 
                     def filtered_add_msg(data, client_tup):
-                        if (
-                            len(data) == UDP_PUNCH_FRAME_LEN
-                            and bytes(data[:4]) == UDP_PUNCH_MAGIC
-                            and bytes(data[5:5 + len(nonce_bytes)]) == nonce_bytes
-                        ):
+                        # Drop any frame parse_frame() recognises whose
+                        # nonce matches this session's.  Covers both
+                        # native P2UP (21B) and STUN-shape (20-32B
+                        # Binding Request/Success).  Compare on the
+                        # first 12 bytes because the STUN-shape only
+                        # carries the truncated 12-byte TXID over the
+                        # wire (parse_frame zero-pads back to 16).
+                        buf = bytes(data)
+                        kind, recv_nonce = parse_frame(buf)
+                        if kind is not None and recv_nonce[:12] == nonce_bytes[:12]:
                             drop_count[0] += 1
                             if drop_count[0] <= 3 or drop_count[0] % 50 == 0:
                                 log(fstr(
@@ -908,7 +989,24 @@ class UdpPunchPlugin(Plugin):
             ))
 
             if not self.result.done():
-                self.result.set_result(pipe if converged else None)
+                # Hand the caller the PipeEvents, not the outer Pipe
+                # wrapper.  verify_pipe_alive's liveness PING/PONG
+                # registration stores futures on the object it gets;
+                # inbound msg_cb dispatch fires on PipeEvents (the
+                # data-bearing layer), so the two sides MUST agree on
+                # which object holds liveness_pong_futures.
+                # tcp_punch already returns PipeEvents (via
+                # reverse_server.accept()); udp_punch was returning
+                # the outer Pipe, so verify registered on Pipe but
+                # PONG arrived at PipeEvents -- the future never
+                # resolved and verify_pipe_alive timed out 100% of
+                # cross-NAT punches.  pipe.pipe_events exposes the
+                # same .send() surface, so the downstream contract
+                # is unchanged.
+                returned_pipe = pipe.pipe_events if (
+                    converged and getattr(pipe, "pipe_events", None) is not None
+                ) else (pipe if converged else None)
+                self.result.set_result(returned_pipe)
         except asyncio.CancelledError:
             if not self.result.done():
                 self.result.set_result(None)

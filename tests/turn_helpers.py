@@ -30,9 +30,7 @@ from turn_server import (
 )
 
 
-def is_windows():
-    """True on any flavour of Windows."""
-    return platform.system() == "Windows"
+from aionetiface.net.pcap.ip.next_hop import is_windows  # noqa: F401
 
 
 def skip_on_windows_for_cross_loopback(test_self, reason):

@@ -117,15 +117,3 @@ def extract_nat64_prefix(aaaa):
     return socket.inet_ntop(socket.AF_INET6, prefix_bytes)
 
 
-def synthesise_nat64_addr(prefix, peer_v4):
-    """Embed peer_v4 into prefix (string form) and return the synthesised v6 addr."""
-    try:
-        prefix_packed = socket.inet_pton(socket.AF_INET6, prefix)
-        v4_packed = socket.inet_pton(socket.AF_INET, peer_v4)
-    except (OSError, ValueError):
-        return None
-    if len(prefix_packed) != 16 or len(v4_packed) != 4:
-        return None
-    # Replace low 32 bits of prefix with v4.
-    synth = prefix_packed[:12] + v4_packed
-    return socket.inet_ntop(socket.AF_INET6, synth)

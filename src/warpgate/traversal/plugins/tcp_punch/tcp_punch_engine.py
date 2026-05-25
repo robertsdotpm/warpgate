@@ -42,21 +42,22 @@ import selectors
 import socket
 import struct
 import time
-from aionetiface import log
+from aionetiface import log, log_exception
 from .tcp_punch_utils import bind_tcp_sockets, connect_on_tcp_sockets
 from .punch_utils import choose_winning_tcp_sock
-
-# Module-level fallback defaults (used when params is None).
-# The per-call values from params dicts take precedence.
-CONNECT_TIMEOUT = 5.0
-RETRY_INTERVAL = 0.05
+from .punch_defs import CONNECT_TIMEOUT, RETRY_INTERVAL  # noqa: F401  re-exported via module namespace for params= callers
 
 
-def setup_engine(af, port_allocs, src_ip, nic_id):
+def setup_engine(af, port_allocs, src_ip, nic_id, route=None):
     """Bind all sockets for the given port allocations and register them with a selector."""
     # TCP hole punching uses ONE socket per port.
     # No listen sockets. Each socket will perform active open only.
-    pre_connect_infos = bind_tcp_sockets(af, nic_id, port_allocs, src_ip)
+    # route is forwarded to bind_tcp_sockets so apply_nic_pin_sockopts
+    # can SO_BINDTODEVICE the punch sockets to the chosen NIC.  Without
+    # it the kernel routes punch outbound via lowest-metric default
+    # regardless of bound source IP -- mobile's punch SYNs would leave
+    # via the LAN gateway and never traverse the carrier NAT.
+    pre_connect_infos = bind_tcp_sockets(af, nic_id, port_allocs, src_ip, route=route)
 
     sel = selectors.DefaultSelector()
 
@@ -183,6 +184,7 @@ af,
     our_ip,
     same_machine,
     params=None,
+    route=None,
 ):
     """
     TCP hole-punch engine.
@@ -211,7 +213,7 @@ af,
     pre_connect_infos = []
     sel = None
     try:
-        pre_connect_infos, sel = setup_engine(af, port_allocs, src_ip, nic_id)
+        pre_connect_infos, sel = setup_engine(af, port_allocs, src_ip, nic_id, route=route)
         bound_locals = []
         for pa, s in pre_connect_infos:
             try:
@@ -254,6 +256,21 @@ af,
         log("[ENGINE] choose_winning_tcp_sock -> {0}".format(
             "selected" if sock else "no winner",
         ))
+
+        # Print the winner's actual 4-tuple so every punch result
+        # self-documents whether it went external.  peername.ip
+        # not appearing on any local interface == real wire round-
+        # trip (no kernel-local shortcut).  Cheaper than asking
+        # the user to run `ip route get` after the fact.
+        if sock is not None:
+            try:
+                sockname = sock.getsockname()
+                peername = sock.getpeername()
+                log("[ENGINE] winner sockname={0} peername={1}".format(
+                    sockname, peername,
+                ))
+            except (OSError, ValueError):
+                log_exception()
 
         # Revert SO_LINGER {1,0} on the winning socket. We set it at
         # bind time so failed-punch close()es bypass TIME_WAIT and

@@ -23,8 +23,18 @@ def f_path_txt(x):
 # that remain are "ip" + "port" -- the resolved local-bind / peer-dial
 # pair for the chosen route_type.  Peer metadata (if_index, nat,
 # netiface_index, machine_id, pub_key_hex, …) stays.
+# Routing-decision keys that get stripped from the per-side dict
+# resolve_pair hands to plugins.  Plugins should read the resolved
+# (ip, port) and let the route layer make the binding decisions.
+#
+# NOTE: "ext" deliberately stays IN the resolved dict (i.e. not in
+# this drop set) -- the punch family's master/slave election uses
+# src["ext"] as the peer-observable identifier for the comparison.
+# It is NOT a routing decision; it is a symmetric peer ID.  Stripping
+# it caused every election to silently fall back to bind_ip and
+# could land both peers on the same role.
 RESOLVE_DROP_KEYS = (
-    "nic", "ext", "loopback",
+    "nic", "loopback",
     "nic_port", "ext_port",
     "loopback_candidates",
 )
@@ -237,13 +247,21 @@ def select_dest_ipr(af, same_pc, src, dest, addr_types, has_set_bind=True):
 
 
 def sort_pairs_by_overlap(srcs, dests):
-    """Partition (src, dest) pairs into overlapping and non-overlapping external IPs."""
+    """Partition (src, dest) pairs into overlapping and non-overlapping external IPs.
+
+    Pairs where either side has a missing/empty ``ext`` are placed in
+    the unique bucket so they get filtered upstream in
+    ``get_if_infos_order`` (the EXT_BIND filter drops them; the
+    NIC_BIND / LOOPBACK_BIND paths don't rely on ext anyway).
+    """
     overlap = []
     unique = []
     for src in srcs:
         for dest in dests:
             pair = [src, dest]
-            if src["ext"] == dest["ext"]:
+            s_ext = src.get("ext")
+            d_ext = dest.get("ext")
+            if s_ext and d_ext and s_ext == d_ext:
                 overlap.append(pair)
             else:
                 unique.append(pair)
@@ -251,223 +269,22 @@ def sort_pairs_by_overlap(srcs, dests):
     return overlap, unique
 
 
-async def for_addr_infos(
-strat,
-    func,
-    timeout,
-    cleanup,
-    has_set_bind,
-    max_pairs,
-    reply,
-    pp,
-    conf,
-):
-    """
-    Given info on a local interface, a remote interface,
-    and a chosen connectivity technique, attempt to create
-    a connection. Adapt the technique depending on whether
-    addressing is suitably local or remote.
-    """
-
-    async def try_addr_infos(af, strat, addr_type, src, dest):
-        """Attempt one connectivity strategy for a specific src/dest interface pair."""
-        # Local addressing and/or remote.
-        try:
-            # Create a future for pending pipes.
-            if reply is None:
-                pipe_id = to_s(rand_plain(15))
-            else:
-                pipe_id = reply.meta.pipe_id
-
-            # Allow awaiting by pipe_id.
-            pp.node.pipe_future(pipe_id)
-
-            # Select interface to use.
-            if_index = src["if_index"]
-            interface = pp.node.ifs[if_index]
-
-            # Ensure our selected NIC is what the
-            # remote peer wanted to use for the technique.
-            if reply is not None:
-                if reply.routing.dest_index != if_index:
-                    return
-
-            # Determine the best destination IP to use
-            # for the connectivity technique based on
-            # addressing and relationships between the
-            # two machines (deep networking specific.)
-            dest_ip = select_dest_ipr(
-                af,
-                pp.same_machine,
-                src,
-                dest,
-                [addr_type],
-                has_set_bind,
-            )
-
-            # Need a destination address.
-            # Possibly a different address type will work.
-            if dest_ip is None:
-                return
-
-            dest["ip"] = str(dest_ip)
-
-            # Use per-bind port when advertised (10-field wire format). Fall back to
-            # the section's single port for peers on the old 8/9-field format.
-            if addr_type == NIC_BIND:
-                dest["port"] = dest.get("nic_port", dest["port"])
-            elif addr_type == EXT_BIND:
-                dest["port"] = dest.get("ext_port", dest["port"])
-
-            # Detailed logging details.
-            path_txt = f_path_txt(addr_type)
-            src_ip = src["nic"] if addr_type == NIC_BIND else src["ext"]
-            msg = fstr(
-                "<{0}> Trying {1} {2} -> ",
-                (
-                    strat,
-                    path_txt,
-                    src_ip,
-                ),
-            )
-            msg += fstr(
-                "{0} on '{1}'",
-                (
-                    dest["ip"],
-                    interface.name,
-                ),
-            )
-            log_p2p(msg, pp.node.node_id[:8])
-
-            # With all the correct interfaces and IPs
-            # chosen -- call the function that will run
-            # the technique to achieve connectivity.
-            result = await async_wrap_errors(
-                func(
-                    pp,
-                    af,
-                    pipe_id,
-                    src,
-                    dest,
-                    interface,
-                    addr_type,
-                    pp.same_machine,
-                    reply,
-                ),
-                timeout,
-            )
-
-            if isinstance(result, ProtoMsg):
-                msg = result
-                msg.meta = ProtoMsg.Meta.from_dict(
-                    {
-                        "ttl": int(pp.node.sys_clock.time()) + 30,
-                        "pipe_id": pipe_id,
-                        "af": af,
-                        "src_buf": pp.src_bytes,
-                        "src_index": src["if_index"],
-                        "addr_types": [addr_type],
-                    }
-                )
-
-                msg.routing = ProtoMsg.Routing.from_dict(
-                    {
-                        "af": af,
-                        "dest_buf": pp.dest_bytes,
-                        "dest_index": dest["if_index"],
-                    }
-                )
-
-                vk = to_h(pp.node.vk.to_string("compressed"))
-                pp.node.sig_msg_queue.put_nowait([msg, vk, 0])
-
-            # Success result from function.
-            if result is not None:
-                return result
-
-            # Some functions require cleanup on failure.
-            # Ensure that the state overtime remains clean.
-            if cleanup is not None:
-                await cleanup(
-                    af,
-                    pipe_id,
-                    src,
-                    dest,
-                    interface,
-                    addr_type,
-                    reply,
-                )
-
-            # Delete unused futures on failure.
-            if pipe_id in pp.node.inbound_pipes:
-                del pp.node.inbound_pipes[pipe_id]
-        except (OSError, ConnectionError, asyncio.TimeoutError):
-            log_exception()
-
-    # Use an AF supported by both.
-    if reply is not None:
-        conf["addr_families"] = [reply.meta.af]
-
-    for addr_type in conf["addr_types"]:
-        count = 1
-        for af in conf["addr_families"]:
-            if reply is not None:
-                # Try select if info based on their chosen offset.
-                src = pp.src[af][reply.routing.dest_index]
-                dest = pp.dest[af][reply.meta.src_index]
-                ret = await async_wrap_errors(
-                    try_addr_infos(af, strat, addr_type, src, dest)
-                )
-
-                return ret, addr_type
-
-            # Get interface offset that supports this af.
-            # for src, dest in if_info_iter:
-            srcs = list(pp.src[af].values())
-            dests = list(pp.dest[af].values())
-            overlap, unique = sort_pairs_by_overlap(srcs, dests)
-
-            # If external address is the same try unique pairs first.
-            if addr_type == EXT_BIND:
-                pair_order = unique + overlap
-
-            # For local addresses you want to do the opposite.
-            # So you're on the same LAN or NIC if on the same machine.
-            if addr_type == NIC_BIND:
-                pair_order = overlap + unique
-
-            if not pair_order:
-                log("pair order list is empty!")
-
-            for src, dest in pair_order:
-                # Only try up to N pairs per technique.
-                # Technique-specific N to avoid lengthy delays.
-                ret = await async_wrap_errors(
-                    try_addr_infos(af, strat, addr_type, src, dest)
-                )
-
-                # Success so return.
-                if ret is not None:
-                    return ret, addr_type
-
-                count += 1
-                if count > max_pairs:
-                    return None, None
-
-                # Cleanup here?
-
-    # Failure.
-    return None, None
-
-
-# TODO: make this work with everything.
-
 
 def get_if_infos_order(af, route_type, src_map, dest_map):
     """
     Given a list of interface details
     for an address family indexed by interface
     offset return a list of them directly.
+
+    EXT_BIND filter: pairs where either side lacks an ``ext`` IP or where
+    both sides share the same ``ext`` (same router / same machine WAN)
+    are dropped entirely.  Such pairs cannot produce a working external
+    path -- traffic loops back at the router with no NAT mapping -- and
+    they used to be returned at low priority, where plugins had to
+    defensively detect them.  The role-election in plugins like
+    random_probe also depends on the two sides having distinct ext IPs
+    to break the NAT-type tie symmetrically; an equal-ext combo races
+    both peers into the same role.
     """
     srcs = list(src_map[af].values())
     dests = list(dest_map[af].values())
@@ -481,9 +298,17 @@ def get_if_infos_order(af, route_type, src_map, dest_map):
 
     # If the route type is external then using the same external
     # address for overlapping pairs is likely not to lead to
-    # a connection since both are behind the same router.
+    # a connection since both are behind the same router.  Also drop
+    # pairs where either side has no ext IP at all -- without ext we
+    # have nothing for the peer to aim at, and downstream plugins'
+    # election math (own_ext_ip vs peer_ext_ip) would have to special-
+    # case the empty value.
     if route_type in (EXT_BIND, None):
-        pair_order = unique + overlap
+        unique = [
+            pair for pair in unique
+            if pair[0].get("ext") and pair[1].get("ext")
+        ]
+        pair_order = unique
 
     # For local addresses you want to do the opposite.
     # So you're on the same LAN or NIC if on the same machine.
@@ -577,6 +402,9 @@ async def close_plugin(plugin, plugins, inbound_pipes):
     further signals for this plugin_id are in-flight.
     """
     plugin_id = getattr(plugin, "plugin_id", None)
+    log("[CLOSE-PLUGIN] enter plugin_id={0} result_done={1}".format(
+        plugin_id, plugin.result.done(),
+    ))
     plugins.pop(plugin_id, None)
 
     fut = inbound_pipes.pop(plugin_id, None)
@@ -584,6 +412,7 @@ async def close_plugin(plugin, plugins, inbound_pipes):
         fut.cancel()
 
     if not plugin.result.done():
+        log("[CLOSE-PLUGIN] cancelling plugin.result plugin_id={0}".format(plugin_id))
         plugin.result.cancel()
 
     close_fn = getattr(plugin, "close", None)

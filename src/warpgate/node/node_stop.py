@@ -2,9 +2,9 @@
 import asyncio
 import glob
 import os
+import time
 from contextlib import suppress
-from aionetiface import log, log_exception, Daemon
-from ..errors import AlreadyClosedError
+from aionetiface import log, log_exception, Daemon, AlreadyClosedError
 
 
 def cleanup_stale_pidfiles(install_path):
@@ -45,33 +45,19 @@ def cleanup_stale_pidfiles(install_path):
             log_exception()
 
 
-async def close_helper(p):
-    """Call p.close(), silently swallowing AlreadyClosedError and logging other exceptions."""
-    try:
-        await p.close()
-    except AlreadyClosedError:
-        pass
-    except asyncio.CancelledError:
-        raise
-    except (OSError, asyncio.TimeoutError):
-        log_exception()
-        log("Error closing " + str(p))
-
-
-async def close_with_timeout(p):
-    """Close p with a 2-second timeout, logging a warning if the close operation hangs."""
-    try:
-        await asyncio.wait_for(close_helper(p), timeout=2)
-    except asyncio.TimeoutError:
-        log("Timeout closing " + str(p) + " endpoint t = " + str(p.endpoint_type))
+# Canonical home of close_helper / close_with_timeout is
+# aionetiface.utility.cleanup; re-exported here so existing
+# `from .node_stop import close_helper` callers keep working.
+from aionetiface.utility.cleanup import (  # noqa: F401, E402
+    close_helper, close_with_timeout,
+)
 
 
 # Shutdown the node server and do cleanup.
 async def node_stop(node):
     """Shut down the node, closing traversal plugins, resources, the daemon, and the stop socket pair."""
-    import time as time_mod
     log("[NODE-STOP] mono={0:.4f} node_stop entered".format(
-        time_mod.monotonic()
+        time.monotonic()
     ))
     # Send stop signal (any amount of data.)
     try:

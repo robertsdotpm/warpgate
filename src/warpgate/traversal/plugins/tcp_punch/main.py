@@ -63,6 +63,7 @@ from .boundary_alloc import boundary_port_alloc
 from aionetiface.nic.nat.nat_defs import EQUAL_DELTA, NA_DELTA
 from .nat_predict_alloc import NATPredictAlloc
 from .punch_defs import TCP_PUNCH_LAN
+from .punch_utils import compute_decider_ip
 from .punch_process import start_punching_process
 from .nat_predict import NATMapping
 from ...traversal_plugin import Plugin
@@ -76,7 +77,7 @@ class PunchPlugin(Plugin):
     name = "tcp_punch"
     transport = TCP
     route_types = (NIC_BIND, EXT_BIND)
-    conf = {"timeout": 5}
+    conf = {"timeout": 10}
     proto_messages = (
         (PunchMsg, P2P_PUNCH, 20),
     )
@@ -102,7 +103,6 @@ class PunchPlugin(Plugin):
                 t, elapsed_ms, label, self.plugin_id, extras,
             )
             log(line)
-            print(line, flush=True)
         self.stamp = stamp
         stamp("run_enter", reply=(reply is not None))
         log("[PUNCH-RUN] enter plugin_id={0} reply={1} completed={2}".format(
@@ -294,11 +294,7 @@ class PunchPlugin(Plugin):
             log("PunchPlugin: dest matches own bind IP ({0}); aborting".format(dest_ip))
             return None, None
 
-        # Master/slave role selection works fine off the local bind IP
-        # for both NIC_BIND and EXT_BIND -- both peers see the same
-        # (src_ip, dest_ip) pair from opposite ends and pick the same
-        # role deterministically.
-        decider_ip = src_ip
+        decider_ip = compute_decider_ip(self.route_type, self.src)
 
         # Create and configure the PunchClient.
         # FAST_PUNCH_PARAMS is used for network-protocol punching: the punch_time
@@ -308,6 +304,15 @@ class PunchPlugin(Plugin):
         # mapping_reply future short-circuiting it on healthy paths)
         # cut total punch latency roughly in half compared to the
         # conservative CLI defaults.
+        # Build a Route referencing this NIC so the engine can pass it
+        # to apply_nic_pin_sockopts and SO_BINDTODEVICE the punch
+        # sockets.  Without this the kernel routes the punch SYNs via
+        # the lowest-metric default route -- on a multi-default-route
+        # host (LAN + mobile) that's the wrong NIC and the punch never
+        # traverses the carrier NAT.  Route.bind() isn't called: the
+        # engine binds its own sockets to explicit (src_ip, src_port)
+        # tuples; we just need route.interface for the pin.
+        punch_route = self.nic.route(self.af)
         puncher = PunchClient(
             dest_ip,
             src_ip,
@@ -317,6 +322,7 @@ class PunchPlugin(Plugin):
             params=FAST_PUNCH_PARAMS,
             our_os=(self.src_map.get("os") if self.src_map else None),
             their_os=(self.dest_map.get("os") if self.dest_map else None),
+            route=punch_route,
         )
 
         # NTP-pinned future start.  The connector picks an absolute
@@ -498,18 +504,33 @@ class PunchPlugin(Plugin):
         # Mark that the peer's mappings have now been folded.  The
         # re-entry guard above keys off this so subsequent duplicate
         # republishes are dropped without re-walking the nat_alloc
-        # state machine.
+        # state machine.  ONLY fold-then-signal when recv_mappings was
+        # supplied: for the INITIATOR's first call (recv_mappings is
+        # None) we've only sent OUR predictions out and the peer hasn't
+        # responded yet, so puncher.port_allocs contains only our
+        # initial template / WE-DICTATE values.  Releasing the worker
+        # at that point binds sockets to those values and fires SYNs
+        # before update_for_reply_ports has a chance to re-target them
+        # at the peer's actual reply-ports.  Wait until recv_mappings
+        # is non-None (peer's response folded) so the worker sees
+        # port_allocs in their final form.  The PRESERV-initiator
+        # case is unaffected -- PRESERV's first prediction is already
+        # the WE-DICTATE answer and doesn't need updating -- and is
+        # protected by the reply_delay timeout in
+        # delayed_start_punching_proc which fires the worker anyway
+        # if the peer never replies.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the worker-spawn task: the peer's mappings have been
-        # folded in and port_allocs is now valid.  Guarded by not done()
-        # because advance_punching_protocol may be re-entered across
-        # signal rounds (mapping refresh), and resolving an
-        # already-resolved future raises InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the worker-spawn task: the peer's mappings have
+            # been folded in and port_allocs is now valid.  Guarded
+            # by not done() because advance_punching_protocol may be
+            # re-entered across signal rounds (mapping refresh), and
+            # resolving an already-resolved future raises
+            # InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         # End of protocol.
         if is_end == 1:
@@ -610,14 +631,16 @@ class PunchPlugin(Plugin):
         """
         task = self.punch_proc.pop(self.plugin_id, None)
         self.punch_clients.pop(self.plugin_id, None)
-        log("[PUNCH-CLOSE] plugin_id={0} task_was_pending={1}".format(
+        log("[PUNCH-CLOSE] plugin_id={0} task_was_pending={1} result_done={2}".format(
             self.plugin_id,
             task is not None and not task.done() if task else False,
+            self.result.done(),
         ))
         await cancel_task(task)
 
         # Cancel the result future if nobody resolved it (e.g. outer timeout).
         if not self.result.done():
+            log("[PUNCH-CLOSE] cancelling self.result plugin_id={0}".format(self.plugin_id))
             self.result.cancel()
         self.completed_pipe_ids.add(self.plugin_id)
 

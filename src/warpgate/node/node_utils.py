@@ -1,5 +1,6 @@
 """Miscellaneous helpers for node startup and operation."""
 import asyncio
+import copy
 import hashlib
 import os
 import socket
@@ -573,8 +574,7 @@ async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     and is shared by every IPR on that route, so two fe80s on one NIC
     would otherwise bind/mutate the same object concurrently.
     """
-    import copy as copy_mod
-    route = copy_mod.deepcopy(fe80_ipr.route)
+    route = copy.deepcopy(fe80_ipr.route)
     port = await soft_bind_and_listen(
         node, route, label, ips=ipr_norm(fe80_ipr),
     )
@@ -590,7 +590,6 @@ async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
     a copy the next iteration's bind(ips=...) would mutate the previous
     listener's route in place.
     """
-    import copy as copy_mod
     try:
         # Use Interface("default") rather than node.ifs[0] so the
         # listen socket isn't SO_BINDTODEVICE-pinned to a physical
@@ -665,7 +664,7 @@ async def listen_on_ifs(node):
                 ("; ".join(failed) or "(no --ip address matched any NIC)",),
             )
             log(msg)
-            raise OSError(msg)
+            raise RuntimeError(msg)
         return
 
     # --- default path: per-NIC "nic" + "ext" binds -----------------------
@@ -736,7 +735,7 @@ async def listen_on_ifs(node):
                     (nic.name, ", ".join(missing)),
                 )
                 log(msg)
-                raise OSError(msg)
+                raise RuntimeError(msg)
 
         if not (nic_ok or ext_ok):
             failed_nics.append(getattr(nic, "id", nic_i))
@@ -748,7 +747,7 @@ async def listen_on_ifs(node):
             (len(acct), failed_nics),
         )
         log(msg)
-        raise OSError(msg)
+        raise RuntimeError(msg)
 
 
 async def remote_reachability_cb(reachability, _msg, client_tup, pipe):
@@ -902,3 +901,59 @@ async def forward(node, port, reachability):
             if reachability[af][nic_id].done()
         ]
     return forward_success, reachable
+
+
+def report_punch_failure(node, plugin_name=None):
+    """Hook for the auto_connect cascade to feed back failed-punch evidence.
+
+    When a punch attempt (tcp_punch / udp_punch / random_probe) returns a
+    pipe that fails verify_pipe_alive, AND the local NIC's delta_test
+    verdict was probationary (the cold-start optimistic-default fallback
+    in `delta_test`), the failure is ground-truth evidence that the
+    optimistic PRESERV guess was wrong.  Invalidate the cached entry so
+    the next cold start re-classifies; the failed attempt is the cost
+    we accepted up-front when delta_test returned the probationary
+    verdict instead of RANDOM.
+
+    Only acts on probationary verdicts to avoid invalidating
+    measured-correct cache entries on transient peer-side / network
+    issues.  A single failed punch under a measured PRESERV could be
+    many things (peer offline, peer NAT, network blip); a failed punch
+    under a probationary PRESERV is the specific case we built the
+    invalidation hook for.
+
+    No-op if:
+      - plugin_name doesn't match a punch plugin
+      - node has no nat_fingerprint (cache wasn't engaged at startup)
+      - no NICs have probationary delta classification
+
+    Imports lazily because aionetiface.nic.nat.nat_cache pulls in
+    ipaddress / json which we don't want loaded at warpgate.node import
+    time for callers that never punch.
+    """
+    PUNCH_PLUGIN_NAMES = ("tcp_punch", "udp_punch", "random_probe", "tcp_punch_pcap")
+    if plugin_name and plugin_name not in PUNCH_PLUGIN_NAMES:
+        return
+    fingerprint = getattr(node, "nat_fingerprint", None)
+    if not fingerprint:
+        return
+
+    from aionetiface.nic.nat.nat_cache import nat_cache_invalidate
+    invalidated = 0
+    for nic in getattr(node, "ifs", []) or []:
+        nat = getattr(nic, "nat", None)
+        if not isinstance(nat, dict):
+            continue
+        delta = nat.get("delta") or {}
+        if delta.get("confidence") != "probationary":
+            continue
+        nic_name = getattr(nic, "name", None)
+        nat_cache_invalidate(fingerprint, nic_name=nic_name)
+        invalidated += 1
+    if invalidated:
+        from aionetiface import log, fstr
+        log(fstr(
+            "[NAT-CACHE] punch failure under probationary classification; "
+            "invalidated {0} cache entr{1} via plugin={2}",
+            (invalidated, ("y" if invalidated == 1 else "ies"), plugin_name),
+        ))

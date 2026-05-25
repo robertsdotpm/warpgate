@@ -39,6 +39,7 @@ from aionetiface import (
     af_bitlen, fstr, log, log_exception, parse_node_addr,
 )
 from aionetiface.nic.nat.nat_defs import SYMMETRIC_NAT
+from aionetiface.utility.utils import rand_nonce_hex
 from .node_connect import resolve_pnp_addr
 from .node_protocol import (
     WG_LIVENESS_PING_PREFIX,
@@ -46,7 +47,7 @@ from .node_protocol import (
     register_liveness_pong_future,
     unregister_liveness_pong_future,
 )
-from .node_utils import enrich_addr_map_with_loopback
+from .node_utils import enrich_addr_map_with_loopback, report_punch_failure
 from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
 
@@ -103,7 +104,7 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
         log("[AC-VERIFY] WG_SKIP_VERIFY=1; skipping liveness check")
         return True
 
-    nonce = os.urandom(8).hex().encode("ascii")
+    nonce = rand_nonce_hex(8).encode("ascii")
     ping = WG_LIVENESS_PING_PREFIX + nonce + b"\n"
 
     loop = asyncio.get_event_loop()
@@ -114,15 +115,18 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
             time.monotonic(), nonce, id(pipe), type(pipe).__name__,
         ))
 
-    # TCP fires one PING (TCP retransmits handle datagram loss); UDP
-    # retries.  The freshly-punched-pipe warm-up race -- verify firing
-    # before the worker's selector_proxy copy loop is pumping -- is
-    # NOT handled here: start_punching_process now withholds the pipe
-    # until the bridge signals ready (its ready socketpair), so by the
-    # time verify runs the copy loop is guaranteed live.  Retrying the
-    # PING on TCP only re-introduced duplicate PONGs that leaked into
-    # the application recv queue, so it stays UDP-only.
-    attempts = retries if transport == UDP else 1
+    # Single PING for both transports.  UDP previously fired up to
+    # `retries` PINGs to compensate for datagram loss, but the
+    # follow-up PONGs leaked into the application recv queue exactly
+    # the same way they did when TCP was retrying (the documented
+    # reason TCP went to single-shot in the first place).  The udp_
+    # punch engine has its own multi-PROBE rendezvous and the bridge
+    # signals ready via its socketpair, so by the time verify fires
+    # the path is already warm -- packet loss on a freshly-punched
+    # warm UDP path is rare enough that single-shot is the better
+    # trade-off than queue pollution.  If the PING does get lost the
+    # cascade falls through to phase4/turn, no session-level damage.
+    attempts = 1
     try:
         for attempt in range(attempts):
             try:
@@ -451,7 +455,31 @@ async def attempt_one_combo(
     except asyncio.TimeoutError:
         log("attempt_one_combo: plugin.result timed out for {0}".format(plugin_name))
     except asyncio.CancelledError:
-        raise
+        # Distinguish "the plugin's own future was cancelled by the
+        # cleanup loop / close_plugin" (an internal lifecycle event;
+        # treat as a normal failed-cascade-phase) from "this task is
+        # being cancelled from outside" (node_stop / KeyboardInterrupt;
+        # must propagate so shutdown unwinds cleanly).
+        #
+        # The discriminator: plugin.result.cancelled() is True only
+        # when close_plugin called plugin.result.cancel().  If it's
+        # False, the awaiting task itself was cancelled from above.
+        # Without this branch, a routine 10 s plugin expiry tore down
+        # the entire demo node -- the user picks random_probe in the
+        # menu, the cleanup loop fires past expires_at, CancelledError
+        # propagates up through gate.connect into run_node_loop, the
+        # menu's only `except TunnelFailed:` doesn't catch it, the
+        # while-loop falls through to the finally clause and
+        # node_stop runs.  Live aionetiface log on 2026-05-24 PID
+        # 2315025 confirmed the trace.
+        try:
+            cancelled_internally = plugin.result.cancelled()
+        except AttributeError:
+            cancelled_internally = False
+        if not cancelled_internally:
+            raise
+        log("attempt_one_combo: plugin.result was cancelled internally "
+            "(plugin={0}); treating as a failed phase".format(plugin_name))
     except Exception:  # pylint: disable=broad-except
         # Plugin-side failure -- race_combos sees it via plugin_pipe
         # returning None on the unresolved future.
@@ -1134,9 +1162,56 @@ async def auto_connect(
             dest_nat = worst_nat(dest_map)
             src_cgnat = is_cgnat_external(src_map)
             dest_cgnat = is_cgnat_external(dest_map)
-            line = "[AC-PHASE] {0} -> pipe={1} plugin={2} src_nat={3} dest_nat={4} elapsed={5}ms src_cgnat={6} dest_cgnat={7}".format(
+
+            # Liveness verify per phase.  Previously only the FIRST
+            # successful phase ran verify_pipe_alive -- subsequent
+            # phases' pipes were closed without a PING/PONG round-trip,
+            # so the [AC-PHASE] line reported pipe=True purely on
+            # engine-returned-a-socket, not on "pipe actually carries
+            # bytes."  test_all_phases mode is the diagnostic harness
+            # downstream gate_sweep matrices rely on for per-plugin
+            # success; without per-phase verify, udp_punch passing the
+            # matrix while its echo round-trip silently failed was
+            # invisible (the cascade winner was always direct_connect,
+            # so app echo succeeded through that, not udp_punch).
+            #
+            # Run verify on every non-None pipe and surface the result
+            # in the [AC-PHASE] line as alive=true/false.  Failing
+            # verify on a non-winner just closes that pipe; on a not-
+            # yet-winner, falls through to the next phase as before.
+            alive = None
+            if pipe is not None:
+                transport = getattr(plugin, "transport", TCP)
+                try:
+                    alive = await verify_pipe_alive(pipe, transport=transport)
+                except (OSError, ConnectionError, asyncio.TimeoutError):
+                    log_exception()
+                    alive = False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    log_exception()
+                    alive = False
+
+            # Punch-failure ground-truth: pipe returned but didn't carry
+            # bytes through PING/PONG verification.  If the local NIC's
+            # delta classification was probationary (cold-start optimistic
+            # PRESERV default), the failure is evidence the optimistic
+            # guess was wrong -- invalidate the cache so the next cold
+            # start re-classifies honestly.  No-op when classification
+            # was a measured verdict; in that case the failure is more
+            # likely peer-side or transient.
+            if pipe is not None and not alive:
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
+                try:
+                    report_punch_failure(node, plugin_name=plugin_name)
+                except Exception:  # pylint: disable=broad-except
+                    log_exception()
+
+            line = "[AC-PHASE] {0} -> pipe={1} alive={2} plugin={3} src_nat={4} dest_nat={5} elapsed={6}ms src_cgnat={7} dest_cgnat={8}".format(
                 phase_fn.__name__,
                 pipe is not None,
+                ("true" if alive else "false") if pipe is not None else "n/a",
                 getattr(plugin, "name", type(plugin).__name__) if plugin is not None else None,
                 src_nat,
                 dest_nat,
@@ -1152,37 +1227,22 @@ async def auto_connect(
                     tel.record(
                         phase_fn.__name__,
                         getattr(plugin, "name", None) if plugin is not None else None,
-                        pipe is not None,
+                        bool(alive),
                         elapsed_ms,
                         src_nat,
                         dest_nat,
                     )
                 except Exception:
                     pass
-            if pipe is not None and winner_pipe is None:
-                # Liveness verify: punch engines occasionally declare
-                # ESTABLISHED for a pipe that the kernel then tears
-                # down before app bytes can flow (multi-NIC routing
-                # asymmetry, NAT mapping closing on the spray's
-                # trailing SYNs, XP-style 174ms post-handshake RST,
-                # etc).  Round-trip a PING and fall through to the
-                # next phase if no PONG comes back.
-                transport = getattr(plugin, "transport", TCP)
-                alive = await verify_pipe_alive(pipe, transport=transport)
-                if not alive:
-                    log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
-                        phase_fn.__name__,
-                    ))
-                    try:
-                        await close_plugin(
-                            plugin, node.traversal.plugins, node.traversal.inbound_pipes,
-                        )
-                    except (OSError, asyncio.TimeoutError):
-                        log_exception()
-                else:
-                    winner_pipe = pipe
-                    winner_plugin = plugin
+            if pipe is not None and alive and winner_pipe is None:
+                # Earliest phase whose pipe verified alive becomes the
+                # cascade winner.  Later phases still run for telemetry
+                # (their pipes get verified + closed for measurement).
+                winner_pipe = pipe
+                winner_plugin = plugin
             elif pipe is not None:
+                # Failed verify, OR we already have a winner -- close
+                # this phase's pipe so it doesn't leak.
                 try:
                     await close_plugin(
                         plugin, node.traversal.plugins, node.traversal.inbound_pipes,
@@ -1232,6 +1292,14 @@ async def auto_connect(
             log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
                 phase_fn.__name__,
             ))
+            # Same punch-failure feedback as the test_all_phases path:
+            # invalidate cache when verify failed AND the local NIC's
+            # delta was probationary.
+            try:
+                plugin_name = getattr(plugin, "name", None) if plugin is not None else None
+                report_punch_failure(node, plugin_name=plugin_name)
+            except Exception:  # pylint: disable=broad-except
+                log_exception()
             try:
                 await close_plugin(
                     plugin, node.traversal.plugins, node.traversal.inbound_pipes,

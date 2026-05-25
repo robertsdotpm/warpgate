@@ -11,13 +11,9 @@ from aionetiface import (
     RANDOM_DELTA, PREDICTABLE_NATS,
 )
 
-MAX_PREDICT_NO = 100
+from .punch_defs import TCP_PUNCH_LAN, TCP_PUNCH_REMOTE, TCP_PUNCH_SELF
 
-# Duplicate defs
-# TODO: should this module be moved into nat lib? probably.
-TCP_PUNCH_LAN = 1
-TCP_PUNCH_REMOTE = 2
-TCP_PUNCH_SELF = 3
+MAX_PREDICT_NO = 100
 
 
 class NATMapping:
@@ -65,24 +61,6 @@ class NATMapping:
         return NATMapping([d["local"], d["reply"], d["remote"]], d["sock"])
 
 
-def mappings_dicts_to_objs(mappings):
-    """Convert a list of mapping dicts to NATMapping objects."""
-    ret = []
-    for d in mappings:
-        ret.append(NATMapping.from_dict(d))
-
-    return ret
-
-
-def mappings_objs_to_dicts(mappings):
-    """Convert a list of NATMapping objects to serialisable dicts."""
-    ret = []
-    for m in mappings:
-        ret.append(m.to_dict())
-
-    return ret
-
-
 async def get_high_port_mapping(stun_client):
     """Bind to a high-numbered port via STUN and return the resulting NAT mapping."""
     assert stun_client.conf["reuse_addr"]
@@ -115,7 +93,7 @@ async def get_high_port_mapping(stun_client):
     raise ConnectionError("high port sock fail.")
 
 
-def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_no=2):
+def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_no=8):
     """Build placeholder NATMapping templates used when no peer mappings are yet available."""
     mappings = []
     for _ in range(0, test_no):
@@ -130,7 +108,7 @@ def get_mapping_templates(use_stun_port=False, use_range=[2000, MAX_PORT], test_
     return mappings
 
 
-def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=2):
+def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=8):
     """Normalise NAT info and produce initial mapping templates for the prediction algorithm."""
     # Set test_no based on recipients test no.
     # [[remote port, required reply port], ...]
@@ -184,6 +162,7 @@ mode,
     our_nat,
     preloaded_mapping,
     step=1000,
+    index=0,
 ):
     """Predict a single outbound NAT mapping that coordinates with the peer's rmap."""
     # Allow last mapped to be modified from inside func.
@@ -228,17 +207,57 @@ mode,
 
     # NAT preserves distance between local ports in remote ports.
     if our_nat["delta"]["type"] == PRESERV_DELTA:
-        # Try use their port but make sure it fits in our range.
-        if not in_range(bind_port, our_nat["range"]):
-            bind_port = from_range(use_range)
+        # PRESERV branch used to chase the peer's bind_port: compute the
+        # signed distance from our last STUN-observed mapping to that
+        # bind_port and add the same distance to our last_local.  That
+        # only works when the NAT applies a CONSTANT (local - mapped)
+        # offset across every socket -- which is what EQUAL_DELTA does,
+        # not PRESERV.  Real PRESERV NATs (and the burst-sequential
+        # CGNATs the classifier surfaces as PRESERV when round 2 sees
+        # mapped_dist == local_dist == 1) preserve port distance only
+        # for sockets allocated close in time to the STUN observation;
+        # a socket whose local port is tens of thousands away from
+        # last_local lands in a different allocation family with an
+        # unrelated offset.  Three preloaded mappings on a real carrier
+        # NAT bear this out: (42662->1446), (48808->1448), (3352->1304)
+        # -- three different (local-mapped) shifts, not one.
+        #
+        # Match the WE-DICTATE pattern the other non-trivial deltas
+        # already use (INDEPENDENT / DEPENDENT / PREDICTABLE-fallback):
+        # bind sequentially after the last STUN observation
+        # (last_local + 1 + index) and tell the peer to target the
+        # adjacent mapped port (last_remote + 1 + index).  The peer
+        # reads our .remote and lands there regardless of what they
+        # initially templated.  The per-mapping index spreads the N
+        # punch sockets across N adjacent NAT slots so multiple SYNs
+        # racing through the allocator have non-colliding predictions.
+        offset = 1 + index
+        next_local = port_wrap(last_local + offset)
+        next_remote = port_wrap(last_remote + offset)
+        # We intentionally do NOT check next_remote against use_range:
+        # nats_intersect() bumps use_range[0] to 2000 to keep BIND-PORT
+        # selection out of privileged territory, but next_remote isn't a
+        # bind port -- it's what the carrier NAT will actually map us to,
+        # and real CGNATs commonly allocate from sub-2000 pools (the
+        # observed last_remote=1319 is the canonical case).  Falling back
+        # to from_range(use_range) here was randomising the predicted
+        # mapping back to 30k+ ports the NAT never assigns, defeating
+        # the whole WE-DICTATE prediction.  port_wrap() above guards
+        # arithmetic overflow; that's the only invariant we need.
 
-        # How far away is our last mapping from desired port.
-        # Delta dist will wrap inside any assumed range.
-        dist = abs(n_dist(last_remote, bind_port))
-        next_local = port_wrap(last_local + dist)
+        # We're dictating the mapped port now, not chasing the peer's
+        # choice -- so the reply-port hint for our RESTRICT_PORT NAT
+        # must point at the port we'll actually arrive on, not the
+        # peer's original ask.
+        if our_nat["type"] == RESTRICT_PORT_NAT:
+            our_reply = next_remote
 
-        # Return results.
-        return NATMapping([next_local, our_reply, bind_port])
+        log("[NAT-PREDICT] PRESERV: last=({0}->{1}) idx={2} "
+            "next_local={3} next_remote={4} our_reply={5}".format(
+                last_local, last_remote, index, next_local, next_remote, our_reply,
+            ))
+
+        return NATMapping([next_local, our_reply, next_remote])
 
     # Independent and dependent NATs allocate mappings from a known range
     # (measured via a large number of STUN tests) and wrap around when they
@@ -275,7 +294,7 @@ mode,
     # If we're port restricted then set our reply port to the STUN port.
     if our_nat["type"] in PREDICTABLE_NATS:
         # Calculate reply port.
-        our_reply = 3478 if our_nat["type"] == RESTRICT_PORT_NAT else 0
+        our_reply = STUN_PORT if our_nat["type"] == RESTRICT_PORT_NAT else 0
         # TODO: Could connect to STUN port in their range.
 
         # Return results.
@@ -290,7 +309,16 @@ mode,
     raise AssertionError("Can't predict this NAT type.")
 
 
-async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=2):
+async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=8):
+    # Wider spray for the predictor path to absorb carrier-NAT
+    # allocation-pointer drift between the STUN preload and the punch
+    # fire. At test_no=2 the wire-level mappings only had to drift by 2
+    # slots to miss both candidates; with test_no=8 (and the
+    # last_local+1..N WE-DICTATE pattern in get_single_mapping) the
+    # spray covers a contiguous 8-port window adjacent to the last STUN
+    # observation, tolerating up to 8 slots of pointer advance.
+    # XP's half-open SYN cap is 10, so 8 stays safely under (matching
+    # boundary_alloc's NUM_PORTS=8 chosen for the same reason).
     """Compute predicted send and preloaded mappings for a hole-punch session."""
     log("[NAT-PREDICT] mode={0} src_nat_type={1} dest_nat_type={2} "
         "stuns={3} recv_mappings={4}".format(
@@ -341,10 +369,29 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
             src_nat,
             # Get a result instantly.
             preloaded_mapping,
+            # Per-mapping index so WE-DICTATE branches (PRESERV) can
+            # spread N punch sockets across N adjacent NAT-slots.
+            index=i,
         )
 
         # Save prediction.
         results.append(result)
+
+    # Diagnostic: log the full input + output of this prediction round so
+    # punch failures can be reconstructed from the log without needing to
+    # rerun the demo.  Previously only mode/types/counts were logged,
+    # which made it impossible to tell whether a failed punch came from
+    # a bad NAT classification (wrong delta type), a wrong preloaded STUN
+    # measurement, a bad bind_port template, or a bug in get_single_mapping.
+    log("[NAT-PREDICT] preloaded={0}".format(
+        [(m.local, m.remote) for m in preloaded_mappings],
+    ))
+    log("[NAT-PREDICT] recv_template={0}".format(
+        [(m.local, m.reply, m.remote) for m in recv_mappings],
+    ))
+    log("[NAT-PREDICT] send_mappings={0}".format(
+        [(m.local, m.reply, m.remote) for m in results],
+    ))
 
     # R8-6: sequential-allocator one-step-ahead candidate.
     # ~40-60% of SOHO routers allocate ports sequentially (Guha2005 §3.2).
@@ -415,9 +462,22 @@ mode,
     """Adjust our local port predictions to satisfy the peer's reply port restrictions."""
     test_no = min(len(send_mappings), len(recv_mappings))
     use_range = nats_intersect(src_nat, dest_nat, test_no)
-    bad_delta = [INDEPENDENT_DELTA, DEPENDENT_DELTA, RANDOM_DELTA]
+    # PRESERV joins the we-dictate set: its predictor branch no longer
+    # follows the peer's bind_port, so re-running it here against the
+    # peer's reply port would just produce another mapping in our own
+    # adjacent-to-STUN-sample range -- not actually satisfying their
+    # reply-port constraint.  Same for INDEPENDENT/DEPENDENT/RANDOM.
+    bad_delta = [PRESERV_DELTA, INDEPENDENT_DELTA, DEPENDENT_DELTA, RANDOM_DELTA]
 
     # Update our local ports for port restricted NATs.
+    log("[NAT-PREDICT] update_for_reply_ports enter src_delta={0} bad={1} "
+        "test_no={2} send_before={3} recv={4}".format(
+            (src_nat.get("delta") or {}).get("type"),
+            (src_nat.get("delta") or {}).get("type") in bad_delta,
+            test_no,
+            [(m.local, m.reply, m.remote) for m in send_mappings],
+            [(m.local, m.reply, m.remote) for m in recv_mappings],
+        ))
     for i in range(0, test_no):
         # No NAT so reply ports don't apply.
         if mode == TCP_PUNCH_SELF:
@@ -426,11 +486,22 @@ mode,
         # The update is to satisfy a port restricted NAT.
         # These NATs require a specific reply port.
         if not recv_mappings[i].reply:
+            log("[NAT-PREDICT] update i={0} skip: recv reply=0".format(i))
             continue
 
         # We can satisfy their requirements.
         if src_nat["delta"]["type"] in bad_delta:
+            log("[NAT-PREDICT] update i={0} skip: src delta in bad_delta".format(i))
             continue
+
+        # preloaded_mappings has 3 entries from preload_mappings(3, ...)
+        # but test_no can be up to 8 (the spray width).  nat_prediction's
+        # main loop guards this with try/except IndexError; mirror that
+        # here so update_for_reply_ports doesn't IndexError for i >= 3.
+        try:
+            per_iter_preload = preloaded_mappings[i]
+        except IndexError:
+            per_iter_preload = preloaded_mappings[0]
 
         # local, remote, reply, sock.
         mapping = get_single_mapping(
@@ -439,11 +510,18 @@ mode,
             preloaded_mappings[-1],
             use_range,
             src_nat,
-            preloaded_mappings[i],
+            per_iter_preload,
+            index=i,
         )
 
         # Update our local port.
         send_mappings[i].local = mapping.local
         send_mappings[i].remote = recv_mappings[i].reply
+        log("[NAT-PREDICT] update i={0} -> local={1} remote={2} (from recv.reply)".format(
+            i, send_mappings[i].local, send_mappings[i].remote,
+        ))
 
+    log("[NAT-PREDICT] update_for_reply_ports exit send_after={0}".format(
+        [(m.local, m.reply, m.remote) for m in send_mappings],
+    ))
     return send_mappings

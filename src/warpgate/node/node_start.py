@@ -4,17 +4,18 @@ Reusing address can hide socket errors and
 make servers appear broken when they're not.
 """
 import asyncio
-import hashlib
 import time
 from aionetiface import (
     fstr, log, log_exception, log_p2p, async_wrap_errors,
     IP4, IP6, OPEN_INTERNET, AFGroup, Interface, SysClock,
     list_interfaces, load_interfaces, parse_node_addr, make_node_addr,
     field_wrap, dhash, create_task, Signing, os_id, os_net_timeouts,
+    ErrorCantLoadNATInfo, aionetiface_setup_netifaces,
 )
 from aionetiface.nic.nat.nat_utils import nat_info
+from aionetiface.utility.hashing import sha256_hex_short
 from aionetiface.nic.nat.nat_cache import (
-    network_fingerprint, nat_cache_get, nat_cache_put,
+    network_fingerprint, nat_cache_get, nat_cache_put, nat_cache_invalidate,
 )
 from sidewire import Router
 from .node_utils import (
@@ -30,7 +31,7 @@ from .node_utils import (
 )
 from .nickname import Nickname
 from ..traversal.traversal_manager import TraversalManager
-from ..traversal.plugin_loader import load_plugins
+from ..traversal.plugin_loader import load_plugins, register_plugin_wire_names
 from ..install_check import verify_sibling_installs
 
 
@@ -181,7 +182,28 @@ async def load_network_interfaces(node):
         try:
             if_names = await list_interfaces()
             if nic_names:
-                filtered = [n for n in if_names if n in nic_names]
+                # Each wanted name is either a canonical (description
+                # on Windows; device path elsewhere) or an alias the
+                # netifaces backend recognises (friendly name on
+                # Windows).  Resolve each through by_name_index to
+                # its canonical, then filter against the discovered
+                # list.  Backends without by_name_index (POSIX) fall
+                # through to canonical-only matching.
+                aliases = {}
+                try:
+                    netifaces = await aionetiface_setup_netifaces()
+                    aliases = getattr(netifaces, "by_name_index", {}) or {}
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+                def to_canonical(name):
+                    if name in if_names:
+                        return name
+                    info = aliases.get(name)
+                    return info.get("name") if info else None
+
+                filtered = [c for c in (to_canonical(n) for n in nic_names)
+                            if c in if_names]
                 if not filtered:
                     raise ValueError(
                         "nic_names {0!r} matched no available interfaces {1!r}".format(
@@ -227,12 +249,18 @@ def apply_cached_or_placeholder_nat(node):
     publish the address straight away. A network-fingerprint cache hit
     seeds the real previously-measured values (rebuilt via nat_info to
     avoid trusting the raw JSON blob); a miss seeds nat_info()'s
-    optimistic default. Either way the background task overwrites it
-    with a fresh probe and republishes if it differs.
+    optimistic default.
+
+    Stores whether the cache hit was FRESH on the node
+    (node.nat_cache_is_fresh) so classify_nat_background can decide
+    whether to skip the BG classification entirely (fresh) or refresh
+    in the background (stale / miss).
     """
     fingerprint = network_fingerprint(node.ifs)
     node.nat_fingerprint = fingerprint
-    cached = nat_cache_get(fingerprint) or {}
+    cached_nics, is_fresh = nat_cache_get(fingerprint)
+    node.nat_cache_is_fresh = bool(is_fresh)
+    cached = cached_nics or {}
     for nic in node.ifs:
         name = getattr(nic, "name", None)
         entry = cached.get(name)
@@ -260,11 +288,48 @@ async def classify_nat_background(node, out):
     The ~2s classify + republish completes well inside the ~8s
     connector settling window, so a peer never resolves the
     placeholder addr in practice.
+
+    Trust-first short-circuit: when the NAT cache hit was fresh
+    (node.nat_cache_is_fresh set by apply_cached_or_placeholder_nat),
+    skip the real classification entirely.  The cached values are
+    already seeded into nic.nat and the published address reflects
+    them; running another classification round just burns STUN load
+    and risks overwriting confident cached data with a transient bad
+    measurement.  The cache is re-classified on:
+      - cache miss (no entry at all)  -> classify normally
+      - stale hit (entry past TTL)    -> classify in background
+      - cache invalidation by a punch-attempt failure (separately wired)
     """
+    if getattr(node, "nat_cache_is_fresh", False):
+        log("[NAT-CLASSIFY] cache fresh; skipping background classify")
+        return
+
     classify_t0 = time.monotonic()
     before = {}
     for nic in node.ifs:
         before[getattr(nic, "name", None)] = getattr(nic, "nat", None)
+
+    # Determine per-NIC cold-start status BEFORE classification runs.
+    # A NIC is "cold-start" when no usable cached entry was seeded
+    # earlier (apply_cached_or_placeholder_nat fell back to the
+    # nat_info() placeholder default rather than a previous measurement).
+    # The placeholder default produced by nat_info() with no args is
+    # (RESTRICT_PORT_NAT, EQUAL_DELTA) -- so any NIC whose seeded nat
+    # matches that exactly is cold; anything else carried a prior
+    # measurement from cache.  This lets delta_test apply its
+    # optimistic-default-on-cold-start behaviour only where it's
+    # actually warranted, never on a NIC we've already classified
+    # before and stored.
+    is_cold_for_nic = {}
+    placeholder = nat_info()
+    for nic in node.ifs:
+        cur = getattr(nic, "nat", None) or {}
+        is_cold = (
+            cur.get("type") == placeholder.get("type")
+            and isinstance(cur.get("delta"), dict)
+            and cur["delta"].get("type") == placeholder["delta"]["type"]
+        )
+        is_cold_for_nic[getattr(nic, "name", None)] = is_cold
 
     # NAT classification timeout scales up on XP/Vista (slow stacks).
     nat_timeout = os_net_timeouts()["nat_load"]
@@ -272,15 +337,21 @@ async def classify_nat_background(node, out):
     for nic in node.ifs:
         try:
             await asyncio.wait_for(
-                nic.load_nat(timeout=nat_timeout),
+                nic.load_nat(
+                    timeout=nat_timeout,
+                    is_cold_start=is_cold_for_nic.get(getattr(nic, "name", None), False),
+                ),
                 timeout=nat_timeout + 5,
             )
         except asyncio.CancelledError:
             raise
         except (OSError, ConnectionError, asyncio.TimeoutError):
             log_exception()
+        except ErrorCantLoadNATInfo:
+            log_exception()
         except Exception:  # pylint: disable=broad-except
             log_exception()
+
         nat = getattr(nic, "nat", None)
         if nat is not None:
             nat_by_nic[getattr(nic, "name", None)] = nat
@@ -379,7 +450,7 @@ def load_cryptography_and_auth(node):
         )
     node.vk = node.sk.verifying_key
 
-    node.node_id = hashlib.sha256(node.vk.to_string("compressed")).hexdigest()[:25]
+    node.node_id = sha256_hex_short(node.vk.to_string("compressed"), 25)
 
     # Table of authenticated users
     node.auth = {
@@ -458,6 +529,25 @@ async def setup_router_and_signal(node, kp, out, cout):
     router.add_msg_handler(node.traversal.recv_signal_msg)
 
     node.traversal.kp = node.kp
+
+    # Wire-names MUST be in node.traversal.sig_proto BEFORE the MQTT
+    # subscription goes live in setup_signal_router below.  Otherwise the
+    # window between 'subscribed' and 'setup_traversal_plugins finished'
+    # (~600ms during which load_p2p_stun_clients, punch_coord, listen and
+    # nickname all run) drops any PunchMsg / signal that arrives at the
+    # listener with "ValueError: unknown wire_name 'tcp_punch.PunchMsg'".
+    # That window is sub-second on a healthy LAN but trivially exposed by
+    # a connector whose own startup finishes faster -- the listener never
+    # sees the punch and sidewire's republish loses the race if the
+    # connector exits inside its punch budget.
+    #
+    # register_plugin_wire_names is the pure-sync subset of load_plugins
+    # (import classes + populate sig_proto + proto_handlers) with no
+    # cls.setup() awaits, so it's safe to run before stun_clients /
+    # sys_clock have been wired up.  load_plugins below re-runs the same
+    # registration during full setup; the collision check makes the
+    # double-write a no-op.
+    register_plugin_wire_names(node)
 
     await setup_signal_router(node, router, out, cout)
 

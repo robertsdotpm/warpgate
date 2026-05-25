@@ -63,6 +63,54 @@ def import_internal_plugins():
             log_exception()
 
 
+def register_plugin_wire_names(node):
+    """Populate node.traversal.sig_proto + proto_handlers with every plugin's
+    wire-name table, without running any plugin's async setup().
+
+    Runs from setup_router_and_signal between TraversalManager construction
+    and router.start() -- i.e. BEFORE the MQTT signaling subscription goes
+    live -- so messages delivered in the window between 'subscribed' and
+    'full plugin setup complete' are recognised by try_unpack_msg.  The
+    failure mode this guards against: an incoming PunchMsg arriving on the
+    listener's signaling topic during the sub-second gap and being silently
+    rejected with 'ValueError: unknown wire_name tcp_punch.PunchMsg'; the
+    connector's punch budget then exits without retry and the punch is
+    dead before it started.
+
+    Idempotent.  load_plugins below re-runs the same registration during
+    full setup; the collision check is keyed off msg_class identity, so
+    re-assigning the same entry is a harmless no-op.  Wire names are
+    static class metadata, not setup-time state.
+    """
+    import_internal_plugins()
+    discover()  # external entry-point plugins, if any
+    for cls in list(plugin_registry):
+        plugin_name = getattr(cls, "name", cls.__name__)
+        for entry in getattr(cls, "proto_messages", ()) or ():
+            msg_class, strategy_enum, ttl = entry
+            wire_name = "{0}.{1}".format(plugin_name, msg_class.__name__)
+            msg_class.WIRE_NAME = wire_name
+            existing = node.traversal.sig_proto.get(wire_name)
+            if existing is not None and existing[0] is not msg_class:
+                raise ValueError(
+                    "proto_messages collision on {0}: {1!r} vs {2!r}".format(
+                        wire_name, existing[0].__name__, msg_class.__name__,
+                    )
+                )
+            node.traversal.sig_proto[wire_name] = [msg_class, strategy_enum, ttl]
+        for msg_class, handler in (getattr(cls, "proto_handlers", {}) or {}).items():
+            wire_name = getattr(msg_class, "WIRE_NAME", "") or \
+                "{0}.{1}".format(plugin_name, msg_class.__name__)
+            existing = node.traversal.proto_handlers.get(wire_name)
+            if existing is not None and existing is not handler:
+                raise ValueError(
+                    "proto_handlers collision on {0}: {1!r} vs {2!r}".format(
+                        wire_name, existing, handler,
+                    )
+                )
+            node.traversal.proto_handlers[wire_name] = handler
+
+
 async def load_plugins(node):
     """Discover and install every registered traversal strategy onto node."""
     import_internal_plugins()

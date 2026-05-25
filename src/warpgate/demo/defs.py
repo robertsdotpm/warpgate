@@ -24,6 +24,7 @@ demo_node_conf = dict_child(
 )
 
 nat_txt = {
+    None: "unknown",
     OPEN_INTERNET: "open internet",
     SYMMETRIC_UDP_FIREWALL: "udp firewall",
     FULL_CONE: "full cone",
@@ -34,6 +35,7 @@ nat_txt = {
 }
 
 delta_txt = {
+    None: "unknown",
     NA_DELTA: "not applicable",
     EQUAL_DELTA: "equal",
     PRESERV_DELTA: "preserving",

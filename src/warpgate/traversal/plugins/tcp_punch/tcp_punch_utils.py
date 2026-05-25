@@ -65,6 +65,14 @@ def sock_opt_voodoo(s):
     """
 
 
+# disable_udp_connreset_on_windows lives in aionetiface.net.socket.
+# Re-exported here so existing `from ...tcp_punch_utils import ...`
+# callers keep working without an extra import indirection.
+from aionetiface.net.socket import (  # noqa: F401
+    disable_udp_connreset_on_windows,
+)
+
+
 def bind_punch_sockets(
     af,
     nic_id,
@@ -100,6 +108,25 @@ def bind_punch_sockets(
         s = socket.socket(af, sock_type)
         sock_opt_voodoo(s)
         apply_nic_pin_sockopts(s, route)
+        # Windows-only: suppress ICMP-error surfacing on UDP sockets.
+        # The punch family sprays to many predicted ports; on Windows
+        # every ICMP unreachable / time-exceeded reply gets surfaced on
+        # the NEXT recvfrom as ConnectionResetError (WinError 10054) or
+        # marks the socket broken (WinError 10052), so the engine /
+        # bridge / selector_proxy keeps eating phantom errors instead
+        # of the real data we're waiting for.  SIO_UDP_CONNRESET=FALSE
+        # tells Winsock to silently drop the ICMP error info per RFC --
+        # matching what Linux/macOS do by default.  Best-effort; old
+        # XP Winsock doesn't support the ioctl, in which case the
+        # WSAEINVAL is swallowed and the socket runs in the legacy
+        # ICMP-surfacing mode (which is fine for XP because XP's
+        # carrier path doesn't pile up ICMP errors the way modern
+        # Windows + multi-port spray does).
+        if (
+            sock_type == socket.SOCK_DGRAM
+            and sys.platform == "win32"
+        ):
+            disable_udp_connreset_on_windows(s)
         # Bump the receive buffer so burst arrivals during executor
         # stall don't overflow the default 64 KB Windows socket buffer.
         # Applies to both DGRAM (PROBE bursts) and STREAM (SYN-ACK DATA
@@ -123,22 +150,15 @@ def bind_punch_sockets(
                 )
             except OSError:
                 pass
-        # Windows UDP: a sendto to a closed port draws an ICMP
-        # port-unreachable, and Windows then makes the *next* recvfrom
-        # on that socket raise WSAECONNRESET (WinError 10054). The punch
-        # spray fires at many predicted ports -- most closed -- so this
-        # fires constantly and aborts the engine's recvfrom loop before
-        # the one converging probe is read. SIO_UDP_CONNRESET=False
-        # turns the behaviour off so recvfrom only returns real
-        # datagrams. v4 punch mostly escaped it (v4 ICMP unreachables
-        # are widely rate-limited / filtered in transit); v6 did not
-        # (ICMPv6 unreachables come back reliably), which is why
-        # udp_punch was v6-0/5 on the Windows matrix VMs.
-        if sock_type == socket.SOCK_DGRAM and hasattr(socket, "SIO_UDP_CONNRESET"):
-            try:
-                s.ioctl(socket.SIO_UDP_CONNRESET, False)
-            except OSError:
-                pass
+        # NOTE: SIO_UDP_CONNRESET=FALSE was already applied above via
+        # disable_udp_connreset_on_windows(s) (ctypes WSAIoctl path).
+        # A second pass via socket.ioctl(socket.SIO_UDP_CONNRESET, False)
+        # used to live here -- removed because (a) the public
+        # socket.SIO_UDP_CONNRESET attribute was only added in Python
+        # 3.7+ so the second pass was a silent no-op on 3.5/3.6, and
+        # (b) when it did fire it triggered the same ioctl twice with
+        # ENOPROTOOPT log noise from the kernel.  Canonical helper
+        # above is the single source of truth.
         bind_tup = binder_sync(af, ip_strip_if(bind_ip), p.src_port, nic_id)
         bound = False
         for retry in range(4):
@@ -191,20 +211,6 @@ def bind_tcp_sockets(
         af, nic_id, port_allocs, src_ip,
         sock_type=socket.SOCK_STREAM, route=route,
     )
-
-
-def listen_on_tcp_sockets(bound_infos):
-    """Call listen() on each bound socket, returning those that succeed."""
-    listen_infos = []
-    for bound_info in bound_infos:
-        p, s = bound_info
-        try:
-            s.listen(1)
-            listen_infos.append((p, s))
-        except OSError:
-            s.close()
-
-    return listen_infos
 
 
 def connect_on_tcp_sockets(

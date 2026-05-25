@@ -158,13 +158,30 @@ async def connect_option(node, con_opts):
     # the TM's finally guarantee, any failure -- caught, raised, or
     # silent early-return -- resolves the future immediately, so this
     # outer wait only hits its ceiling on a legitimate long success.
-    pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
+    #
+    # CancelledError handling mirrors auto_connect.attempt_one_combo:
+    # async_wrap_errors re-raises CancelledError unconditionally, but
+    # a cleanup-loop-driven plugin.result.cancel() should NOT tear
+    # down the interactive menu.  Distinguish via plugin.result.cancelled().
+    try:
+        pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
+    except asyncio.CancelledError:
+        try:
+            cancelled_internally = plugin.result.cancelled()
+        except AttributeError:
+            cancelled_internally = False
+        if not cancelled_internally:
+            raise
+        log("menu connect: plugin.result cancelled internally; treating as failure")
+        pipe = None
 
-    # Unconditional cleanup: cancels any still-running punch task and removes
-    # the plugin from the traversal manager's registry.  On success the punch
-    # task is already done so this is a fast no-op; on failure it terminates
-    # the background subprocess and frees the ports for the next attempt.
-    if plugin_holder[0] is not None:
+    # Failure-only cleanup: cancels any still-running punch task and removes
+    # the plugin from the traversal manager's registry so the next attempt
+    # gets a fresh port pool.  Must NOT run on success: udp_punch keeps its
+    # selector_proxy bridge running off bridge_socks after convergence, and
+    # plugin.close() tears those down -- the bridge's write-arm then fails
+    # with fd=-1 on the very first ECHO and the round-trip times out.
+    if pipe is None and plugin_holder[0] is not None:
         await close_plugin(
             plugin_holder[0],
             node.traversal.plugins,
@@ -191,8 +208,34 @@ async def connect_option(node, con_opts):
     return "menu"
 
 
-async def accept_option(nick):
-    """Wait in an accept loop, printing the node's PNP nickname, until a stop signal arrives."""
+async def accept_option(nick, node=None):
+    """Wait in an accept loop, printing the node's PNP nickname, until a stop signal arrives.
+
+    Awaits node.nat_classify_task (if present) BEFORE printing "Listen on
+    PNP" so callers / scripted matrix runners that key off the
+    nickname-printed marker don't race the background NAT classifier.
+    classify_nat_background republishes the node addr if the measured
+    NAT differs from the cached placeholder; a connector that resolves
+    our nickname during that window picks up the stale addr and runs
+    the punch with wrong NAT info -- predictions miss the wire, punch
+    fails for non-obvious reasons.  Blocking the listener-side wait
+    here gives every PNP-resolve a node addr that already reflects the
+    real measured NAT.  No-op if node was not passed or the task is
+    already done.
+    """
+    if node is not None:
+        nct = getattr(node, "nat_classify_task", None)
+        if nct is not None and not nct.done():
+            print("\tWaiting for NAT classification to complete...", flush=True)
+            try:
+                await nct
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                # NAT classify is best-effort; surface failure but don't
+                # block the listener if classification errored.  The cached
+                # placeholder remains; punch may misfire but the listener
+                # is still reachable.
+                log_exception()
+
     print("\tListen on PNP: ", nick, flush=True)
     while not sock_has_data(stop_rw[0]):
         await asyncio.sleep(1)
@@ -247,7 +290,12 @@ async def run_menu_program(
     # Just an asyncio sleep loop.
     if "accept:" and menu_option == "1":
         # NOTE: Blocking loop so won't return.
-        return await accept_option(nick)
+        # Pass node so accept_option can await its background NAT
+        # classification before advertising the nickname; otherwise
+        # scripted callers (--cmd 1 matrix runs) race the classifier
+        # and any connector that resolves the nickname during that
+        # window picks up a stale-NAT addr.
+        return await accept_option(nick, node=nodes[0])
 
     # Set a new nickname for the primary node.
     if "nickname:" and menu_option == "2":

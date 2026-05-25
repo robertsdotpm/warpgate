@@ -43,6 +43,7 @@ from ..tcp_punch.proto import PunchMsg
 from ..tcp_punch.boundary_lib import FAST_PUNCH_PARAMS, compute_rendezvous
 from ..tcp_punch.boundary_alloc import boundary_port_alloc
 from ..tcp_punch.punch_client import PunchClient
+from ..tcp_punch.punch_utils import compute_decider_ip
 from ..tcp_punch.nat_predict_alloc import NATPredictAlloc
 from ..tcp_punch.nat_predict import NATMapping
 from ..tcp_punch.punch_defs import TCP_PUNCH_LAN
@@ -92,7 +93,7 @@ class PunchPcapPlugin(Plugin):
     # converges in <2 s once both sides fire or it won't converge at
     # all (no NAT timer extension to play for, no XP reverse-bridge
     # accept tail to budget for).
-    conf = {"timeout": 5}
+    conf = {"timeout": 10}
     # DO NOT register PunchMsg here. tcp_punch already registers it
     # under wire name "tcp_punch.PunchMsg"; listing it here would
     # either collide or create a second wire name and break interop.
@@ -228,7 +229,7 @@ class PunchPcapPlugin(Plugin):
                 "aborting".format(dest_ip))
             return None, None
 
-        decider_ip = src_ip
+        decider_ip = compute_decider_ip(self.route_type, self.src)
         puncher = PunchClient(
             dest_ip,
             src_ip,
@@ -318,15 +319,24 @@ class PunchPcapPlugin(Plugin):
 
         port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
+        # Only fold-then-signal when recv_mappings was supplied: for the
+        # INITIATOR's first call we've only sent OUR predictions out and
+        # the peer hasn't responded yet, so puncher.port_allocs contains
+        # only our initial template / WE-DICTATE values.  Releasing the
+        # worker at that point binds sockets to those values before
+        # update_for_reply_ports can re-target them at the peer's
+        # actual reply-ports.  See tcp_punch for the full
+        # asymmetric-direction analysis -- same shared NATPredictAlloc
+        # state machine, same gating fix.
         if recv_mappings is not None:
             self.peer_mappings_folded = True
 
-        # Signal the pcap-engine task: peer's mappings have been folded
-        # in and port_allocs is now valid.  Guarded by not done() so
-        # re-entries across signal rounds don't InvalidStateError.
-        reply_future = getattr(self, "mapping_reply", None)
-        if reply_future is not None and not reply_future.done():
-            reply_future.set_result(True)
+            # Signal the pcap-engine task: peer's mappings have been folded
+            # in and port_allocs is now valid.  Guarded by not done() so
+            # re-entries across signal rounds don't InvalidStateError.
+            reply_future = getattr(self, "mapping_reply", None)
+            if reply_future is not None and not reply_future.done():
+                reply_future.set_result(True)
 
         if is_end == 1:
             return None
@@ -377,9 +387,18 @@ class PunchPcapPlugin(Plugin):
             # port BEFORE the punch fires. tcpip.sys / Linux kernel
             # must NOT see the SYN as "no socket listening" and emit
             # an RST; the pcap stack will own the handshake.
+            #
+            # install_block_ports shells out to iptables / pfctl /
+            # netsh -- a synchronous subprocess that on Linux can
+            # take 100ms+ and would otherwise stall the event loop on
+            # every TCP punch attempt.  Offload to the default thread
+            # pool executor.
             local_ports = sorted(set(int(pa.src_port)
                                      for pa in puncher.port_allocs))
-            firewall_ports = install_block_ports(local_ports)
+            loop = asyncio.get_event_loop()
+            firewall_ports = await loop.run_in_executor(
+                None, install_block_ports, local_ports,
+            )
 
             # Resolve pcap NIC name. On Unix it's the NIC's name; on
             # Windows it's the NPF device path. Same lookup the original

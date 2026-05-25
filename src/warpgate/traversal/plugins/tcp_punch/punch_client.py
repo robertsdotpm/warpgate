@@ -26,6 +26,7 @@ self,
         params=None,
         our_os=None,
         their_os=None,
+        route=None,
     ):
         # Fallback to IP4
         self.af = socket.AF_INET
@@ -53,6 +54,19 @@ self,
         # sides == historical default pool.
         self.our_os = our_os
         self.their_os = their_os
+
+        # Route used for SO_BINDTODEVICE pinning on the actual punch
+        # sockets bound in tcp_punch_engine.setup_engine.  Without this
+        # the engine calls bind_tcp_sockets(route=None), which makes
+        # apply_nic_pin_sockopts a no-op -- the kernel then routes
+        # punch outbound via whichever default route has the lowest
+        # metric regardless of which NIC's IP the socket was bound to.
+        # On a host with two default routes (LAN + mobile), the mobile
+        # NIC's punch SYNs leave via the LAN gateway and the simul-open
+        # never actually reaches the mobile carrier path.  bind_punch_
+        # sockets' docstring documents this failure; the plumbing just
+        # wasn't passing route through.
+        self.route = route
 
         # Listen bind / dest connect matrixes.
         self.port_allocs = []  # [ src bind, dest port ]
@@ -153,12 +167,6 @@ self,
             "capped={3}".format(
                 self.timestamp, self.punch_time, sleep_time, capped,
             ))
-        try:
-            print("[PUNCH-STAGE] wall={0:.3f} stage=sleep_until ts={1} punch_time={2} sleep={3}s".format(
-                time.time(), self.timestamp, self.punch_time, sleep_time,
-            ), flush=True)
-        except Exception:
-            pass
 
         # No sleep needed if far behind.
         if sleep_time > 0:
@@ -234,12 +242,6 @@ self,
         log("[PUNCH-CLIENT] run_engine: primary punch_time={0} secondary={1}".format(
             self.punch_time, self.secondary_punch_time,
         ))
-        try:
-            print("[PUNCH-STAGE] wall={0:.3f} stage=run_engine_enter punch_time={1}".format(
-                time.time(), self.punch_time,
-            ), flush=True)
-        except Exception:
-            pass
         sock = f_engine(
             af=self.af,
             nic_id=self.nic_id,
@@ -250,6 +252,7 @@ self,
             our_ip=self.our_ip,
             same_machine=self.same_machine,
             params=self.params,
+            route=self.route,
         )
         if sock is not None:
             log("[PUNCH-CLIENT] run_engine: primary fire converged")
@@ -276,6 +279,7 @@ self,
             our_ip=self.our_ip,
             same_machine=self.same_machine,
             params=self.params,
+            route=self.route,
         )
 
 

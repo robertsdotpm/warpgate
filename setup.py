@@ -16,7 +16,7 @@ install_reqs = [
     "ecdsa",
 ]
 setup(
-    version="4.0.10",
+    version="4.0.11",
     name="warpgate",
     description="Async NAT traversal library",
     keywords=(

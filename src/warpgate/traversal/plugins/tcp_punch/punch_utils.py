@@ -4,16 +4,59 @@ import socket
 import struct
 import selectors
 import asyncio
-from aionetiface import IPRange, fstr, log, SysClock
-from .punch_defs import PUNCH_END, TCP_PUNCH_REMOTE, TCP_PUNCH_SELF, TCP_PUNCH_LAN
+from aionetiface import EXT_BIND, IPRange, fstr, log, SysClock
+from .punch_defs import (
+    MAX_NTP_RETRIES,
+    NTP_DELTA,
+    NTP_PACKET_SIZE,
+    NTP_PORT,
+    NTP_SERVER,
+    NTP_TIMEOUT,
+    PUNCH_END,
+    TCP_PUNCH_LAN,
+    TCP_PUNCH_REMOTE,
+    TCP_PUNCH_SELF,
+)
 
-# --- NTP Constants ---
-NTP_SERVER = "pool.ntp.org"
-NTP_PORT = 123
-NTP_DELTA = 2208988800  # 70-year offset between NTP epoch (1900) and Unix epoch (1970)
-NTP_PACKET_SIZE = 48
-MAX_NTP_RETRIES = 5
-NTP_TIMEOUT = 1.0
+
+def compute_decider_ip(route_type, src_map):
+    """Return the IP that this side identifies as for master/slave election.
+
+    Single source of truth for the EXT_BIND-vs-NIC_BIND branch that
+    used to live in tcp_punch / udp_punch / tcp_punch_pcap main.py with
+    three drifted bodies:
+
+      - tcp_punch:      ``if NIC_BIND: src["ip"] else: src.get("ext")``
+                        -- returned None on missing "ext"
+      - udp_punch:      ``if EXT_BIND: src.get("ext") else: src_ip``
+                        -- returned None on missing "ext"
+      - tcp_punch_pcap: ``if EXT_BIND: src.get("ext") or src_ip else: src_ip``
+                        -- correct: falls back to src_ip on missing "ext"
+
+    The OPEN_INTERNET / loopback / pre-classify case where src lacks an
+    "ext" key would silently return None from the first two; downstream
+    IPRange(None) would crash.  Pick the pcap branch's behaviour --
+    always fall back to bind IP if "ext" is missing.
+
+    Returns a string suitable for IPRange() construction.
+    """
+    src_ip = src_map["ip"] if isinstance(src_map, dict) else src_map
+    if route_type == EXT_BIND:
+        return src_map.get("ext") or src_ip
+    return src_ip
+
+
+def is_master_by_ext(own_decider_ip, peer_decider_ip):
+    """Symmetric master/slave election by IPRange comparison.
+
+    Both peers MUST feed the same pair of decider IPs (their own and the
+    peer's wire-advertised ext) for the result to be consistent.  Returns
+    False (slave) when either side is missing -- caller's responsibility
+    to ensure both inputs are populated before relying on the result.
+    """
+    if not own_decider_ip or not peer_decider_ip:
+        return False
+    return IPRange(own_decider_ip) > IPRange(peer_decider_ip)
 
 
 def timestamp_from_ntp(
@@ -81,46 +124,6 @@ def get_punch_mode(af, dest_ip, same_machine):
             return TCP_PUNCH_SELF
         else:
             return TCP_PUNCH_LAN
-
-
-def punching_sanity_check(mode, our_wan, dest_addr, send_mappings, recv_mappings):
-    """Log warnings when port or address conflicts are detected in the punch configuration."""
-    if mode == TCP_PUNCH_SELF:
-        for sm in send_mappings:
-            for rm in recv_mappings:
-                if sm.local == rm.local:
-                    error = fstr("punch self local port conflict ")
-                    fstr(
-                        "{0} {1}",
-                        (
-                            sm.local,
-                            rm.local,
-                        ),
-                    )
-                    log(error)
-
-    if mode == TCP_PUNCH_REMOTE:
-        if our_wan == dest_addr:
-            error = fstr("punch remote but dest is the same ")
-            fstr("as our ext {0}", (our_wan,))
-            log(error)
-
-
-# Not really the best approach but process communication is a pain.
-async def punch_close_msg(msg, client_tup, pipe):
-    """Close the pipe after a short delay when a punch-end message is received."""
-    if msg in PUNCH_END:
-        # Allow time to send message down pipes.
-        await asyncio.sleep(2)
-        await pipe.close()
-
-
-async def setup_punch_coordination(node, sys_clock=None):
-    """Initialise and attach the NTP-synchronised SysClock to the node for punch timing."""
-    if sys_clock is None:
-        sys_clock = await SysClock(node.ifs[0]).start()
-
-    node.sys_clock = sys_clock
 
 
 def wait_for_first_with_data(sockets, timeout):
@@ -209,9 +212,16 @@ def choose_winning_tcp_sock(their_ip, sock_list, our_ip=None, sentinel_wait=None
     if not sock_list:
         return None
 
-    # Master side closes all others immediately
+    # Master side closes all others immediately.  Wrap both IPs in
+    # IPRange for NUMERIC comparison -- the old `our_ip > their_ip`
+    # was a Python string compare, which mis-elects when one peer's
+    # IP lex-sorts higher than the other's but is numerically smaller
+    # (single-digit first octet vs three-digit first octet).
+    # IPRange.__lt__ parses both sides via ipaddress.ip_address so
+    # the comparison is correct for both v4 and v6.
+    from aionetiface import IPRange
     our_ip = our_ip or sock_list[0].getsockname()[0]
-    if our_ip > their_ip:
+    if IPRange(our_ip) > IPRange(their_ip):
         sorted_socks = sorted(sock_list, key=peer_symmetric_4tuple_key)
         winner = sorted_socks[-1]
         losers = [s for s in sorted_socks if s is not winner]

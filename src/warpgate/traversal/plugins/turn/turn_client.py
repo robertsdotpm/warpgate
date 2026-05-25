@@ -19,7 +19,7 @@ from aionetiface import (
     PipeEvents, Pipe, UDP, NET_CONF, to_b, to_s, fstr, log, log_exception,
     SUB_ALL, async_wrap_errors, async_retry, gather_or_cancel, timestamp,
     af_from_ip_s, STUNMsg, STUNAttrs, STUNAddrTup, STUNMsgTypes, RFC5389,
-    norm_client_tup, tup_to_sub, async_test, resolv_dest,
+    norm_client_tup, tup_to_sub, async_test, resolv_dest, STUN_PORT,
 )
 from .turn_process import (
     process_replies,
@@ -682,7 +682,7 @@ if __name__ == "__main__":  # pragma: no cover
         interface = await Interface("enp1s0f0").start()
         turn_user = b""
         turn_pw = b""
-        turn_addr = ("", 3478)
+        turn_addr = ("", STUN_PORT)
 
         # A faulty network interface will cause hosts with multiple
         # interfaces to report non-deterministic results with defaults.
