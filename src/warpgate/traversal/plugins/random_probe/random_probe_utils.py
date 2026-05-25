@@ -209,20 +209,23 @@ def make_udp_socket(bind_ip, bind_port=0, route=None):
     """
     fam = socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
     s = socket.socket(fam, socket.SOCK_DGRAM)
-    from ..tcp_punch.tcp_punch_utils import disable_udp_connreset_on_windows
+    from aionetiface.net.socket import (
+        apply_nic_pin_sockopts, disable_udp_connreset_on_windows,
+    )
+    from ..tcp_punch.tcp_punch_utils import sock_opt_voodoo
+    # sock_opt_voodoo handles the Windows REUSEADDR-vs-EXCLUSIVEADDRUSE
+    # split + POSIX REUSEPORT.  Before this delegation, make_udp_socket
+    # set bare SO_REUSEADDR on Windows -- which has the *opposite*
+    # semantics from POSIX (it lets a stray listener hijack the port)
+    # -- so two random_probe spray sockets could share a 4-tuple and
+    # confuse the engine.  Matches the bug class fixed for the NIC pin
+    # by 09e1bb5 (delegating to apply_nic_pin_sockopts).
+    sock_opt_voodoo(s)
     disable_udp_connreset_on_windows(s)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except (OSError, AttributeError):
-            pass
 
     if route is not None:
-        from aionetiface.net.socket import apply_nic_pin_sockopts
         apply_nic_pin_sockopts(s, route)
 
-    s.setblocking(False)
     s.bind((bind_ip, bind_port))
     return s
 

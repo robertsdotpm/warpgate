@@ -65,55 +65,12 @@ def sock_opt_voodoo(s):
     """
 
 
-def disable_udp_connreset_on_windows(sock):
-    """Tell Winsock to NOT surface ICMP errors on a UDP socket.
-
-    Windows reflects ICMP unreachable / time-exceeded back to the
-    originating UDP socket via WSAECONNRESET (10054) on the next
-    recvfrom, and broken-socket errors via WSAEINVAL (10038) on
-    subsequent calls.  RFC 1122 says UDP MAY surface these but the
-    common Unix convention is to swallow them silently, which is
-    what we want for the punch family -- the spray ALWAYS hits
-    closed peer ports (we're predicting), so ICMP backwash is
-    normal and should not pollute recv.
-
-    SIO_UDP_CONNRESET (0x9800000C) controls this.  Setting the
-    BOOL value to FALSE tells Winsock to suppress the errors and
-    just drop the ICMP info.
-
-    Python's socket.ioctl whitelists ioctl commands and rejects
-    SIO_UDP_CONNRESET, so we call WSAIoctl via ctypes.  Best-
-    effort: any failure is logged and the socket continues with
-    legacy ICMP-surfacing behaviour (which matches XP / pre-fix
-    behaviour and only hurts modern Windows under heavy spray).
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        import ctypes.wintypes
-        SIO_UDP_CONNRESET = 0x9800000C
-        WSAIoctl = ctypes.windll.ws2_32.WSAIoctl
-        bytes_returned = ctypes.wintypes.DWORD()
-        inbuf = ctypes.wintypes.BOOL(False)
-        ret = WSAIoctl(
-            sock.fileno(),
-            ctypes.c_ulong(SIO_UDP_CONNRESET),
-            ctypes.byref(inbuf),
-            ctypes.sizeof(inbuf),
-            None, 0,
-            ctypes.byref(bytes_returned),
-            None, None,
-        )
-        if ret != 0:
-            try:
-                err = ctypes.windll.ws2_32.WSAGetLastError()
-            except Exception:  # pylint: disable=broad-except
-                err = "?"
-            log("disable_udp_connreset_on_windows: WSAIoctl failed "
-                "ret={0} WSAGetLastError={1}".format(ret, err))
-    except (OSError, AttributeError, OSError):
-        log_exception()
+# disable_udp_connreset_on_windows lives in aionetiface.net.socket.
+# Re-exported here so existing `from ...tcp_punch_utils import ...`
+# callers keep working without an extra import indirection.
+from aionetiface.net.socket import (  # noqa: F401
+    disable_udp_connreset_on_windows,
+)
 
 
 def bind_punch_sockets(
@@ -193,22 +150,15 @@ def bind_punch_sockets(
                 )
             except OSError:
                 pass
-        # Windows UDP: a sendto to a closed port draws an ICMP
-        # port-unreachable, and Windows then makes the *next* recvfrom
-        # on that socket raise WSAECONNRESET (WinError 10054). The punch
-        # spray fires at many predicted ports -- most closed -- so this
-        # fires constantly and aborts the engine's recvfrom loop before
-        # the one converging probe is read. SIO_UDP_CONNRESET=False
-        # turns the behaviour off so recvfrom only returns real
-        # datagrams. v4 punch mostly escaped it (v4 ICMP unreachables
-        # are widely rate-limited / filtered in transit); v6 did not
-        # (ICMPv6 unreachables come back reliably), which is why
-        # udp_punch was v6-0/5 on the Windows matrix VMs.
-        if sock_type == socket.SOCK_DGRAM and hasattr(socket, "SIO_UDP_CONNRESET"):
-            try:
-                s.ioctl(socket.SIO_UDP_CONNRESET, False)
-            except OSError:
-                pass
+        # NOTE: SIO_UDP_CONNRESET=FALSE was already applied above via
+        # disable_udp_connreset_on_windows(s) (ctypes WSAIoctl path).
+        # A second pass via socket.ioctl(socket.SIO_UDP_CONNRESET, False)
+        # used to live here -- removed because (a) the public
+        # socket.SIO_UDP_CONNRESET attribute was only added in Python
+        # 3.7+ so the second pass was a silent no-op on 3.5/3.6, and
+        # (b) when it did fire it triggered the same ioctl twice with
+        # ENOPROTOOPT log noise from the kernel.  Canonical helper
+        # above is the single source of truth.
         bind_tup = binder_sync(af, ip_strip_if(bind_ip), p.src_port, nic_id)
         bound = False
         for retry in range(4):
