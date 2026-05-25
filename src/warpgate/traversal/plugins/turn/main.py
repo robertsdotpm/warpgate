@@ -96,6 +96,28 @@ class TURNPlugin(Plugin):
         (e.g. initiator on a mobile carrier reaching a Chinese coturn
         the responder's home ISP can't) silently NO_ECHO'd.
         """
+        # TURN requires the two peers to be reachable from the relay
+        # server as DISTINCT addresses.  When src["ext"] == dest["ext"]
+        # (both peers behind the same NAT / colocated WAN IP), Coturn's
+        # anti-loopback check rejects the relay forward, and even if it
+        # didn't, the server's outbound to (ext, port) would loopback
+        # via the local NAT to the wrong side.  Reject combos that
+        # share an ext IP up front so the cascade falls through to
+        # something that can work (NIC_BIND / LOOPBACK_BIND for same-
+        # machine pairs).  Skipped for empty ext IPs (combo generator
+        # guard handles that case).
+        src_ext = self.src.get("ext")
+        dest_ext = self.dest.get("ext")
+        if src_ext and dest_ext and str(src_ext) == str(dest_ext):
+            log(fstr(
+                "turn[{0}]: src ext == dest ext ({1}); aborting "
+                "(Coturn will reject same-WAN-IP relay)",
+                (self.plugin_id, src_ext),
+            ))
+            if not self.result.done():
+                self.result.set_result(None)
+            return
+
         is_initial_initiator = reply is None
         is_responder = reply is not None and not (
             getattr(reply.payload, "reject_reason", None)

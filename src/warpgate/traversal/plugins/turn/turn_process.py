@@ -199,172 +199,182 @@ async def process_attributes(af, self, msg):
 
 # Process any replies from the TURN server.
 # This function is run concurrently and doesn't block the main program.
-async def process_replies(self):
-    """Continuously receive and dispatch TURN server messages until the session stops."""
-    # Keep processing until stopped.
-    while self.state != TURN_ERROR_STOPPED:
-        # Prune old tasks.
-        self.tasks = rm_done_tasks(self.tasks)
+async def turn_msg_handler(client, data, client_tup, pipe):
+    """msg_cb-style handler for TURN server messages on the signaling
+    pipe.  Replaces the old process_replies polling loop -- registered
+    via turn_pipe.add_msg_cb(...) in TURNClient.start() so each inbound
+    frame dispatches immediately (no 1s poll latency).
 
-        # Async wait for up to N seconds for new messages.
-        try:
-            out = await self.turn_pipe.recv(timeout=1)
-        except (asyncio.TimeoutError, OSError):
-            await asyncio.sleep(1)
-            continue
+    Wrapped per-message in an exception guard: a single malformed frame
+    must not kill subsequent dispatch.
+    """
+    try:
+        await dispatch_one(client, data)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        log_exception()
 
-        # Timeout no messages.
-        if out is None:
-            await asyncio.sleep(1)
-            continue
 
-        # Option B) Parse TURN messages from the server.
-        turn_msg, turn_method, turn_status = turn_parse_msg(memoryview(out))
-        if turn_msg is None:
-            continue
+async def dispatch_one(self, out):
+    """Dispatch one inbound frame from the TURN server's signaling
+    pipe.  Recognises three classes:
+      1. ChannelData (first byte 0x40-0x7F) — strip channel header,
+         route via channel_to_peer.
+      2. STUN message with a Data attribute + XorPeerAddress —
+         relay-forwarded peer data, route via handle_data.
+      3. STUN message matching a previously-recorded transaction TXID
+         — Allocate / CreatePermission / Refresh / ChannelBind reply,
+         resolve the waiting future.
+    """
+    # Prune old tasks at each iteration (was in the old loop).
+    self.tasks = rm_done_tasks(self.tasks)
 
-        # Some TURN messages may have data attributes.
-        # These indicate a peer who sent data to our relay address.
-        # Attempt to look for these attributes and process them if found.
-        msg_data, peer_tup = turn_get_data_attr(turn_msg, self.turn_pipe.route.af, self)
-
-        if msg_data is not None and peer_tup is not None:
-            # Not a peer we white listed.
-            peer_tup = norm_client_tup(peer_tup)
-            if peer_tup not in self.peers:
-                error = fstr(
-                    """
-                Got a TURN data message from an
-                unknown peer = {0} which
-                may indicate a decoding error.
-                """,
-                    (peer_tup,),
-                )
-                log(error)
-                continue
-
-            # Get relay address to route to sender of the message.
-            peer_relay_tup = self.peers[peer_tup]
-
-            # Tell the sender that we got the message.
-            _, payload = self.stream.handle_ack(
-                msg_data,
-                self.stream.is_ack,
-                self.stream.is_ackable,
-                lambda buf: self.stream.send(buf, peer_relay_tup),
-            )
-
-            # A simple ACK-based protocol is transparently applied to the
-            # relay messages behind the scenes to add reliability.
-            # If the header can't be found then the original message
-            # will be unknown so we skip it.
-            if payload is None:
-                log(fstr("Payload from turn was None but msg data = {0}", (msg_data,)))
-                if not self.blank_rudp_headers:
-                    continue
-                else:
-                    self.handle_data(msg_data, peer_tup)
-                    continue
-
-            # The sender's message has been stripped of the ACK header.
-            # It is then routed to this object (pipe-like object)
-            # where it will be handled and/or queued. The sender's
-            # relay address is listed as the sender to make it
-            # easy to route replies transparently.
-            self.handle_data(payload, peer_tup)
-            continue
-
-        # When a TURN message is sent it has a unique TXID.
-        # Replies in response to these messages use the same TXID.
-        # Unknown TXIDs for messages are discarded.
-        txid = turn_msg.txn_id
-        if txid not in self.msgs:
-            log("Got turn message with unknown TXID.")
-            continue
-
-        # PolledDatagramTransport batches recvfrom calls, so duplicate
-        # responses for the same TXID (e.g. two 401s from two unsigned
-        # retransmits) can arrive back-to-back.  set_result() raises
-        # InvalidStateError on an already-resolved Future, which kills
-        # process_replies before the signed-Allocate 200 is processed.
-        if self.msgs[txid]["status"].done():
-            continue
-
-        # A few important attributes are saved into the client for future use.
-        # Mostly details for relaying and authentication.
-        try:
-            error_code, error_msg = await process_attributes(
-                self.turn_pipe.route.af, self, turn_msg
-            )
-        except (OSError, ValueError):
-            log_exception()
-            continue
-
-        # Log any error messages.
-        if turn_status == STUNMsgCodes.ErrorResp:
-            log("Turn error {}: {}".format(error_code, error_msg))
-            log(fstr("turn hex msg: {0}", (to_h(turn_msg.pack()),)))
-
-            # Stale nonce.
-            if error_code == 438:
-                log(fstr("stole nonce. retransmit for {0}", (txid,)))
-                if not self.msgs[txid]["status"].done():
-                    self.msgs[txid]["status"].set_result(STATUS_RETRY)
-                continue
-
-        # Attempt to authenticate or create a relay address or refresh one.
-        if turn_method == STUNMsgTypes.Allocate:
-            log("got alloc")
-
-            # Notify sender that message was received.
-            if not self.msgs[txid]["status"].done():
-                self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
-            if turn_status == STUNMsgCodes.SuccessResp:
-                if self.state != TURN_TRY_ALLOCATE:
-                    # self.txid = txid
-                    # self.requires_auth = False
-                    self.auth_event.set()
-            else:
-                log("Error in TURN allocate")
-
-            """
-            The first 'allocate' message makes the server return attributes
-            needed to authenticate and sign all future messages.
-            Hence failing once is expected.
-            """
-            if turn_status == STUNMsgCodes.ErrorResp:
-                # Avoid infinite loop of allocations.
-                if self.state != TURN_TRY_ALLOCATE:
-                    self.set_state(TURN_TRY_ALLOCATE)
-
-                    # All future messages from here-on in are 'signed.'
-                    task = asyncio.create_task(
-                        async_wrap_errors(async_retry(lambda: self.allocate_relay(sign=True), count=5))
+    # 1) ChannelData dispatch.  Non-STUN, [channel:2][len:2][data][pad].
+    out_bytes = bytes(out) if not isinstance(out, bytes) else out
+    if len(out_bytes) >= 4 and 0x40 <= out_bytes[0] <= 0x7F:
+        channel_num = (out_bytes[0] << 8) | out_bytes[1]
+        data_len = (out_bytes[2] << 8) | out_bytes[3]
+        if len(out_bytes) >= 4 + data_len:
+            channel_peer = self.channel_to_peer.get(channel_num)
+            if channel_peer is not None:
+                payload = out_bytes[4:4 + data_len]
+                # ACK reply MUST go via raw self.stream.send so the
+                # 9-byte ACK frame is sent unwrapped to the peer's
+                # relay.  Using TURNClient.send would re-wrap via
+                # ack_send -> [new_seq:8][0x00][ack:9] = 18 bytes;
+                # the peer's dispatch would then unwrap the outer
+                # frame and route the inner 9-byte ACK to its app
+                # via handle_data (TURNClient.is_ack is None for the
+                # UDP-typed TURN pipe so the inner ACK isn't filtered),
+                # surfacing as a stray 9-byte buffer to user code.
+                peer_relay_tup = self.peers.get(channel_peer)
+                if peer_relay_tup is not None:
+                    f_send = (
+                        lambda buf, prt=peer_relay_tup:
+                        self.stream.send(buf, prt)
                     )
-                    self.tasks.append(task)
-
-            self.msgs.pop(txid, None)
-            continue
-
-        # White list a particular peer to send replies to our relay address.
-        if turn_method == STUNMsgTypes.CreatePermission:
-            if turn_status == STUNMsgCodes.SuccessResp:
-                # Notify sender that message was received.
-                if not self.msgs[txid]["status"].done():
-                    self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
-            else:
-                error = fstr("Error in TURN create permission = ") + fstr(
-                    "{0}", (to_h(turn_msg.pack()),)
+                else:
+                    f_send = lambda buf: None
+                _, app_payload = self.stream.handle_ack(
+                    payload,
+                    self.stream.is_ack,
+                    self.stream.is_ackable,
+                    f_send,
                 )
-                log(error)
+                if app_payload is not None:
+                    self.handle_data(app_payload, channel_peer)
+            else:
+                log(fstr(
+                    "ChannelData on unbound channel {0}",
+                    (channel_num,),
+                ))
+        return
 
-            self.msgs.pop(txid, None)
-            continue
+    # 2) STUN message parse.  Malformed frames return None; skip.
+    turn_msg, turn_method, turn_status = turn_parse_msg(memoryview(out))
+    if turn_msg is None:
+        return
 
-        if turn_method == STUNMsgTypes.Refresh:
+    # Data attribute path — server forwarded a peer's data to us.
+    msg_data, peer_tup = turn_get_data_attr(turn_msg, self.turn_pipe.route.af, self)
+    if msg_data is not None and peer_tup is not None:
+        peer_tup = norm_client_tup(peer_tup)
+        if peer_tup not in self.peers:
+            log(fstr(
+                "Got a TURN data message from an unknown peer = {0} "
+                "which may indicate a decoding error.",
+                (peer_tup,),
+            ))
+            return
+        peer_relay_tup = self.peers[peer_tup]
+        _, payload = self.stream.handle_ack(
+            msg_data,
+            self.stream.is_ack,
+            self.stream.is_ackable,
+            lambda buf: self.stream.send(buf, peer_relay_tup),
+        )
+        if payload is None:
+            log(fstr("Payload from turn was None but msg data = {0}", (msg_data,)))
+            if self.blank_rudp_headers:
+                self.handle_data(msg_data, peer_tup)
+            return
+        self.handle_data(payload, peer_tup)
+        return
+
+    # 3) Response to one of our outstanding requests, matched by TXID.
+    txid = turn_msg.txn_id
+    if txid not in self.msgs:
+        log("Got turn message with unknown TXID.")
+        return
+    if self.msgs[txid]["status"].done():
+        return
+
+    try:
+        error_code, error_msg = await process_attributes(
+            self.turn_pipe.route.af, self, turn_msg
+        )
+    except (OSError, ValueError):
+        log_exception()
+        return
+
+    if turn_status == STUNMsgCodes.ErrorResp:
+        log("Turn error {}: {}".format(error_code, error_msg))
+        log(fstr("turn hex msg: {0}", (to_h(turn_msg.pack()),)))
+        if error_code == 438:
+            log(fstr("stale nonce. retransmit for {0}", (txid,)))
+            if not self.msgs[txid]["status"].done():
+                self.msgs[txid]["status"].set_result(STATUS_RETRY)
+            return
+
+    if turn_method == STUNMsgTypes.Allocate:
+        log("got alloc")
+        if not self.msgs[txid]["status"].done():
+            self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
+        if turn_status == STUNMsgCodes.SuccessResp:
+            if self.state != TURN_TRY_ALLOCATE:
+                self.auth_event.set()
+        else:
+            log("Error in TURN allocate")
+        # First Allocate is intentionally unsigned -> 401, then signed
+        # via the retry task below.
+        if turn_status == STUNMsgCodes.ErrorResp:
+            if self.state != TURN_TRY_ALLOCATE:
+                self.set_state(TURN_TRY_ALLOCATE)
+                task = asyncio.create_task(async_wrap_errors(
+                    async_retry(lambda: self.allocate_relay(sign=True), count=5)
+                ))
+                self.tasks.append(task)
+        self.msgs.pop(txid, None)
+        return
+
+    if turn_method == STUNMsgTypes.CreatePermission:
+        if turn_status == STUNMsgCodes.SuccessResp:
             if not self.msgs[txid]["status"].done():
                 self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
-            self.msgs.pop(txid, None)
-            continue
+        else:
+            log(fstr(
+                "Error in TURN create permission = {0}",
+                (to_h(turn_msg.pack()),),
+            ))
+        self.msgs.pop(txid, None)
+        return
 
-    self.turn_client_stopped.set()
+    if turn_method == STUNMsgTypes.Refresh:
+        if not self.msgs[txid]["status"].done():
+            self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
+        self.msgs.pop(txid, None)
+        return
+
+    if turn_method == STUNMsgTypes.ChannelBind:
+        if not self.msgs[txid]["status"].done():
+            if turn_status == STUNMsgCodes.SuccessResp:
+                self.msgs[txid]["status"].set_result(STATUS_SUCCESS)
+            else:
+                self.msgs[txid]["status"].set_result(STATUS_RETRY)
+                log(fstr(
+                    "ChannelBind rejected: {0}",
+                    (to_h(turn_msg.pack()),),
+                ))
+        self.msgs.pop(txid, None)
+        return
