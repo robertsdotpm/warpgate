@@ -17,11 +17,11 @@ node's ``nick_client`` because the node failed to start when the
 quota tripped, so its client isn't fully wired up.
 """
 from __future__ import print_function
-import json
 import os
 
 from aionetiface import IP4, PNP_SERVERS
 from aionetiface.keystore import KEYSTORE_DIR
+from aionetiface.utility.jsonfile import load_json_or_default
 from ecdsa import SECP256k1, SigningKey
 
 from .utils import ainput, cout
@@ -49,11 +49,7 @@ def discover_keystore_entries():
         if not fn.endswith(".json"):
             continue
         path = os.path.join(KEYSTORE_DIR, fn)
-        try:
-            with open(path, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-        except (OSError, ValueError):
-            continue
+        data = load_json_or_default(path, None)
         if not isinstance(data, dict):
             continue
         pnp_name = data.get("pnp_name")
