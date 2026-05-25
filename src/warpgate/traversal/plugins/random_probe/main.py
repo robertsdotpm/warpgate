@@ -144,7 +144,10 @@ class RandomProbePlugin(Plugin):
         else:
             # src["ext"] is an IPRange object (set by topology.py); cast
             # to str for downstream comparisons and on-wire encoding.
-            self.my_addr_ip = str(self.src.get("ext") or "")
+            # The combo generator guarantees src["ext"] is populated for
+            # EXT_BIND combos and that the two sides' ext IPs differ;
+            # see the combo-level validation in traversal_utils.
+            self.my_addr_ip = str(self.src["ext"])
 
         # Role assignment by NAT restrictiveness, then by IP:
         #   1. Whichever side has the *higher* NAT type number plays
@@ -167,15 +170,11 @@ class RandomProbePlugin(Plugin):
         elif my_nat_n < peer_nat_n:
             my_role = "non_sym"
         else:
-            # Tie-breaker on missing / equal addr: fall back to who
-            # initiated (initiator = non_sym, responder = sym).
-            if (
-                self.my_addr_ip == self.peer_addr_ip
-                or not self.my_addr_ip
-                or not self.peer_addr_ip
-            ):
-                my_role = "non_sym" if reply is None else "sym"
-            elif self.my_addr_ip < self.peer_addr_ip:
+            # NAT-type tie.  Decide by IP order so both peers pick
+            # opposite roles deterministically.  The combo generator
+            # guarantees the two sides' addr_ips differ, so the IP
+            # compare always picks a definite role.
+            if self.my_addr_ip < self.peer_addr_ip:
                 my_role = "non_sym"
             else:
                 my_role = "sym"
@@ -216,16 +215,16 @@ class RandomProbePlugin(Plugin):
             return
 
         # Responder: extract peer's params, lock our role, fire.
+        #
+        # The previous code aborted when peer_role == my_role.  That was
+        # a real failure mode when NAT-info propagation races mean each
+        # side computes its role from a partially-populated peer_nat
+        # dict and both pick "sym" (or both pick "non_sym").  But the
+        # spray engine is direction-agnostic: it converges as long as
+        # both sides actually fire, regardless of which role label they
+        # carry.  Letting the round proceed is strictly better than
+        # giving up.
         peer_role = reply.payload.role
-        if peer_role == my_role:
-            log(
-                "RandomProbePlugin: peer claimed role={0} but I'm also "
-                "{0}; aborting".format(peer_role)
-            )
-            if not self.result.done():
-                self.result.set_result(None)
-            return
-
         nonce = bytes.fromhex(reply.payload.magic)
         if len(nonce) != 16:
             log("RandomProbePlugin: bad nonce length in peer reply")
@@ -294,7 +293,11 @@ class RandomProbePlugin(Plugin):
         # ~39 s fast, Vista: ~22 s fast) fire at the agreed rendezvous
         # instead of too early.  wait_until() uses time.time() which
         # reflects the raw OS clock and fires immediately on skewed hosts.
-        ntp_delay = punch_time - int(self.sys_clock.time())
+        #
+        # Use float subtraction (not int(sys_clock.time())) so we don't
+        # truncate up to a full second of pre-rendezvous wait and fire
+        # too early near the boundary.
+        ntp_delay = punch_time - self.sys_clock.time()
         if 0 < ntp_delay <= p_or_default("max_sleep"):
             await asyncio.sleep(ntp_delay)
 
@@ -308,16 +311,14 @@ class RandomProbePlugin(Plugin):
         bind_ip = self.src["ip"]
 
 
-        # Master/slave election: use src["ext"] on EXT_BIND, src_ip on
-        # NIC_BIND -- same pattern udp_punch's decider_ip uses (see
-        # udp_punch/main.py:248-256).  bind_ip is the LAN-side address
-        # not symmetric across NAT; the NIC IP returned by
-        # nic.route().ext() can degenerate to the LAN IP when no STUN
-        # cache exists for that NIC; both produce NIC-vs-ext asymmetry
-        # that lets both peers elect SLAVE.  src["ext"] is the
-        # peer-visible address resolve_pair / src_map populated.
+        # Master/slave election: strict per-route_type IP source so both
+        # peers compare the SAME class of address.  Mixing NIC-vs-ext
+        # across peers used to let both elect SLAVE (live failure 2026-
+        # 05-25 on CGNAT pool: src["ext"] missing -> fell back to bind_ip
+        # locally, peer still compared against STUN-mapped WAN).  Combo
+        # generator guarantees src["ext"] is populated for EXT_BIND.
         if self.route_type == EXT_BIND:
-            own_ext_ip = str(self.src.get("ext") or bind_ip)
+            own_ext_ip = str(self.src["ext"])
         else:
             own_ext_ip = str(bind_ip)
 
@@ -724,6 +725,14 @@ class RandomProbePlugin(Plugin):
         one gets dropped at the cone's NAT, and the round can never
         converge.
 
+        Deadlined against ``self.punch_time``: STUN discovery is on the
+        critical path between "send the signal" and "fire the spray",
+        and a slow-responding STUN pool used to burn up to 16 s here
+        (4 servers * 2.0 s timeout * 2 retries) while the rendezvous
+        ticked by silently.  We give STUN at most STUN_SAFETY seconds
+        less than the time until punch_time, fail-fast on the remainder,
+        and fall back to local port if nothing replied in time.
+
         Falls back to (local_ip, local_port) when no STUN servers are
         available or the queries time out -- in that case the
         algorithm only works on full-cone NATs that happen to do port
@@ -762,23 +771,59 @@ class RandomProbePlugin(Plugin):
                 "for full-cone-with-port-preservation peers)")
             return
 
+        # Deadline STUN discovery against the rendezvous: STUN must
+        # finish in time to advertise the mapping in the outgoing
+        # RandomProbeMsg, which we only get to send if punch_time is
+        # still ahead.  STUN_SAFETY leaves the post-STUN signal+settle
+        # window of the punch protocol.  Without this gate a slow STUN
+        # pool burned up to 16s here while punch_time ticked by silently
+        # (4 servers * 2s timeout * 2 retries) and we missed the bucket.
+        STUN_SAFETY = 2.0
+        punch_time = getattr(self, "punch_time", None)
+        if punch_time is None:
+            stun_budget = None
+        else:
+            stun_budget = punch_time - self.sys_clock.time() - STUN_SAFETY
+            if stun_budget <= 0:
+                log("RandomProbePlugin: no STUN budget; punch_time too "
+                    "close (rendezvous in {0:.1f}s); skipping STUN".format(
+                        punch_time - self.sys_clock.time(),
+                    ))
+                return
+
         loop = get_running_loop()
         for stun_server in stun_servers:
+            if stun_budget is not None and stun_budget <= 0:
+                log("RandomProbePlugin: STUN budget exhausted before "
+                    "trying all servers; falling back to local port")
+                break
             try:
+                t0 = self.sys_clock.time()
                 resolved = await self.resolve_stun_dest(stun_server)
             except (OSError, ConnectionError, asyncio.TimeoutError):
+                if stun_budget is not None:
+                    stun_budget -= self.sys_clock.time() - t0
                 continue
+            # Per-server timeout: bound to whichever is smaller -- the
+            # default 2s probe budget or the remaining STUN_BUDGET so
+            # we never bleed into the punch_time window.
+            if stun_budget is not None:
+                per_server_timeout = max(0.5, min(2.0, stun_budget))
+            else:
+                per_server_timeout = 2.0
             # Run the STUN query in a thread executor using
             # sync blocking I/O -- the prebound sock should
             # never get touched by asyncio.add_reader before
             # Pipe.connect takes ownership post-algorithm.
             mapping = await loop.run_in_executor(
                 None,
-                lambda srv=resolved: sync_stun_discover_mapping(
+                lambda srv=resolved, t=per_server_timeout: sync_stun_discover_mapping(
                     self.prebound_sock, srv, self.af,
-                    timeout=2.0, retries=2,
+                    timeout=t, retries=2,
                 ),
             )
+            if stun_budget is not None:
+                stun_budget -= self.sys_clock.time() - t0
             if mapping is not None:
                 self.mapped_ip, self.mapped_port = mapping
                 log("RandomProbePlugin: STUN discovered mapping "

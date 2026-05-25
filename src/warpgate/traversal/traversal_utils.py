@@ -247,13 +247,21 @@ def select_dest_ipr(af, same_pc, src, dest, addr_types, has_set_bind=True):
 
 
 def sort_pairs_by_overlap(srcs, dests):
-    """Partition (src, dest) pairs into overlapping and non-overlapping external IPs."""
+    """Partition (src, dest) pairs into overlapping and non-overlapping external IPs.
+
+    Pairs where either side has a missing/empty ``ext`` are placed in
+    the unique bucket so they get filtered upstream in
+    ``get_if_infos_order`` (the EXT_BIND filter drops them; the
+    NIC_BIND / LOOPBACK_BIND paths don't rely on ext anyway).
+    """
     overlap = []
     unique = []
     for src in srcs:
         for dest in dests:
             pair = [src, dest]
-            if src["ext"] == dest["ext"]:
+            s_ext = src.get("ext")
+            d_ext = dest.get("ext")
+            if s_ext and d_ext and s_ext == d_ext:
                 overlap.append(pair)
             else:
                 unique.append(pair)
@@ -267,6 +275,16 @@ def get_if_infos_order(af, route_type, src_map, dest_map):
     Given a list of interface details
     for an address family indexed by interface
     offset return a list of them directly.
+
+    EXT_BIND filter: pairs where either side lacks an ``ext`` IP or where
+    both sides share the same ``ext`` (same router / same machine WAN)
+    are dropped entirely.  Such pairs cannot produce a working external
+    path -- traffic loops back at the router with no NAT mapping -- and
+    they used to be returned at low priority, where plugins had to
+    defensively detect them.  The role-election in plugins like
+    random_probe also depends on the two sides having distinct ext IPs
+    to break the NAT-type tie symmetrically; an equal-ext combo races
+    both peers into the same role.
     """
     srcs = list(src_map[af].values())
     dests = list(dest_map[af].values())
@@ -280,9 +298,17 @@ def get_if_infos_order(af, route_type, src_map, dest_map):
 
     # If the route type is external then using the same external
     # address for overlapping pairs is likely not to lead to
-    # a connection since both are behind the same router.
+    # a connection since both are behind the same router.  Also drop
+    # pairs where either side has no ext IP at all -- without ext we
+    # have nothing for the peer to aim at, and downstream plugins'
+    # election math (own_ext_ip vs peer_ext_ip) would have to special-
+    # case the empty value.
     if route_type in (EXT_BIND, None):
-        pair_order = unique + overlap
+        unique = [
+            pair for pair in unique
+            if pair[0].get("ext") and pair[1].get("ext")
+        ]
+        pair_order = unique
 
     # For local addresses you want to do the opposite.
     # So you're on the same LAN or NIC if on the same machine.

@@ -76,18 +76,28 @@ def sync_run_bidirectional_spray(
     rng=None,
     route=None,
     own_ext_ip=None,
+    max_rounds=2,
 ):
     """Direction-agnostic random-probe punch.
 
     Returns ``{"sock": winning_socket, "peer": (ip,port), "role": "spray-*"}``
     on success, or None on timeout.  Caller closes the returned sock.
+
+    ``max_rounds`` controls how many full spray+listen rounds to run
+    before giving up.  Each round opens a fresh set of ``probe_count``
+    sockets (closed at the end of the round on no_winner).  Reusing
+    sockets across rounds was rejected because it doubles the
+    simultaneous NAT-mapping count (256 mappings * 2 rounds) and
+    consumer routers silently drop v6 UDP past ~256 mappings per host
+    (see project_consumer_router_v6_flow_cap memory).
     """
     import select as select_mod
     peer_ext_ip = normalize_ip6(peer_ext_ip)
 
     log("[RP-SPRAY] enter bind_ip={0} peer_ext_ip={1} own_ext_ip={2} "
-        "probe_count={3} listen_timeout={4}".format(
-            bind_ip, peer_ext_ip, own_ext_ip, probe_count, listen_timeout,
+        "probe_count={3} listen_timeout={4} max_rounds={5}".format(
+            bind_ip, peer_ext_ip, own_ext_ip, probe_count,
+            listen_timeout, max_rounds,
         ))
 
     own_ip_for_election = (
@@ -102,6 +112,44 @@ def sync_run_bidirectional_spray(
         "MASTER" if is_master else "SLAVE", own_ip_for_election, peer_ext_ip,
     ))
 
+    for round_idx in range(max_rounds):
+        if round_idx > 0:
+            log("[RP-SPRAY] round {0}/{1}: re-spraying with fresh sockets".format(
+                round_idx + 1, max_rounds,
+            ))
+        result = run_spray_round(
+            bind_ip=bind_ip,
+            peer_ext_ip=peer_ext_ip,
+            nonce=nonce,
+            probe_count=probe_count,
+            listen_timeout=listen_timeout,
+            rng=rng,
+            route=route,
+            own_ip_for_election=own_ip_for_election,
+            is_master=is_master,
+            select_mod=select_mod,
+        )
+        if result is not None:
+            return result
+    log("[RP-SPRAY] FAIL all {0} rounds exhausted".format(max_rounds))
+    return None
+
+
+def run_spray_round(
+    bind_ip,
+    peer_ext_ip,
+    nonce,
+    probe_count,
+    listen_timeout,
+    rng,
+    route,
+    own_ip_for_election,
+    is_master,
+    select_mod,
+):
+    """One spray+listen round.  Closes its own sockets on no_winner; on
+    success returns ``{sock, peer, role}`` and the caller owns the sock.
+    """
     src_ports = random_probe_ports(probe_count, rng=rng)
     dst_ports = random_probe_ports(probe_count, rng=rng)
     socks = []
@@ -231,7 +279,11 @@ def sync_run_bidirectional_spray(
             if is_master:
                 # Master commits on first arrival.  Send a CONFIRM burst
                 # from this socket so the slave's listener picks up the
-                # marker even under packet loss.
+                # marker even under packet loss.  Initial burst is 5
+                # frames; the post-commit reinforcement loop (below)
+                # adds periodic CONFIRMs over the rest of the listen
+                # window so a slave whose first batch of CONFIRMs was
+                # dropped still has a chance to lock on a later one.
                 for _ in range(5):
                     try:
                         s.sendto(
@@ -274,11 +326,50 @@ def sync_run_bidirectional_spray(
     except OSError:
         winner_local = None
     log("[RP-SPRAY] WINNER role={0} datagrams_seen={1} parsed_ok={2} "
-        "parsed_fail={3} peer_ip_mismatch={4} winner_local={5} winner_peer={6} "
+        "parsed_fail={3} self_loops={4} winner_local={5} winner_peer={6} "
         "is_master={7}".format(
             winner["role"], datagrams_seen, parsed_ok, parsed_fail,
             peer_ip_mismatch, winner_local, winner["peer"], is_master,
         ))
+
+    # Master post-commit reinforcement: keep firing CONFIRM bursts at
+    # the chosen peer 4-tuple for ~2s so a slave that missed the
+    # initial 5-packet burst (mobile packet loss, flow-table pressure
+    # after the spray) still has a chance to lock.  Without this,
+    # master succeeds locally on first PROBE arrival while slave hits
+    # PROBE_LISTEN_TIMEOUT no_winner -- master then enters its bridge
+    # with a half-open path (PING from master never PONG-ed).
+    #
+    # Runs in a daemon thread so the engine returns immediately and
+    # master's bridge setup proceeds in parallel with reinforcement.
+    # The winner sock is shared with the caller -- safe because UDP
+    # sendto on the same sock from two threads is atomic per-datagram
+    # on POSIX + Windows.  drain_probe_residue in the bridge worker
+    # only reads, so no read/write contention.
+    if is_master:
+        import threading
+
+        def reinforce_confirms():
+            reinforce_deadline = time.time() + 2.0
+            next_burst = time.time()
+            while time.time() < reinforce_deadline:
+                now = time.time()
+                if now >= next_burst:
+                    for _ in range(3):
+                        try:
+                            winner["sock"].sendto(
+                                encode_probe(
+                                    nonce, ROLE_SYM, PROBE_IDX_CONFIRM,
+                                ),
+                                winner["peer"],
+                            )
+                        except OSError:
+                            return  # socket closed by bridge teardown
+                    next_burst = now + 0.25
+                time.sleep(0.05)
+
+        t = threading.Thread(target=reinforce_confirms, daemon=True)
+        t.start()
 
     # Close losers.
     for s in socks:
