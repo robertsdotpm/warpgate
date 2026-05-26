@@ -43,6 +43,11 @@ from .wire import WIRE_PROTO_PATH_BROKEN, WIRE_PROTO_PATH_LOOKUP, WIRE_PROTO_PAT
 # Upstream defaults from ironwood/network/config.go.
 PATH_TIMEOUT_SECONDS = 60.0
 PATH_THROTTLE_SECONDS = 1.0
+# Extra delay after a path_broken before re-lookup, on top of the
+# normal throttle.  Gives the public mesh time to refresh its
+# tree-port-allocation view before we re-discover the path --
+# without this we'd retry the same stale path in a tight loop.
+PATH_BROKEN_BACKOFF_SECONDS = 5.0
 
 
 def bloom_transform(key):
@@ -224,7 +229,18 @@ class Pathfinder(object):
             await self.handle_outbound_traffic(tr)
 
     async def handle_broken(self, from_key, broken):
-        """A path we used has broken -- forward to source, or invalidate cache."""
+        """A path we used has broken -- forward to source, or invalidate cache.
+
+        On source-side: mark the cached path broken AND push the
+        rumor's send_time forward by ``PATH_BROKEN_BACKOFF_SECONDS``
+        so the next ``send_rumor_lookup`` for this dest is delayed.
+        This gives the public mesh time to converge between
+        re-lookups -- without backoff, we'd keep getting the
+        same stale path advertised by the dest (whose own tree
+        view hasn't refreshed yet).  See
+        [[yggdrasil-tree-convergence-bug]] for the live trace
+        that motivated this delay.
+        """
         watermark = [broken.watermark]
         next_link = self.router.lookup_next_hop_with_watermark(
             broken.path, watermark,
@@ -235,13 +251,22 @@ class Pathfinder(object):
                 next_link, WIRE_PROTO_PATH_BROKEN, broken.encode(),
             )
             return
-        # We are the source of the broken path -- invalidate + retry.
+        # We are the source of the broken path -- invalidate + retry
+        # with a forced back-off so the mesh has time to converge.
         if bytes(broken.source) != bytes(self.public_key):
             return
         info = self.paths.get(bytes(broken.dest))
         if info is not None:
             info.broken = True
-            await self.send_rumor_lookup(broken.dest)
+        # Push the rumor's send_time forward so the next lookup waits.
+        xform = bloom_transform(bytes(broken.dest))
+        rumor = self.rumors.get(xform)
+        if rumor is not None:
+            rumor.send_time = time.monotonic() + PATH_BROKEN_BACKOFF_SECONDS
+        # Issue the lookup -- it will throttle itself based on the
+        # send_time we just pushed forward, so this is effectively
+        # a "schedule for later" call.
+        await self.send_rumor_lookup(broken.dest)
 
     async def emit_path_broken(self, tr):
         """Build + send a PathBroken back along the from-path of ``tr``."""
