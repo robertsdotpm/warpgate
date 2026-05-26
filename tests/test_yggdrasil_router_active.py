@@ -1,12 +1,14 @@
 """Active router tests: two-node tree formation + traffic forwarding."""
 import asyncio
 import os
+import time
 import unittest
 
 from aionetiface import IP6
 from aionetiface.testing import AsyncTestCase
 
 from warpgate.overlay.yggdrasil.node_core import NodeCore
+from warpgate.overlay.yggdrasil.pathfinder import PathInfo, bloom_transform
 from warpgate.overlay.yggdrasil.router_active import (
     ActiveRouter,
     RouterInfo,
@@ -15,7 +17,8 @@ from warpgate.overlay.yggdrasil.router_active import (
     verify,
 )
 from warpgate.overlay.yggdrasil.routing_msgs import (
-    PathBroken, RouterAnnounce, RouterSigReq, RouterSigRes, Traffic,
+    PathBroken, PathNotify, PathNotifyInfo,
+    RouterAnnounce, RouterSigReq, RouterSigRes, Traffic,
 )
 from warpgate.overlay.yggdrasil.wire import (
     WIRE_PROTO_ANNOUNCE, WIRE_PROTO_SIG_REQ, WIRE_TRAFFIC,
@@ -139,6 +142,126 @@ class TestTwoNodeTreeFormation(AsyncTestCase):
         # The signature should verify against B's pubkey.
         bs = res.bytes_for_sig(self.node_a.public_key, self.node_b.public_key)
         self.assertTrue(verify(self.node_b.public_key, bs, res.psig))
+
+
+class TestLocalSeqAfterUseResponse(AsyncTestCase):
+    """When we adopt a peer's parent via use_response, our local_seq
+    must be brought up to the peer-supplied seq.  Otherwise the next
+    sig_req we send will have a stale seq, and update_info will
+    reject it -- breaking tree convergence.
+
+    This mirrors the Go invariant that ``_newReq`` uses
+    ``r.infos[selfKey].seq + 1``; the Python port held seq state
+    separately in ``local_seq`` and didn't sync it after use_response.
+    """
+
+    async def test_use_response_syncs_local_seq(self):
+        seed_a = os.urandom(32)
+        seed_b = os.urandom(32)
+        node_a = NodeCore(seed=seed_a)
+        node_b = NodeCore(seed=seed_b)
+        router_a = ActiveRouter(node_a)
+        # Simulate: B sends back a sig_res with a much higher seq
+        # than A's local_seq.  After A adopts B as parent, A's
+        # local_seq must match res.seq -- not stay at the old
+        # become_root value.
+        peer_seq = 999
+        peer_nonce = 12345
+        res = RouterSigRes(
+            seq=peer_seq, nonce=peer_nonce, port=42,
+            psig=b"\x00" * 64,
+        )
+        # Sign as B (acting as parent).
+        bs = res.bytes_for_sig(node_a.public_key, node_b.public_key)
+        res.psig = sign(seed_b, bs)
+        router_a.use_response(node_b.public_key, res)
+        # After use_response, our self-info should have seq = peer_seq.
+        self.assertEqual(router_a.infos[node_a.public_key].seq, peer_seq)
+        # And our local_seq tracker should also be at peer_seq so
+        # the next sig_req we send is peer_seq+1 (matches Go's
+        # _newReq semantics).
+        self.assertGreaterEqual(router_a.local_seq, peer_seq,
+            "local_seq must be >= adopted self-info seq, else "
+            "future sig_reqs use stale seqs and update_info rejects "
+            "fresh responses from peers")
+
+
+class TestHandleNotifyDropsUnsolicited(AsyncTestCase):
+    """Path notifies must be dropped unless we have an outstanding rumor
+    for this destination OR an existing path entry.  Otherwise an
+    arbitrary peer can pollute our path cache by sending valid-looking
+    notifies for keys we never asked about.
+
+    Upstream Go pathfinder._handleNotify enforces this gate (lines
+    104-124 of pathfinder.go); the Python port accepted unsolicited
+    notifies that passed the signature check.
+    """
+
+    async def test_unsolicited_notify_does_not_populate_paths(self):
+        seed_a = os.urandom(32)
+        seed_b = os.urandom(32)
+        node_a = NodeCore(seed=seed_a)
+        node_b = NodeCore(seed=seed_b)
+        router_a = ActiveRouter(node_a)
+        # Build a perfectly valid signed notify FROM B TO A.
+        path_to_b = [1, 2, 3]
+        info = PathNotifyInfo(seq=42, path=list(path_to_b),
+                              sig=b"\x00" * 64)
+        info.sig = sign(seed_b, info.bytes_for_sig())
+        notify = PathNotify(
+            path=[], watermark=(1 << 64) - 1,
+            source=node_b.public_key,
+            dest=node_a.public_key,
+            info=info,
+        )
+        # A has NO rumor and NO existing path for B.  Notify must be dropped.
+        await router_a.pathfinder.handle_notify(node_b.public_key, notify)
+        self.assertNotIn(node_b.public_key, router_a.pathfinder.paths,
+            "notify with no preceding rumor/path was wrongly accepted "
+            "into the path cache; this is a path-cache pollution bug")
+
+
+class TestHandleSigResMatchesRequest(AsyncTestCase):
+    """The sig_res we accept must match the seq+nonce of the sig_req we sent.
+
+    Without this check, a stale response (from a previous, since-
+    overwritten request) can race ahead of the current one and
+    overwrite our state.  Upstream router._handleResponse (line
+    425) requires ``r.requests[p.key] == res.routerSigReq`` before
+    updating responses[].
+    """
+
+    async def test_handle_sig_res_rejects_stale_seq(self):
+        seed_a = os.urandom(32)
+        seed_b = os.urandom(32)
+        node_a = NodeCore(seed=seed_a)
+        node_b = NodeCore(seed=seed_b)
+        router_a = ActiveRouter(node_a)
+        # A has an outstanding request for B at seq=100.
+        current_req = RouterSigReq(seq=100, nonce=9999)
+        router_a.requests[node_b.public_key] = current_req
+        # B replies with a STALE response: seq=50 (from a request
+        # that was overwritten by network re-order).  Sign it
+        # correctly so it would pass signature verification.
+        stale_res = RouterSigRes(
+            seq=50, nonce=4242, port=3,
+            psig=b"\x00" * 64,
+        )
+        bs = stale_res.bytes_for_sig(node_a.public_key, node_b.public_key)
+        stale_res.psig = sign(seed_b, bs)
+        # Simulate a fake link object so handle_sig_res can use it.
+
+        class FakeLink(object):
+            def __init__(self, pubkey, addr="200::1"):
+                self.remote_pubkey = pubkey
+                self.remote_addr = addr
+        link = FakeLink(node_b.public_key)
+        router_a.handle_sig_res(link, stale_res)
+        stored = router_a.responses.get(node_b.public_key)
+        self.assertIsNone(stored,
+            "stale sig_res (seq mismatch with current request) was "
+            "wrongly accepted; this allows out-of-order responses "
+            "to overwrite valid current-request state")
 
 
 if __name__ == "__main__":

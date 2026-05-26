@@ -202,16 +202,26 @@ class Pathfinder(object):
         # We're the destination of the notify -- accept it.
         if bytes(notify.dest) != bytes(self.public_key):
             return
+        src = bytes(notify.source)
+        existing = self.paths.get(src)
+        # Solicitation gate: upstream pathfinder._handleNotify (Go
+        # lines 104-124) drops notifies that don't correspond to an
+        # outstanding rumor OR an existing path entry.  Without this
+        # check, any peer can pollute our path cache by sending
+        # valid-looking notifies for keys we never asked about.
+        if existing is None:
+            xform = bloom_transform(src)
+            if xform not in self.rumors:
+                return
+        # Existing-path seq check first, so the cheap reject happens
+        # before the expensive signature verify.
+        if existing is not None and notify.info.seq <= existing.seq:
+            return
         # Verify the signed PathNotifyInfo (proves the source
         # really sent this path).
         from .router_active import verify
         if not verify(notify.source, notify.info.bytes_for_sig(),
                       notify.info.sig):
-            return
-        src = bytes(notify.source)
-        # Update or create the PathInfo for this dest.
-        existing = self.paths.get(src)
-        if existing is not None and notify.info.seq <= existing.seq:
             return
         info = PathInfo(path=list(notify.info.path), seq=notify.info.seq)
         # If there's a rumor with buffered traffic for this dest,

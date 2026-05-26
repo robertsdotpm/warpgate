@@ -267,6 +267,16 @@ class ActiveRouter(object):
         req = self.requests.get(link.remote_pubkey)
         if req is None:
             return
+        # Upstream router._handleResponse (router.go:425) gates the
+        # accept on ``r.requests[p.key] == res.routerSigReq`` -- i.e.
+        # the seq+nonce of the response must match the seq+nonce of
+        # our currently-outstanding request.  Without this gate, a
+        # stale response from a previous (already-overwritten)
+        # request can race ahead of the current one and corrupt our
+        # state.  Even though the signature check below covers
+        # forgery, it does NOT detect "old but still-valid" responses.
+        if req.seq != res.seq or req.nonce != res.nonce:
+            return
         # Verify peer's signature on (us, peer, req+port).
         bs = res.bytes_for_sig(self.public_key, link.remote_pubkey)
         if not verify(link.remote_pubkey, bs, res.psig):
@@ -375,6 +385,13 @@ class ActiveRouter(object):
 
         Build a new self-info with parent=peer_key, our own sig
         over (us, peer_key, req+port).  Then re-broadcast.
+
+        Also sync local_seq forward to ``res.seq`` -- upstream's
+        ``_newReq`` (router.go:386) computes the next req from
+        ``r.infos[selfKey].seq + 1``; if our local_seq lags behind
+        the seq we just adopted, the next sig_req we send carries a
+        stale seq, peers respond with a stale seq, and update_info
+        rejects everything because existing.seq > ann.seq.
         """
         bs = res.bytes_for_sig(self.public_key, peer_key)
         self_sig = sign(self.seed, bs)
@@ -384,7 +401,9 @@ class ActiveRouter(object):
             key=self.public_key, parent=peer_key,
             sig_res=res, sig=self_sig,
         )
-        self.update_info(ann)
+        if self.update_info(ann):
+            if res.seq > self.local_seq:
+                self.local_seq = res.seq
 
     def get_root_and_dists(self, dest):
         """Walk parent chain from ``dest`` to compute (root_key, dist_map).
