@@ -22,7 +22,7 @@ from aionetiface import (
     norm_client_tup, tup_to_sub, async_test, resolv_dest, STUN_PORT,
 )
 from .turn_process import (
-    process_replies,
+    turn_msg_handler,
     is_auth_ready,
     turn_proc_attrs,
     process_attributes,
@@ -109,6 +109,20 @@ self,
         self.peers = {}
         self.msgs = {}
         self.tasks = []
+        # ChannelData support (RFC 5766 §11).  channel_to_peer is the
+        # receive-side dispatch map -- peer's relay wraps incoming
+        # UDP from us as ChannelData (because peer bound a channel
+        # for our wan tup), so we need to be able to decode incoming
+        # ChannelData and route it to the right peer.  peer_to_channel
+        # records the channel number we asked our own relay to assign
+        # for outbound to that peer; outbound sends still go raw to
+        # the peer's relay (standard ICE-TURN), not as ChannelData
+        # via our own relay -- that path makes the listener receive
+        # raw UDP from our relay's source tup, which it can't
+        # disambiguate as application data.
+        self.channel_to_peer = {}
+        self.peer_to_channel = {}
+        self.next_channel = 0x4000
 
         # Futures to return from start.
         self.turn_client_stopped = asyncio.Event()
@@ -186,11 +200,26 @@ self,
         # restore it so PipeClient.send() takes the UDP sendto() path.
         self.proto = UDP
 
-        # Start processing UDP replies.
-        self.processing_loop_task = asyncio.create_task(
-            async_wrap_errors(process_replies(self))
-        )
-        self.tasks.append(self.processing_loop_task)
+        # Register the TURN message dispatch as a msg_cb on the
+        # signaling pipe.  Replaces the previous process_replies
+        # polling loop -- each inbound frame dispatches immediately
+        # via PipeEvents.route_msg -> run_handlers, no 1s poll
+        # latency.  The handler is per-message exception-guarded so
+        # one malformed frame doesn't kill subsequent dispatch.
+        client_for_handler = self
+
+        async def turn_pipe_msg_cb(data, client_tup, pipe):
+            await turn_msg_handler(
+                client_for_handler, data, client_tup, pipe,
+            )
+
+        # Pipe.connect with a dest and no msg_cb (and the explicit
+        # subscribe(SUB_ALL) above) left the stream's SUB_ALL queue
+        # active.  Hand off to callback dispatch: handoff_to_cb
+        # atomically replays any frames buffered there through the cb,
+        # drops the subscription, and registers the cb for future
+        # frames.
+        self.turn_pipe.handoff_to_cb(turn_pipe_msg_cb)
 
         # Add any message handlers.
         if self.msg_cb is not None:
@@ -512,6 +541,40 @@ self,
             # silently routing data to an unconfirmed relay entry.
             self.peers[peer_tup] = peer_relay_tup
 
+            # Pre-warm the INBOUND conntrack circuit BEFORE binding the
+            # channel.  When the server forwards a peer's data to us,
+            # the source 5-tuple is (server_ip, peer's_relay_port), a
+            # 5-tuple our outbound Allocate flow (only to
+            # server_ip:3478) has never punched.  Send a tiny outbound
+            # directly to peer_relay_tup to open the conntrack entry.
+            #
+            # ORDER MATTERS: this MUST run BEFORE bind_channel, because
+            # the stream.send override (installed in start()) hijacks
+            # sends to peer_relay_tup once a channel is bound and
+            # re-wraps them as ChannelData via the signaling port --
+            # which would NOT punch the conntrack we need.  Pre-bind,
+            # the override has no channel for the peer and falls
+            # through to raw stream.send → handle.sendto to the actual
+            # peer_relay_tup.  Pair: this warmup fixes inbound,
+            # ChannelData fixes outbound.
+            # Non-empty payload because some stacks (Windows Defender
+            # in particular) don't establish conntrack state on 0-byte
+            # UDP datagrams.  Server may forward this to peer — peer
+            # will fail to parse it as TURN data and silently discard,
+            # which is fine; the only goal is local conntrack punch.
+            try:
+                await self.stream.send(b"\x00", peer_relay_tup)
+            except (OSError, ConnectionError):
+                pass
+
+            # Bind a TURN channel so subsequent OUTBOUND data uses
+            # ChannelData framing via the signaling pipe (conntrack
+            # established by Allocate).
+            try:
+                await self.bind_channel(peer_tup)
+            except (OSError, ConnectionError, asyncio.TimeoutError):
+                log("[TURN] bind_channel failed; using raw-relay fallback")
+
             # Start the loop to refresh the permission.
             task = asyncio.create_task(async_wrap_errors(refresher()))
             self.tasks.append(task)
@@ -538,6 +601,55 @@ self,
 
     # Main step 2 -- white list a peer to use our relay address msg.
     # Apparently the port number is irrelevant.
+    def build_channel_bind_msg(self, peer_tup, channel_num):
+        """RFC 5766 §11.2 ChannelBind request — CHANNEL-NUMBER (2 bytes
+        channel + 2 reserved) + XOR-PEER-ADDRESS.  Authenticated via
+        send_turn_msg(do_sign=True)."""
+        msg = STUNMsg(msg_type=STUNMsgTypes.ChannelBind, mode=RFC5389)
+        chan_buf = pack("!HH", channel_num, 0)
+        msg.write_attr(STUNAttrs.ChannelNumber, chan_buf)
+        af = af_from_ip_s(peer_tup[0])
+        peer_addr = STUNAddrTup(
+            ip=peer_tup[0], port=peer_tup[1], af=af,
+            txid=msg.txn_id, magic_cookie=msg.magic_cookie,
+        )
+        msg.write_attr(STUNAttrs.XorPeerAddress, peer_addr)
+        return msg
+
+    async def bind_channel(self, peer_tup):
+        """Allocate a channel, register locally BEFORE the bind wire-
+        send (race fix), then send signed ChannelBind and briefly wait
+        for the ack so subsequent ChannelData isn't dropped server-side.
+        """
+        if peer_tup in self.peer_to_channel:
+            return self.peer_to_channel[peer_tup]
+        channel_num = self.next_channel
+        if channel_num > 0x7FFE:
+            log("[TURN] channel pool exhausted")
+            return None
+        self.next_channel += 1
+        self.channel_to_peer[channel_num] = peer_tup
+        self.peer_to_channel[peer_tup] = channel_num
+        log("[TURN] channel {0} registered for peer {1}".format(
+            channel_num, peer_tup,
+        ))
+        msg = self.build_channel_bind_msg(peer_tup, channel_num)
+        f, _retransmit, _new_future = self.record_msg(msg)
+        try:
+            await self.send_turn_msg(msg, do_sign=True)
+        except (OSError, ConnectionError):
+            log("[TURN] ChannelBind send failed")
+            return channel_num
+        try:
+            await asyncio.wait_for(f, timeout=1.0)
+            log("[TURN] channel {0} bind confirmed".format(channel_num))
+        except asyncio.TimeoutError:
+            log("[TURN] channel {0} bind ack not received in 1s "
+                "(continuing optimistically)".format(channel_num))
+        except (OSError, ConnectionError):
+            log_exception()
+        return channel_num
+
     # Permissions are made per IP.
     async def white_list_msg(self, src_tup):
         """Build and return a TURN CreatePermission request for the given peer address."""
@@ -643,8 +755,16 @@ self,
             self.auth_event.set()
             self.relay_event.set()
 
+            # Signal that shutdown is complete.  Under the msg_cb model
+            # (turn_msg_handler registered via turn_pipe.add_msg_cb)
+            # there is no polling loop to drain -- the pipe.close()
+            # above detaches handlers synchronously -- so we mark the
+            # event here directly rather than waiting on a loop that
+            # no longer exists.
+            self.turn_client_stopped.set()
+
     async def close(self):
-        """Shut down the TURN client, waiting for the processing loop to finish."""
+        """Shut down the TURN client."""
         # Already closed.
         if self.turn_client_stopped.is_set():
             return
@@ -652,12 +772,6 @@ self,
         # Close all pipes.
         # Set events as done so all tasks end.
         await self.do_cleanup()
-
-        # Processing loop sets this when done.
-        try:
-            await asyncio.wait_for(self.turn_client_stopped.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            log("[TURN] turn_client_stopped wait timed out; process_replies may have crashed")
 
         # Wait for permission refresher tasks or cancel them.
         await gather_or_cancel(self.tasks, 2)

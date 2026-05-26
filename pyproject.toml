@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "warpgate"
-version = "4.0.11"
-description = "Async NAT traversal library"
+version = "4.0.13"
+description = "Any peer, any NAT — one-shot Python NAT traversal: 8-plugin cascade, IPv4 + IPv6, multi-NIC, zero infrastructure to run."
 readme = "README.md"
 requires-python = ">=3.5"
 license = {text = "public domain"}
@@ -13,8 +13,11 @@ authors = [
     {name = "Matthew Roberts", email = "matthew@roberts.pm"}
 ]
 keywords = [
-    "NAT traversal", "TCP hole punching", "simultaneous open",
-    "UPnP", "STUN", "TURN", "P2P", "peer-to-peer", "networking",
+    "NAT traversal", "hole punching", "TCP hole punching", "UDP hole punching",
+    "simultaneous open", "STUN", "TURN", "ICE", "UPnP", "NAT-PMP", "PCP",
+    "P2P", "peer-to-peer", "decentralized", "rendezvous", "WebRTC alternative",
+    "asyncio", "async networking", "IPv6", "multi-NIC", "cross-platform",
+    "Windows XP", "self-hosted", "serverless networking",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -40,8 +43,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/robertsdotpm/p2pd"
+Homepage = "https://www.warpgate.io/"
 Repository = "https://github.com/robertsdotpm/p2pd"
+Documentation = "https://www.warpgate.io/"
 
 [tool.setuptools.packages.find]
 where = ["src"]
