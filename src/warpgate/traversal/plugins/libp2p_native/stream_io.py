@@ -1,18 +1,26 @@
-"""Async stream IO helpers + a Pipe-to-StreamReader/Writer adapter.
+"""Async stream IO helpers + a passive Pipe-to-StreamReader/Writer adapter.
 
-The whole libp2p stack (multistream-select, plaintext, yamux) talks
-to a ``reader/writer`` pair shaped like asyncio.StreamReader/Writer:
+The libp2p stack (multistream-select, plaintext, yamux) talks to a
+``reader/writer`` pair shaped like asyncio.StreamReader/Writer:
 
     reader.read(n)         -> bytes (UP TO n, may be short)
-    writer.write(b)        -> sync queue
-    writer.drain()         -> async flush
+    writer.write(b)        -> async, fully flushed
 
-aionetiface Pipes give us send/recv on top of raw TCP; to plug them
-into a libp2p stack we wrap each Pipe in a PipeStream that exposes
-the asyncio.StreamReader interface backed by Pipe's msg_cb pump.
-This is the natural mapping the user asked for: "ensure your
-networking version works well with aionetifaces pipes, routes, and
-nics" -- the wrapping lives here and nowhere else.
+aionetiface Pipes deliver inbound bytes via the ``msg_cb`` callback
+contract: a registered cb is called with ``(data, client_tup, pipe)``
+on every received chunk -- including, for TCP servers, ONE shared
+cb that fires per-client with the client-side ``pipe`` as the third
+arg.  We lean on that natively rather than spinning a separate
+accept loop: the plugin's listener registers ONE demuxing cb on
+the server Pipe that creates a PipeStream the first time it sees
+a new ``id(pipe)``, and routes subsequent bytes for that pipe into
+the same PipeStream.
+
+So PipeStream itself is PASSIVE -- it doesn't know about msg_cbs at
+all.  The caller (node_core) wires up whichever cb topology makes
+sense for that side and pushes data in via ``feed_data(bytes)``.
+The dialer path uses ``pipe.handoff_to_cb`` with a single-stream
+lambda; the listener path uses one shared demuxer over many streams.
 """
 import asyncio
 
@@ -36,21 +44,21 @@ async def read_exactly(reader, n):
 
 
 class PipeStream(object):
-    """Adapter exposing the asyncio StreamReader/StreamWriter surface
-    on top of an aionetiface Pipe.
+    """StreamReader/StreamWriter-shaped surface on top of an aionetiface Pipe.
 
-    Construction:
-        ps = PipeStream(pipe)
-        await ps.start()    # subscribes msg_cb to Pipe.pipe_events.msg_cbs
+    Two-sided:
+        - Reader side is passive: ``feed_data(data)`` pushes bytes
+          into the internal buffer + wakes any ``read()`` waiter.
+          ``feed_eof()`` flips the closed flag.  The CALLER is
+          responsible for arranging the msg_cb wiring that calls
+          feed_data.
+        - Writer side forwards to ``pipe.send`` so back-pressure is
+          honoured naturally (Pipe.send is fully awaited).
 
-    Then use ps.read(n), ps.write(b), ps.drain(), ps.close().
-
-    Internally:
-        - inbound bytes arrive via msg_cb(data, client_tup, pipe)
-          which appends to a bytearray buffer + signals an Event
-        - read() awaits the event, drains buffer up to n bytes
-        - write() forwards to Pipe.send() (synchronously enqueued;
-          drain() awaits the resulting send-future for back-pressure)
+    Keeping the cb wiring out of PipeStream lets one msg_cb on a
+    server pipe demux across many PipeStreams (one per client) and
+    avoids paying for the SUB_ALL-queue handoff + per-stream cb
+    registration we'd need otherwise.
     """
 
     def __init__(self, pipe):
@@ -58,61 +66,18 @@ class PipeStream(object):
         self.buf = bytearray()
         self.event = asyncio.Event()
         self.closed = False
-        self.bound_cb = None
-        self.pending_send = None
 
-    async def start(self):
-        """Register the msg_cb that pumps inbound bytes into our buffer.
+    def feed_data(self, data):
+        """Push received bytes into the buffer and wake any reader."""
+        if not data or self.closed:
+            return
+        self.buf.extend(data)
+        self.event.set()
 
-        Works against either:
-          * A Pipe instance -- has ``.pipe_events`` + proxies
-            ``handoff_to_cb`` / ``add_msg_cb`` via __getattr__.
-          * A bare PipeEvents instance (the kind ``Pipe.accept()``
-            returns) -- exposes the same methods directly.
-
-        Critically: aionetiface's server-side accept sets
-        ``client_events.msg_cbs = pipe_events.msg_cbs`` (see
-        ``pipe_tcp_events.connection_made``) so every accepted
-        client INHERITS the parent server's shared msg_cbs set.
-        Our cb therefore filters on the ``pipe`` arg -- only data
-        whose dispatching pipe matches OUR pipe object gets pushed
-        into THIS stream's buffer.  Without that filter, two
-        concurrent inbound connections would see each other's bytes
-        and the multistream-select handshake of conn 1 would race
-        conn 2's bytes.
-        """
-        ps = self
-        # Resolve the PipeEvents-shaped object regardless of whether
-        # we were handed a Pipe or a raw PipeEvents.
-        pe = getattr(self.pipe, "pipe_events", None)
-        if pe is None:
-            pe = self.pipe  # bare PipeEvents from Pipe.accept()
-        our_pe_id = id(pe)
-
-        async def msg_cb(data, client_tup, pipe):
-            # Filter: only deliver bytes whose dispatching pipe is
-            # OUR pipe.  The shared-msg_cbs design on server-side
-            # accepted clients makes this filter load-bearing.
-            if id(pipe) != our_pe_id:
-                return
-            if not data:
-                return
-            ps.buf.extend(data)
-            ps.event.set()
-
-        self.bound_cb = msg_cb
-        self.bound_pe = pe
-        # Atomic handoff if supported; falls back to direct msg_cbs
-        # add for legacy / minimal stubs.
-        handoff = getattr(pe, "handoff_to_cb", None)
-        if handoff is not None:
-            handoff(msg_cb)
-        else:
-            msg_cbs = getattr(pe, "msg_cbs", None)
-            if msg_cbs is None:
-                raise ValueError("PipeStream.start: pipe lacks msg_cbs / handoff_to_cb")
-            msg_cbs.add(msg_cb)
-        return self
+    def feed_eof(self):
+        """Mark the stream closed; pending + future reads return b''."""
+        self.closed = True
+        self.event.set()
 
     async def read(self, n):
         """Read UP TO ``n`` bytes; returns immediately if buffer has any."""
@@ -149,13 +114,4 @@ class PipeStream(object):
 
     def close(self):
         """Mark the stream closed and wake any pending read."""
-        self.closed = True
-        self.event.set()
-        cb = self.bound_cb
-        if cb is not None:
-            pe = getattr(self.pipe, "pipe_events", None) or self.pipe
-            try:
-                pe.msg_cbs.discard(cb)
-            except (KeyError, AttributeError):
-                pass
-            self.bound_cb = None
+        self.feed_eof()

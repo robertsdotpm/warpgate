@@ -87,23 +87,40 @@ class Libp2pNode(object):
     def __init__(self, identity):
         self.identity = identity
         self.listener_pipes = {}  # (af, nic_name) -> Pipe
-        self.listener_tasks = []
-        self.inbound_streams = asyncio.Queue()  # (stream, remote_peer_id) tuples
+        self.inbound_streams = asyncio.Queue()  # (stream, remote_peer_id, session) tuples
         self.sessions = []
+        # Per-listener demuxer state: id(client_pipe_events) -> PipeStream.
+        # Populated lazily on first byte from a new client; the cb spawns
+        # the handshake task at that moment and routes subsequent bytes
+        # into the existing PipeStream.
+        self.inbound_pipestreams = {}
+        self.handshake_tasks = []
         self.closed = False
 
     async def listen(self, nic, af, ips, port=0):
         """Start a TCP listener on ``ips`` of ``nic`` for ``af``.
 
         Returns (bound_ip_string, bound_port).  Multiple calls add
-        more listeners (e.g. v4 + v6 + LAN + ext).  The accept loop
-        per listener handles each inbound pipe through the full
-        handshake pipeline and pushes the resulting yamux Stream
-        into ``self.inbound_streams``.
+        more listeners (e.g. v4 + v6 + LAN + ext).
 
-        ips is the address string to bind on (e.g. "0.0.0.0", "::").
-        Use the resolved NIC IP (self.src["ip"]) when called from a
-        plugin so the bind matches the advertised IP.
+        The listener is a normal aionetiface TCP server Pipe (one
+        ``Pipe(TCP, dest=None, route=route).connect()``) -- we hook
+        into it the canonical way, by registering a single ``msg_cb``
+        on the server's pipe_events.  aionetiface inherits that cb
+        set onto every accepted client's pipe_events
+        (``pipe_tcp_events.connection_made`` deliberately sets
+        ``client_events.msg_cbs = pipe_events.msg_cbs``), so our one
+        cb fires per-client with the third arg ``pipe`` being the
+        per-client PipeEvents.  We demux by ``id(pipe)`` -- first
+        time we see an unseen pipe id, spin a PipeStream + spawn the
+        handshake; subsequent chunks feed the existing PipeStream.
+
+        Avoids the ``await listener.accept()`` codepath entirely --
+        ``accept`` is a legacy surface that suffers from a double-
+        dispatch on Windows Py3.8 (the ``create_server(sock=...)``
+        accept loop AND the ``server.serve_forever()`` task both
+        push the same client_events onto the accept queue) and we
+        simply don't need it: msg_cb already gives us everything.
         """
         if self.closed:
             raise OSError("Libp2pNode.listen: node is closed")
@@ -120,53 +137,45 @@ class Libp2pNode(object):
             bound_ip = ips
             bound_port = port
         self.listener_pipes[(af, getattr(nic, "name", "?"))] = pipe
-        t = asyncio.ensure_future(self.accept_loop(pipe))
-        self.listener_tasks.append(t)
+
+        node = self
+
+        async def demux_cb(data, client_tup, client_pipe):
+            """Per-server-pipe demuxer: route data to the right PipeStream
+            and spin up a handshake task on first sight of a new client.
+            """
+            if node.closed:
+                return
+            cpid = id(client_pipe)
+            ps = node.inbound_pipestreams.get(cpid)
+            if ps is None:
+                # First byte from a new client -- create its PipeStream
+                # + spawn the handshake task.  The data we just
+                # received is fed AFTER the spawn so the task's first
+                # read() sees it.
+                ps = PipeStream(client_pipe)
+                node.inbound_pipestreams[cpid] = ps
+                t = asyncio.ensure_future(node.handle_inbound_stream(ps, cpid))
+                node.handshake_tasks.append(t)
+            ps.feed_data(data)
+
+        pipe.add_msg_cb(demux_cb)
         log(fstr(
             "libp2p_native: listener up on {0}:{1} af={2} nic={3}",
             (bound_ip, bound_port, af, getattr(nic, "name", "?")),
         ))
         return bound_ip, bound_port
 
-    async def accept_loop(self, listener):
-        """Per-listener accept loop: handshake each inbound pipe.
+    async def handle_inbound_stream(self, ps, cpid):
+        """Run the responder side of the libp2p handshake on a new PipeStream.
 
-        Dedupes consecutive accepts of the SAME PipeEvents identity.
-        aionetiface's TCP server path on Windows Py3.8 delivers each
-        accepted client twice through ``listener.accept()`` -- one
-        from ``loop.create_server(sock=...)`` already starting the
-        accept loop and a second from the
-        ``server.serve_forever()`` task that the Pipe builder kicks
-        off in parallel.  Both deliveries land on the same
-        client_events queue entry, so the second pop is a duplicate
-        of the first.  Dropping the dup here is local + safe -- on
-        Linux/Py3.5 only one delivery ever happens so the seen-set
-        stays size 1 per real connection.
+        Called by the listener's demuxer the first time a client
+        sends a byte.  Drives the full multistream + plaintext +
+        yamux + app handshake; on success pushes the result onto
+        ``inbound_streams`` for plugin code to await.
         """
-        seen = set()
-        while not self.closed:
-            try:
-                inbound = await listener.accept()
-            except asyncio.CancelledError:
-                raise
-            except (OSError, ConnectionError):
-                log_exception()
-                return
-            if inbound is None:
-                return
-            inbound_id = id(inbound)
-            if inbound_id in seen:
-                # Duplicate dispatch on the same pipe -- ignore.
-                continue
-            seen.add(inbound_id)
-            asyncio.ensure_future(self.handle_inbound(inbound))
-
-    async def handle_inbound(self, pipe):
-        """Run the responder side of the libp2p handshake on a fresh pipe."""
-        ps = PipeStream(pipe)
+        pipe = ps.pipe
         try:
-            await ps.start()
-            # 1) outer multistream + security
             chosen_sec = await negotiate_responder(ps, ps, (SECURITY_PROTOCOL,))
             if chosen_sec != SECURITY_PROTOCOL:
                 raise ConnectionError(
@@ -175,7 +184,6 @@ class Libp2pNode(object):
             remote_peer_id, _remote_pub = await plaintext.perform_handshake(
                 ps, ps, self.identity,
             )
-            # 2) inner multistream + muxer
             chosen_mux = await negotiate_responder(ps, ps, (MUXER_PROTOCOL,))
             if chosen_mux != MUXER_PROTOCOL:
                 raise ConnectionError(
@@ -184,7 +192,6 @@ class Libp2pNode(object):
             mux = yamux.Session(ps, ps, is_client=False).start()
             session = LibP2PSession(pipe, ps, mux, remote_peer_id)
             self.sessions.append(session)
-            # 3) accept the first stream + negotiate app protocol
             stream = await asyncio.wait_for(mux.accept_stream(), timeout=30)
             chosen_app = await negotiate_responder(stream, stream, (APP_PROTOCOL,))
             if chosen_app != APP_PROTOCOL:
@@ -202,10 +209,7 @@ class Libp2pNode(object):
                 ps.close()
             except (OSError, ConnectionError):
                 pass
-            try:
-                await pipe.close()
-            except (OSError, ConnectionError, asyncio.TimeoutError):
-                pass
+            self.inbound_pipestreams.pop(cpid, None)
 
     async def dial(self, dest_ip, dest_port, route, expected_peer_id=None, timeout=15.0):
         """Open a libp2p connection to (dest_ip, dest_port) over ``route``.
@@ -224,8 +228,16 @@ class Libp2pNode(object):
         if pipe is None or pipe.sock is None:
             raise OSError("Libp2pNode.dial: TCP connect produced no socket")
         ps = PipeStream(pipe)
+        # Wire bytes from this Pipe into the PipeStream via handoff_to_cb.
+        # The pipe was opened with dest+no-msg_cb so it's currently
+        # subscribed to SUB_ALL; handoff atomically drains the
+        # buffered queue + installs our feed cb.
+
+        def dial_cb(data, client_tup, pipe_arg):
+            ps.feed_data(data)
+
+        pipe.handoff_to_cb(dial_cb)
         try:
-            await ps.start()
             chosen_sec = await negotiate_initiator(ps, ps, [SECURITY_PROTOCOL])
             if chosen_sec != SECURITY_PROTOCOL:
                 raise ConnectionError("libp2p_native: dial sec mismatch")
@@ -259,11 +271,11 @@ class Libp2pNode(object):
             raise
 
     async def close(self):
-        """Tear down all listeners + active sessions."""
+        """Tear down all listeners + handshake tasks + active sessions."""
         if self.closed:
             return
         self.closed = True
-        for t in self.listener_tasks:
+        for t in self.handshake_tasks:
             if not t.done():
                 t.cancel()
         for pipe in list(self.listener_pipes.values()):
@@ -278,4 +290,5 @@ class Libp2pNode(object):
                 pass
         self.sessions = []
         self.listener_pipes = {}
-        self.listener_tasks = []
+        self.handshake_tasks = []
+        self.inbound_pipestreams = {}
