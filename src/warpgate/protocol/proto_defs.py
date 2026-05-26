@@ -21,6 +21,12 @@ P2P_REVERSE = 2
 P2P_PUNCH = 3
 P2P_RELAY = 4
 P2P_RANDOM_PROBE = 5
+# Overlay-network relays (Yggdrasil, Reticulum, etc.).  Distinct from
+# P2P_RELAY (TURN) because overlay plugins exchange a different kind
+# of address (e.g. an Yggdrasil 200::/7 IPv6 or an RNS destination
+# hash), not a TURN allocation tuple.  Plugins implement the
+# OverlayPlugin base in plugins/overlay/base.py.
+P2P_OVERLAY = 6
 
 
 DIRECT_FAIL = 11
