@@ -129,7 +129,21 @@ class Libp2pNode(object):
         return bound_ip, bound_port
 
     async def accept_loop(self, listener):
-        """Per-listener accept loop: handshake each inbound pipe."""
+        """Per-listener accept loop: handshake each inbound pipe.
+
+        Dedupes consecutive accepts of the SAME PipeEvents identity.
+        aionetiface's TCP server path on Windows Py3.8 delivers each
+        accepted client twice through ``listener.accept()`` -- one
+        from ``loop.create_server(sock=...)`` already starting the
+        accept loop and a second from the
+        ``server.serve_forever()`` task that the Pipe builder kicks
+        off in parallel.  Both deliveries land on the same
+        client_events queue entry, so the second pop is a duplicate
+        of the first.  Dropping the dup here is local + safe -- on
+        Linux/Py3.5 only one delivery ever happens so the seen-set
+        stays size 1 per real connection.
+        """
+        seen = set()
         while not self.closed:
             try:
                 inbound = await listener.accept()
@@ -140,6 +154,11 @@ class Libp2pNode(object):
                 return
             if inbound is None:
                 return
+            inbound_id = id(inbound)
+            if inbound_id in seen:
+                # Duplicate dispatch on the same pipe -- ignore.
+                continue
+            seen.add(inbound_id)
             asyncio.ensure_future(self.handle_inbound(inbound))
 
     async def handle_inbound(self, pipe):

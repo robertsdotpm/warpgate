@@ -158,7 +158,17 @@ class Pathfinder(object):
     # -------- protocol-side ----------------------------------------------
 
     async def handle_lookup(self, from_key, lookup):
-        """Multicast forward + self-match check."""
+        """Multicast forward + self-match check.
+
+        Per upstream pathfinder.go:46-48, only on-tree peers may
+        inject lookups -- otherwise an arbitrary connected node
+        could trigger bloom-multicast fan-out toward every
+        on-tree peer (amplification DoS).  Self-issued lookups
+        skip the gate (we route our own queries unconditionally).
+        """
+        if bytes(from_key) != bytes(self.public_key):
+            if not self.router.is_peer_on_tree(from_key):
+                return
         # Forward via bloom multicast: any peer whose recv-bloom
         # matches the transformed dest gets the lookup.
         await self.router.bloom_multicast(

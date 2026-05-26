@@ -167,6 +167,18 @@ class ActiveRouter(object):
         self.peer_req_sent_at = {}
         # Local sequence number -- monotonic per (re)become-root.
         self.local_seq = 0
+        # Per-info insertion timestamps for lazy TTL expiry.  Keys
+        # not in info_timestamps are treated as "fresh forever"
+        # (e.g. self_info which we always want around).  Upstream
+        # uses per-key time.AfterFunc Timer objects; we use a
+        # cheaper batch-sweep on the maintenance tick to avoid
+        # the scheduler churn at the cost of <1s expiry precision.
+        self.info_timestamps = {}
+        # Refresh flag -- set on self-info update from a peer
+        # (mirrors upstream router._handleAnnounce: when a peer
+        # echoes back our own info, that means our seq reset and
+        # we need a fresh announce out).
+        self.refresh = False
         # Maintenance timer state.
         self.maintenance_task = None
         self.do_root2 = True   # first maintenance cycle: become root
@@ -305,7 +317,18 @@ class ActiveRouter(object):
                 self.peer_lags[link.remote_pubkey] = prev * 7 / 8 + capped / 8
 
     def handle_announce(self, link, ann):
-        """Apply upstream's announce-comparison rules and propagate."""
+        """Apply upstream's announce-comparison rules and propagate.
+
+        Two upstream behaviours we now match (router.go:544-573):
+        - If a peer ECHOES BACK our own info, that means our seq
+          probably reset (e.g. process restart) and we should set
+          ``refresh = True`` so the next maintenance tick re-mints
+          our own announce with a bumped seq.
+        - If we REJECT an inbound announce (theirs is worse than
+          what we have), send THEM what we have so they update.
+          Otherwise we'd spam each other with stale data until
+          one side capitulates.
+        """
         # Verify both signatures: child signed (key,parent,sig_res)
         # and parent signed (key,parent,req+port).
         bs = ann.sig_res.bytes_for_sig(ann.key, ann.parent)
@@ -319,6 +342,20 @@ class ActiveRouter(object):
         accepted = self.update_info(ann)
         if accepted:
             self.sent.setdefault(link.remote_pubkey, set()).add(ann.key)
+            # Self-info echo recovery: peer just told us about our
+            # own key, our seq probably reset, flag for refresh.
+            if bytes(ann.key) == bytes(self.public_key):
+                self.refresh = True
+        else:
+            # Rejected as worse-than-known.  Tell the peer what
+            # we have so they update.
+            existing = self.infos.get(bytes(ann.key))
+            if existing is not None:
+                self.sent.setdefault(link.remote_pubkey, set()).add(ann.key)
+                better = existing.get_announce(ann.key)
+                asyncio.ensure_future(self.send_packet_safe(
+                    link, WIRE_PROTO_ANNOUNCE, better.encode(),
+                ))
 
     def update_info(self, ann):
         """Insert/replace info[key] if ``ann`` is strictly better.
@@ -348,7 +385,49 @@ class ActiveRouter(object):
             sig_res=ann.sig_res,
             sig=ann.sig,
         )
+        # Stamp the insertion time for the TTL sweep.  Self-info
+        # is exempt -- we always want our own entry around.
+        if bytes(ann.key) != bytes(self.public_key):
+            import time as _time
+            self.info_timestamps[bytes(ann.key)] = _time.monotonic()
         return True
+
+    def sweep_expired_infos(self):
+        """Drop infos older than ROUTER_TIMEOUT_SECONDS.
+
+        Upstream uses per-key time.AfterFunc timers (router.go:521);
+        we sweep on the 1 s maintenance tick instead.  Same end
+        result -- stale peer infos eventually disappear from the
+        table -- with a fraction of the scheduler load.  Self-info
+        is never expired.
+
+        Also handles the refresh-on-self-update flag: every
+        ROUTER_REFRESH_SECONDS, our own info is re-signed (matches
+        upstream's _doMaintenance refresh schedule).
+        """
+        import time as _time
+        now = _time.monotonic()
+        # TTL sweep: remove any info older than ROUTER_TIMEOUT_SECONDS.
+        expired = []
+        for key, ts in self.info_timestamps.items():
+            if now - ts > ROUTER_TIMEOUT_SECONDS:
+                expired.append(key)
+        for key in expired:
+            self.infos.pop(key, None)
+            self.info_timestamps.pop(key, None)
+            # Drop sent-dedup entries too so we don't keep advertising
+            # a key we've forgotten.
+            for sent in self.sent.values():
+                sent.discard(key)
+        # Refresh self-info on the upstream cadence so we don't
+        # appear stale to long-running peers' TTL sweeps.
+        self_age_attr = "_self_info_signed_at"
+        signed_at = getattr(self, self_age_attr, None)
+        if signed_at is None:
+            setattr(self, self_age_attr, now)
+        elif now - signed_at > ROUTER_REFRESH_SECONDS:
+            self.refresh = True
+            setattr(self, self_age_attr, now)
 
     def fix(self):
         """Pick the best parent from known responses.
@@ -453,7 +532,20 @@ class ActiveRouter(object):
         return root, ports
 
     def do_maintenance(self):
-        """Periodic tick: sync new peers, fix parent selection, send pending announces."""
+        """Periodic tick: sync new peers, expire stale infos, fix parent
+        selection, send pending announces.
+
+        Sweep order matters: expire BEFORE fix so a freshly-stale
+        peer doesn't get picked as parent.  Sweep BEFORE sync_peers
+        so a peer that timed out but reconnects gets a fresh sig_req.
+        """
+        self.sweep_expired_infos()
+        if self.refresh:
+            # Self-info marked stale -- re-become-root to mint a fresh
+            # ann with a higher seq.  This also flushes the sent-dedup
+            # so every peer gets the refreshed info.
+            self.become_root()
+            self.refresh = False
         self.sync_peers()
         self.fix()
         self.send_pending_announces()
@@ -633,21 +725,65 @@ class ActiveRouter(object):
 
     # -------- bloom filter helpers ---------------------------------------
 
+    def is_peer_on_tree(self, peer_key):
+        """Return True iff ``peer_key`` is a direct link OR shares a tree edge.
+
+        Upstream gates path_lookup forwarding on this to prevent
+        amplification (any client could trigger fan-out otherwise).
+        Definition: peer is our parent, our direct child, OR a
+        currently-live direct peer (link present in NodeCore.peers).
+
+        Adding the direct-peer fallback is slightly more permissive
+        than upstream's strict ``_fixOnTree`` -- it eliminates the
+        race window where a freshly-connected peer's sig_res hasn't
+        landed yet but they're already exchanging traffic with us.
+        Cost: a peer with which we share a link but no tree edge
+        could trigger lookup forwarding.  Bound: limited by the
+        physical peering set, not the open internet.
+        """
+        peer_bytes = bytes(peer_key)
+        self_info = self.infos.get(bytes(self.public_key))
+        if self_info is not None and self_info.parent == peer_bytes:
+            return True
+        peer_info = self.infos.get(peer_bytes)
+        if peer_info is not None and peer_info.parent == bytes(self.public_key):
+            return True
+        # Permissive fallback: any node we have an active link to
+        # counts as on-tree.  Closes the post-connect race without
+        # opening the gate to arbitrary off-internet senders.
+        if self.node_core.peers.get_peer(peer_bytes) is not None:
+            return True
+        return False
+
     def build_bloom_for_peer(self, peer_key):
         """Build the outbound bloom filter we should send to ``peer_key``.
 
-        Contains the transformed forms of every key we know about
-        EXCEPT the destination peer's own (no point telling them
-        they're reachable through us).  Mirrors upstream's
-        ``_getBloomFor``.
+        Two contributions, per upstream bloomfilter.go:223-234
+        ``_getBloomFor``:
+
+        1. ``bloom_transform(self.public_key)`` -- our own key,
+           so peers know they can reach us through this link.
+        2. The bitwise UNION of every other peer's RECV bloom
+           filter -- so the merged filter advertises everyone
+           reachable transitively through us.  Without the
+           merge, a path_lookup to a node 2+ hops away never
+           gets multicast-forwarded because no direct peer's
+           bloom matches it.  This was a silent-drop on
+           multi-hop networks.
+
+        Filters out ``peer_key`` itself -- no point telling them
+        about themselves.
         """
         from .pathfinder import bloom_transform
         b = Bloom()
         b.add_key(bloom_transform(self.public_key))
-        for k in self.infos:
-            if k == peer_key:
+        # Merge every other peer's RECV bloom -- this is the
+        # transitive-reachability bit, recovers multi-hop
+        # forwarding capability.
+        for other_peer_key, other_bloom in self.peer_recv_bloom.items():
+            if bytes(other_peer_key) == bytes(peer_key):
                 continue
-            b.add_key(bloom_transform(k))
+            b.merge(other_bloom)
         return b
 
     async def bloom_multicast(self, packet_type, payload, from_key, dest_key):

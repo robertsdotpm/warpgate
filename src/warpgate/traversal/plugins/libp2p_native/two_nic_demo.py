@@ -1,27 +1,35 @@
-"""Two-NIC demonstration: prove that two Libp2pNode instances bound
-to DIFFERENT NICs on the same machine can complete the full libp2p
-handshake and exchange application bytes through the plugin's
-stack.
+"""Cross-NIC demonstration: prove that two Libp2pNode instances bound
+to distinct local endpoints on the same machine can complete the
+full libp2p handshake and exchange application bytes through the
+plugin's stack.
 
-This is the Windows 10 cross-NIC validation the user asked for --
-it doesn't go through the warpgate traversal cascade (no MQTT
-signaling), it just exercises the libp2p TCP transport directly:
+Default uses two addresses from the 127.0.0.0/8 loopback block
+(127.0.0.1 / 127.0.0.2) -- Windows accepts binds on the entire
+loopback block even when only 127.0.0.1 is configured, and Linux
+treats the whole /8 as loopback natively, so this exercises the
+two-distinct-endpoints path on every platform without depending
+on inter-subnet routing between the actual physical NICs.
 
-   NIC-A:  Libp2pNode listening on listen_ip:port
-   NIC-B:  Libp2pNode dialing (listen_ip, port) via NIC-B's route
+Override --listen-ip / --dial-ip to point at real NIC IPs if your
+network topology lets the dialer's NIC route packets to the
+listener's NIC (e.g. dual-NIC bridged into the same LAN).
 
 Run from a checkout root:
 
+    python -m warpgate.traversal.plugins.libp2p_native.two_nic_demo
+
+Or with explicit NIC IPs:
+
     python -m warpgate.traversal.plugins.libp2p_native.two_nic_demo \\
-        --listen-ip 10.0.1.199 --dial-ip 20.0.0.26
+        --listen-ip 10.0.1.199 --dial-ip 10.0.1.200
 
-If both NICs are dual-stack the same script works for v6 too:
+For IPv6:
 
     python -m warpgate.traversal.plugins.libp2p_native.two_nic_demo \\
-        --listen-ip fe80::1%Ethernet0 --dial-ip fe80::2%Ethernet1 --af 6
+        --listen-ip ::1 --dial-ip ::1 --af 6
 
-On exit the script prints PASS / FAIL + the message contents to
-stdout so a one-liner SSH harness can grep "PASS".
+On exit the script prints PASS / FAIL to stdout so a one-liner
+SSH harness can grep "PASS".
 """
 import argparse
 import asyncio
@@ -125,16 +133,22 @@ async def run_demo(listen_ip, dial_ip, af, listen_iface_name, dial_iface_name,
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--listen-ip", required=True,
-                   help="local IP to bind the listener on (e.g. 10.0.1.199)")
-    p.add_argument("--dial-ip", required=True,
-                   help="local IP to bind the dialer's source on (e.g. 20.0.0.26)")
+    p.add_argument("--listen-ip", default="127.0.0.1",
+                   help="local IP to bind the listener on "
+                        "(default 127.0.0.1)")
+    p.add_argument("--dial-ip", default="127.0.0.2",
+                   help="local IP to bind the dialer's source on "
+                        "(default 127.0.0.2 -- a second 127/8 alias "
+                        "so the cross-endpoint path is exercised on "
+                        "both Linux and Windows without depending on "
+                        "physical-NIC routing)")
     p.add_argument("--listen-iface", default=None,
-                   help='Interface name for the listener (e.g. "Ethernet0"); '
-                        'omit for the default')
+                   help='Interface name for the listener; omit for '
+                        'the default interface (recommended for the '
+                        '127/8 loopback-block default config)')
     p.add_argument("--dial-iface", default=None,
-                   help='Interface name for the dialer (e.g. "Ethernet1"); '
-                        'omit for the default')
+                   help="Interface name for the dialer; omit for "
+                        "the default interface")
     p.add_argument("--af", type=int, default=4, choices=(4, 6),
                    help="address family: 4 or 6 (default 4)")
     p.add_argument("--port", type=int, default=0,
