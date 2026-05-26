@@ -7,7 +7,7 @@ This page explains how to connect two nodes and how to use the resulting Pipe.
 ```python
 from warpgate.node.auto_connect import auto_connect
 
-pipe, plugin = await auto_connect(node, dest_addr, timeout=60.0)
+pipe, plugin = await auto_connect(node, dest_addr)
 ```
 
 `auto_connect` is the high-level connection API. It:

@@ -1285,7 +1285,14 @@ async def auto_connect(
                 dest_cgnat,
             )
             log(line)
-            print(line, flush=True)
+            # Gate the stdout copy on AIONETIFACE_LOG_TAG so orchestrators
+            # (gate_sweep, matrix_full, intra_vm_2nic — all set the tag for
+            # subprocess correlation) still see the [AC-PHASE] cascade
+            # progression in captured stdout, while end-user applications
+            # built on Gate.connect get a clean stdout (the same log line
+            # is always written to the rotating aionetiface log file).
+            if os.environ.get("AIONETIFACE_LOG_TAG"):
+                print(line, flush=True)
             tel = getattr(node, "telemetry", None)
             if tel is not None:
                 try:
@@ -1305,6 +1312,19 @@ async def auto_connect(
                 # (their pipes get verified + closed for measurement).
                 winner_pipe = pipe
                 winner_plugin = plugin
+                # Stamp the winning plugin name onto the pipe so
+                # callers can introspect which strategy carried the
+                # cascade (e.g. `link.pipe.winner_plugin == "tcp_punch"`)
+                # without parsing [AC-PHASE] log lines.  Best-effort:
+                # some pipe shapes (PolledDatagramTransport stubs in
+                # tests) won't accept arbitrary attributes -- silently
+                # skip rather than crash the winner pickup.
+                try:
+                    pipe.winner_plugin = getattr(
+                        plugin, "name", type(plugin).__name__,
+                    )
+                except (AttributeError, TypeError):
+                    pass
             elif pipe is not None:
                 # Failed verify, OR we already have a winner -- close
                 # this phase's pipe so it doesn't leak.
@@ -1354,6 +1374,13 @@ async def auto_connect(
             if alive:
                 winner_pipe = pipe
                 winner_plugin = plugin
+                # See test_all_phases path above for rationale.
+                try:
+                    pipe.winner_plugin = getattr(
+                        plugin, "name", type(plugin).__name__,
+                    )
+                except (AttributeError, TypeError):
+                    pass
                 break
             log("[AC-VERIFY] {0} pipe failed liveness ping; closing and continuing".format(
                 phase_fn.__name__,

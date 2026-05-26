@@ -41,12 +41,16 @@ async def main():
         link = await gate.connect(
             peer.find("peer.bravo"),
             transport=TCP,
-            timeout=5.0,
         )
+        if link is None:
+            print("could not reach peer")
+            return
+        print("connected via", link.winner_plugin)
         async with link:
             await link.send(b"Hello world")
             async for msg in link:
                 print(msg)
+                break
 
 
 asyncio.run(main())
