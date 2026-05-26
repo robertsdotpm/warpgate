@@ -35,27 +35,63 @@ from .multistream import (
     negotiate_initiator, negotiate_responder,
 )
 from . import plaintext
+from . import noise
 from . import yamux
+from . import identify as identify_mod
+from . import multiaddr as ma
+from . import circuit_relay as cr
 from .stream_io import PipeStream
 
 
-SECURITY_PROTOCOL = "/plaintext/2.0.0"
+NOISE_PROTOCOL = "/noise"
+PLAINTEXT_PROTOCOL = "/plaintext/2.0.0"
+# Dial-side preference order: noise first (real-world libp2p
+# default), plaintext second (fallback for warpgate-to-warpgate
+# during smoke tests or when the peer hasn't been upgraded yet).
+DIAL_SECURITY_PREFERENCE = (NOISE_PROTOCOL, PLAINTEXT_PROTOCOL)
+# Listener accepts either -- the initiator's first matching offer wins.
+LISTEN_SECURITY_OFFERS = (NOISE_PROTOCOL, PLAINTEXT_PROTOCOL)
 MUXER_PROTOCOL = "/yamux/1.0.0"
 APP_PROTOCOL = "/warpgate/relay/1.0.0"
+IDENTIFY_PROTOCOL = identify_mod.IDENTIFY_PROTOCOL  # "/ipfs/id/1.0.0"
+HOP_PROTOCOL = cr.HOP_PROTOCOL    # "/libp2p/circuit/relay/0.2.0/hop"
+STOP_PROTOCOL = cr.STOP_PROTOCOL  # "/libp2p/circuit/relay/0.2.0/stop"
+
+# Protocols we'll advertise via Identify.  Order is informational
+# only -- libp2p Identify lists are unordered + a peer may filter.
+ADVERTISED_PROTOCOLS = (
+    APP_PROTOCOL,
+    IDENTIFY_PROTOCOL,
+    HOP_PROTOCOL,
+    STOP_PROTOCOL,
+)
 
 
 class LibP2PSession(object):
     """Bundle of (Pipe, PipeStream, yamux.Session, remote_peer_id)
     for one active libp2p connection.  Held by Libp2pNode so we can
-    tear everything down together on close."""
+    tear everything down together on close.
+
+    Also holds the side-stream dispatcher task -- the responder
+    side spawns one per session, accepting fresh yamux streams the
+    peer opens and routing them by their multistream-selected
+    protocol id.  This is how /ipfs/id/1.0.0 (Identify) gets
+    handled out-of-band from the main /warpgate/relay/1.0.0 stream.
+    """
 
     def __init__(self, pipe, pipe_stream, mux_session, remote_peer_id):
         self.pipe = pipe
         self.pipe_stream = pipe_stream
         self.mux_session = mux_session
         self.remote_peer_id = remote_peer_id
+        self.side_dispatcher_task = None
+        # Last Identify result we learned from the peer (None until
+        # Identify runs at least once).
+        self.last_identify = None
 
     async def close(self):
+        if self.side_dispatcher_task is not None and not self.side_dispatcher_task.done():
+            self.side_dispatcher_task.cancel()
         try:
             await self.mux_session.close()
         except (OSError, ConnectionError):
@@ -95,7 +131,40 @@ class Libp2pNode(object):
         # into the existing PipeStream.
         self.inbound_pipestreams = {}
         self.handshake_tasks = []
+        # Listen-side advertised addresses (multiaddr bytes) -- used in
+        # Identify responses.  Each successful listen() call appends
+        # an entry.  Multiaddrs follow the libp2p wire format
+        # /ip4/<v4>/tcp/<port>; for v6: /ip6/<v6>/tcp/<port>.
+        self.listen_multiaddrs = []
+        # Optional RelayService: when this node should act as a relay
+        # for other peers (i.e. accept /hop streams + forward), set
+        # ``self.relay_service`` to a circuit_relay.RelayService.
+        # ``None`` means we DECLINE /hop streams ("we're not a relay").
+        self.relay_service = None
+        # Active outbound reservation we hold against a remote relay
+        # (so we can be reached via /p2p-circuit).  Map session ->
+        # Reservation.  Updated by ``reserve_via_relay``.
+        self.reservations = {}
+        # Handler invoked when an inbound /stop CONNECT lands -- the
+        # relay punched a stream to us on behalf of a source peer.
+        # Default: hand the spliced stream back up to the caller via
+        # ``relayed_inbound_streams`` so plugin code can run the
+        # libp2p stack on top of it.
+        self.relayed_inbound_streams = asyncio.Queue()
         self.closed = False
+
+    def enable_relay_service(self):
+        """Turn this node into a libp2p Circuit Relay v2 relay.
+
+        After this, peers can run /hop RESERVE against us; their
+        sessions get tracked in our reservations table.  We then
+        accept incoming /hop CONNECT requests and forward via /stop
+        to the reserved peer.
+
+        Idempotent -- calling twice is harmless.
+        """
+        if self.relay_service is None:
+            self.relay_service = cr.RelayService(self)
 
     async def listen(self, nic, af, ips, port=0):
         """Start a TCP listener on ``ips`` of ``nic`` for ``af``.
@@ -160,49 +229,260 @@ class Libp2pNode(object):
             ps.feed_data(data)
 
         pipe.add_msg_cb(demux_cb)
+        # Record the multiaddr form so Identify can advertise it.
+        try:
+            self.listen_multiaddrs.append(ma.encode_ip_tcp(bound_ip, bound_port))
+        except ValueError:
+            # Some bind targets (e.g. an unresolvable name, "::%zone")
+            # won't pack into a multiaddr; skip rather than fail listen.
+            log_exception()
         log(fstr(
             "libp2p_native: listener up on {0}:{1} af={2} nic={3}",
             (bound_ip, bound_port, af, getattr(nic, "name", "?")),
         ))
         return bound_ip, bound_port
 
+    async def session_stream_dispatcher(self, session):
+        """Accept new yamux streams on ``session`` forever, multistream-
+        select each one, then dispatch by protocol.
+
+        ``/warpgate/relay/1.0.0`` -> push the Stream onto
+        ``self.inbound_streams`` so plugin code can hand it back to
+        the cascade as a winning pipe.
+
+        ``/ipfs/id/1.0.0`` -> write our Identify protobuf and close
+        the stream (no further bytes flow on an Identify stream).
+
+        Anything else -> the multistream-select responder already
+        sent "na" while iterating the offer list, so by the time we
+        get here we've negotiated a known protocol; drop the stream
+        if it somehow slipped through.
+        """
+        try:
+            while True:
+                try:
+                    stream = await session.mux_session.accept_stream()
+                except (ConnectionError, asyncio.CancelledError):
+                    raise
+                except Exception:
+                    log_exception()
+                    return
+                if stream is None:
+                    return
+                asyncio.ensure_future(self.handle_inbound_substream(stream, session))
+        except asyncio.CancelledError:
+            return
+
+    async def handle_inbound_substream(self, stream, session):
+        """Multistream-select one fresh yamux stream then route by protocol.
+
+        Dispatch table:
+          /warpgate/relay/1.0.0  -- app stream, push to inbound_streams
+          /ipfs/id/1.0.0         -- reply with our Identify protobuf
+          /libp2p/.../hop        -- handled by RelayService (if enabled)
+          /libp2p/.../stop       -- handled as inbound relayed dial
+        """
+        # The set we OFFER depends on whether the relay service is
+        # turned on -- without it we don't advertise /hop, so a peer
+        # can't use us as a relay.
+        offers = [APP_PROTOCOL, IDENTIFY_PROTOCOL, STOP_PROTOCOL]
+        if self.relay_service is not None:
+            offers.append(HOP_PROTOCOL)
+        try:
+            chosen = await negotiate_responder(stream, stream, tuple(offers))
+        except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):
+            log_exception()
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+            return
+
+        if chosen == APP_PROTOCOL:
+            await self.inbound_streams.put(
+                (stream, session.remote_peer_id, session)
+            )
+            return
+
+        if chosen == IDENTIFY_PROTOCOL:
+            try:
+                await identify_mod.send_identify(
+                    stream,
+                    public_key_marshalled=self.identity.pubkey_marshalled,
+                    listen_addrs_bytes=list(self.listen_multiaddrs),
+                    protocols=list(ADVERTISED_PROTOCOLS),
+                )
+            except (OSError, ConnectionError):
+                log_exception()
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+            return
+
+        if chosen == HOP_PROTOCOL and self.relay_service is not None:
+            await self.relay_service.handle_hop(stream, session)
+            return
+
+        if chosen == STOP_PROTOCOL:
+            # A relay is forwarding bytes to us on behalf of a source.
+            try:
+                src_peer_id, src_addrs, _limit = await cr.destination_handle_stop(stream)
+            except (ConnectionError, OSError, ValueError):
+                log_exception()
+                try:
+                    await stream.close()
+                except (OSError, ConnectionError):
+                    pass
+                return
+            log(fstr(
+                "libp2p_native: inbound relayed /stop from peer_id={0}",
+                (src_peer_id.hex()[:16],),
+            ))
+            await self.relayed_inbound_streams.put(
+                (stream, src_peer_id, session)
+            )
+            return
+
+        # Unknown protocol -- shouldn't happen since multistream-select
+        # narrowed to our offer set.  Drop defensively.
+        try:
+            await stream.close()
+        except (OSError, ConnectionError):
+            pass
+
+    async def reserve_via_relay(self, session, timeout=10.0):
+        """Use ``session`` (a Libp2pSession to a relay) to RESERVE a slot.
+
+        After this returns, peers that look us up via the relay's
+        /hop CONNECT can reach us through ``self.relayed_inbound_streams``.
+        Returns a circuit_relay.Reservation -- the caller can advertise
+        the reservation's addrs as relayed multiaddrs for our peer.
+        """
+        stream = await session.mux_session.open_stream()
+        try:
+            chosen = await asyncio.wait_for(
+                negotiate_initiator(stream, stream, [HOP_PROTOCOL]),
+                timeout=timeout,
+            )
+            if chosen != HOP_PROTOCOL:
+                raise ConnectionError("libp2p_native: relay refused /hop negotiation")
+            reservation = await asyncio.wait_for(
+                cr.client_reserve(stream), timeout=timeout,
+            )
+            self.reservations[session.remote_peer_id] = reservation
+            return reservation
+        finally:
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+
+    async def dial_via_relay(self, session, target_peer_id, timeout=10.0):
+        """Use ``session`` (a Libp2pSession to a relay) to /hop CONNECT
+        to ``target_peer_id`` (which must have a live reservation on
+        that relay).
+
+        On success, returns a ``yamux.Stream``-shaped object that is
+        a transparent conduit to the target peer; the caller can run
+        a fresh libp2p stack (multistream + security + muxer + app)
+        on TOP of it.
+        """
+        stream = await session.mux_session.open_stream()
+        try:
+            chosen = await asyncio.wait_for(
+                negotiate_initiator(stream, stream, [HOP_PROTOCOL]),
+                timeout=timeout,
+            )
+            if chosen != HOP_PROTOCOL:
+                raise ConnectionError("libp2p_native: relay refused /hop negotiation")
+            await asyncio.wait_for(
+                cr.client_connect_to(stream, target_peer_id),
+                timeout=timeout,
+            )
+            return stream
+        except Exception:
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+            raise
+
+    async def query_identify(self, session, timeout=10.0):
+        """Open a fresh yamux stream on ``session`` and run /ipfs/id/1.0.0.
+
+        Returns an ``identify.IdentifyResult`` populated from the
+        peer's response.  Caches the latest result on
+        ``session.last_identify`` so callers can re-use without
+        re-querying.
+        """
+        stream = await session.mux_session.open_stream()
+        try:
+            chosen = await asyncio.wait_for(
+                negotiate_initiator(stream, stream, [IDENTIFY_PROTOCOL]),
+                timeout=timeout,
+            )
+            if chosen != IDENTIFY_PROTOCOL:
+                raise ConnectionError("libp2p_native: peer rejected Identify")
+            result = await asyncio.wait_for(
+                identify_mod.recv_identify(stream), timeout=timeout,
+            )
+            session.last_identify = result
+            return result
+        finally:
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+
     async def handle_inbound_stream(self, ps, cpid):
         """Run the responder side of the libp2p handshake on a new PipeStream.
 
         Called by the listener's demuxer the first time a client
-        sends a byte.  Drives the full multistream + plaintext +
+        sends a byte.  Drives the full multistream + security
+        upgrade (noise OR plaintext, whichever the peer picks) +
         yamux + app handshake; on success pushes the result onto
         ``inbound_streams`` for plugin code to await.
         """
         pipe = ps.pipe
         try:
-            chosen_sec = await negotiate_responder(ps, ps, (SECURITY_PROTOCOL,))
-            if chosen_sec != SECURITY_PROTOCOL:
-                raise ConnectionError(
-                    "libp2p_native: peer wanted {0}".format(chosen_sec)
+            chosen_sec = await negotiate_responder(ps, ps, LISTEN_SECURITY_OFFERS)
+            if chosen_sec == NOISE_PROTOCOL:
+                noise_sess = await noise.perform_responder_handshake(
+                    ps, ps, self.identity,
                 )
-            remote_peer_id, _remote_pub = await plaintext.perform_handshake(
-                ps, ps, self.identity,
-            )
-            chosen_mux = await negotiate_responder(ps, ps, (MUXER_PROTOCOL,))
+                remote_peer_id = noise_sess.remote_peer_id
+                secure_io = noise_sess
+            elif chosen_sec == PLAINTEXT_PROTOCOL:
+                remote_peer_id, _remote_pub = await plaintext.perform_handshake(
+                    ps, ps, self.identity,
+                )
+                secure_io = ps
+            else:
+                raise ConnectionError(
+                    "libp2p_native: peer wanted unsupported sec {0}".format(chosen_sec)
+                )
+
+            chosen_mux = await negotiate_responder(secure_io, secure_io, (MUXER_PROTOCOL,))
             if chosen_mux != MUXER_PROTOCOL:
                 raise ConnectionError(
                     "libp2p_native: peer wanted muxer {0}".format(chosen_mux)
                 )
-            mux = yamux.Session(ps, ps, is_client=False).start()
+            mux = yamux.Session(secure_io, secure_io, is_client=False).start()
             session = LibP2PSession(pipe, ps, mux, remote_peer_id)
             self.sessions.append(session)
-            stream = await asyncio.wait_for(mux.accept_stream(), timeout=30)
-            chosen_app = await negotiate_responder(stream, stream, (APP_PROTOCOL,))
-            if chosen_app != APP_PROTOCOL:
-                raise ConnectionError(
-                    "libp2p_native: peer wanted app {0}".format(chosen_app)
-                )
+            # Spawn the side-stream dispatcher BEFORE awaiting the
+            # first app-stream -- the peer might send Identify or
+            # another protocol first, and we don't want those frames
+            # to languish in accept_queue while we block on a
+            # specific app stream.
+            session.side_dispatcher_task = asyncio.ensure_future(
+                self.session_stream_dispatcher(session),
+            )
             log(fstr(
-                "libp2p_native: inbound handshake complete from peer_id={0}",
-                (remote_peer_id.hex()[:16],),
+                "libp2p_native: inbound session complete from peer_id={0} sec={1}",
+                (remote_peer_id.hex()[:16], chosen_sec),
             ))
-            await self.inbound_streams.put((stream, remote_peer_id, session))
         except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):
             log_exception()
             try:
@@ -238,25 +518,40 @@ class Libp2pNode(object):
 
         pipe.handoff_to_cb(dial_cb)
         try:
-            chosen_sec = await negotiate_initiator(ps, ps, [SECURITY_PROTOCOL])
-            if chosen_sec != SECURITY_PROTOCOL:
-                raise ConnectionError("libp2p_native: dial sec mismatch")
-            remote_peer_id, _ = await plaintext.perform_handshake(
-                ps, ps, self.identity, expected_peer_id=expected_peer_id,
-            )
-            chosen_mux = await negotiate_initiator(ps, ps, [MUXER_PROTOCOL])
+            chosen_sec = await negotiate_initiator(ps, ps, list(DIAL_SECURITY_PREFERENCE))
+            if chosen_sec == NOISE_PROTOCOL:
+                noise_sess = await noise.perform_initiator_handshake(
+                    ps, ps, self.identity, expected_peer_id=expected_peer_id,
+                )
+                remote_peer_id = noise_sess.remote_peer_id
+                secure_io = noise_sess
+            elif chosen_sec == PLAINTEXT_PROTOCOL:
+                remote_peer_id, _ = await plaintext.perform_handshake(
+                    ps, ps, self.identity, expected_peer_id=expected_peer_id,
+                )
+                secure_io = ps
+            else:
+                raise ConnectionError("libp2p_native: dial security mismatch")
+
+            chosen_mux = await negotiate_initiator(secure_io, secure_io, [MUXER_PROTOCOL])
             if chosen_mux != MUXER_PROTOCOL:
                 raise ConnectionError("libp2p_native: dial mux mismatch")
-            mux = yamux.Session(ps, ps, is_client=True).start()
+            mux = yamux.Session(secure_io, secure_io, is_client=True).start()
             session = LibP2PSession(pipe, ps, mux, remote_peer_id)
             self.sessions.append(session)
+            # Side dispatcher so the peer can open Identify (or
+            # future control) streams back to us on this session.
+            session.side_dispatcher_task = asyncio.ensure_future(
+                self.session_stream_dispatcher(session),
+            )
+            # Open the application stream + negotiate /warpgate/relay/1.0.0.
             stream = await mux.open_stream()
             chosen_app = await negotiate_initiator(stream, stream, [APP_PROTOCOL])
             if chosen_app != APP_PROTOCOL:
                 raise ConnectionError("libp2p_native: dial app mismatch")
             log(fstr(
-                "libp2p_native: dial handshake complete to peer_id={0} at {1}:{2}",
-                (remote_peer_id.hex()[:16], dest_ip, dest_port),
+                "libp2p_native: dial handshake complete to peer_id={0} at {1}:{2} sec={3}",
+                (remote_peer_id.hex()[:16], dest_ip, dest_port, chosen_sec),
             ))
             return stream, remote_peer_id, session
         except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):
