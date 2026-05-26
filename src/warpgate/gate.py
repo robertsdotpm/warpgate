@@ -19,7 +19,44 @@ while different hosts get distinct identities without coordination.
 import asyncio
 import time
 
-from aionetiface import TCP, log, fstr
+from aionetiface import (
+    TCP, log, fstr,
+    NIC_BIND, EXT_BIND, LOOPBACK_BIND,
+)
+
+
+ROUTE_TYPE_BY_NAME = {
+    "NIC_BIND": NIC_BIND,
+    "EXT_BIND": EXT_BIND,
+    "LOOPBACK_BIND": LOOPBACK_BIND,
+}
+
+
+def normalize_route_types(value):
+    """Convert a route_types kwarg into a tuple of int constants.
+
+    Accepts ``None`` (passthrough), a single value (int or name str),
+    or any iterable of int / str.  Unknown name strings raise
+    ``ValueError`` -- this is a public API surface and a typo here
+    would otherwise silently exclude the wrong route_type.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, str)):
+        value = (value,)
+    out = []
+    for rt in value:
+        if isinstance(rt, str):
+            if rt not in ROUTE_TYPE_BY_NAME:
+                raise ValueError(
+                    "Unknown route_type name: {0!r} (expected one of {1})".format(
+                        rt, sorted(ROUTE_TYPE_BY_NAME),
+                    )
+                )
+            out.append(ROUTE_TYPE_BY_NAME[rt])
+        else:
+            out.append(int(rt))
+    return tuple(out)
 from aionetiface.utility.hashing import sha256_hex_short
 
 from .node.node import Node
@@ -323,7 +360,8 @@ class Gate(object):
         return False
 
     async def connect(self, target, transport=None, timeout=None,
-                      plugins=None, test_all_phases=False, afs=None):
+                      plugins=None, test_all_phases=False, afs=None,
+                      route_types=None):
         """Resolve a PeerHandle / nickname / addr_bytes and return a Link.
 
         ``target`` is one of:
@@ -354,6 +392,19 @@ class Gate(object):
         log.  The first winning pipe is what gets returned to the
         caller; later phases' pipes are closed.
 
+        ``route_types`` forces the cascade onto a subset of binding
+        strategies.  Default ``None`` lets every phase try its full
+        ordered set (NIC_BIND -> LOOPBACK_BIND -> EXT_BIND for
+        direct, NIC_BIND -> EXT_BIND for punch/spray, EXT_BIND for
+        TURN).  Pass an iterable of aionetiface constants
+        (``EXT_BIND``, ``NIC_BIND``, ``LOOPBACK_BIND``) or their
+        name strings (``"EXT_BIND"``, ...).  Single value is also
+        accepted (``route_types=EXT_BIND``).  Useful when you have
+        multiple WAN paths and need to force a cross-internet route
+        instead of letting a same-LAN combo win.  Phases whose only
+        viable route is excluded become no-ops (e.g. TURN is skipped
+        entirely if ``EXT_BIND`` is not in the set).
+
         Returns a ``Link`` on success, or ``None`` on failure.
         """
         from aionetiface import TCP as _TCP, UDP as _UDP
@@ -382,6 +433,8 @@ class Gate(object):
             kwargs["test_all_phases"] = True
         if afs is not None:
             kwargs["afs"] = afs
+        if route_types is not None:
+            kwargs["route_types"] = normalize_route_types(route_types)
         from .node.nickname import FullNameFailure
         coro = auto_connect(self.node, dest, **kwargs)
         if timeout is not None:

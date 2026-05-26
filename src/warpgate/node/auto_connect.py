@@ -266,6 +266,22 @@ def is_same_machine(src_map, dest_map):
     return bool(sid) and sid == did
 
 
+def filter_route_types(default_types, route_types):
+    """Restrict an ordered tuple of route_types to a user-allowed subset.
+
+    `route_types=None` -> return default_types unchanged (no filter).
+    Otherwise return the elements of default_types that appear in
+    route_types, preserving the original cascade order (NIC_BIND
+    before EXT_BIND etc.).  Used by Gate.connect / auto_connect's
+    route_types= kwarg to force the cascade onto a specific binding
+    strategy -- e.g. EXT_BIND-only to demand a cross-internet path
+    even when LAN-side combos would otherwise win.
+    """
+    if route_types is None:
+        return default_types
+    return tuple(rt for rt in default_types if rt in route_types)
+
+
 def is_transition_v6(ip_str):
     """Return True for IPv6 transition addresses that route via IPv4 middleboxes.
 
@@ -692,8 +708,14 @@ async def phase1_direct(
     dest_map,
     sig_pipe,
     plugins,
+    route_types=None,
 ):
-    """Race direct_connect / reverse_connect across all valid combos."""
+    """Race direct_connect / reverse_connect across all valid combos.
+
+    `route_types` (frozenset of {NIC_BIND, EXT_BIND, LOOPBACK_BIND} or
+    None) restricts which binding strategies the phase will try.
+    Default None = all three in their normal order.
+    """
     names = [n for n in plugins_for_phase("direct") if n in plugins]
     if not names:
         return None, None
@@ -703,7 +725,9 @@ async def phase1_direct(
     for af in (IP4, IP6):
         if not af_compatible(src_map, dest_map, af):
             continue
-        for route_type in (NIC_BIND, LOOPBACK_BIND, EXT_BIND):
+        for route_type in filter_route_types(
+            (NIC_BIND, LOOPBACK_BIND, EXT_BIND), route_types,
+        ):
             for src, dest in viable_pairs_for_arc(
                 af, route_type, src_map, dest_map,
             ):
@@ -733,6 +757,7 @@ async def punch_phase(
     sig_pipe,
     plugin_names,
     label,
+    route_types=None,
 ):
     """Generic phase-2/3 driver shared by tcp_punch and udp/probe.
 
@@ -741,13 +766,16 @@ async def punch_phase(
     bipartite schedule (sorted by nat_type) drives parallel attempts in
     each slot. plugin_names supplies the plugins raced concurrently
     against each scheduled (src, dest) pair.
+
+    `route_types` (frozenset or None) optionally restricts the
+    (NIC_BIND, EXT_BIND) sub-phase walk to a subset.
     """
     loaders = node.traversal.plugin_loaders
     names = [n for n in plugin_names if n in loaders]
     if not names:
         return None, None
 
-    for route_type in (NIC_BIND, EXT_BIND):
+    for route_type in filter_route_types((NIC_BIND, EXT_BIND), route_types):
         active_names = [
             n for n in names
             if plugin_supports_route_type(loaders.get(n), route_type)
@@ -844,6 +872,7 @@ async def phase2_tcp_punch(
     dest_map,
     sig_pipe,
     plugins,
+    route_types=None,
 ):
     names = tuple(n for n in plugins_for_phase("punch") if n in plugins)
     if not names:
@@ -880,6 +909,7 @@ async def phase2_tcp_punch(
         node, src_map, dest_map, sig_pipe,
         plugin_names=names,
         label="phase2",
+        route_types=route_types,
     )
 
 
@@ -889,6 +919,7 @@ async def phase3_udp_probe(
     dest_map,
     sig_pipe,
     plugins,
+    route_types=None,
 ):
     names = tuple(n for n in plugins_for_phase("spray") if n in plugins)
     if not names:
@@ -913,6 +944,7 @@ async def phase3_udp_probe(
         node, src_map, dest_map, sig_pipe,
         plugin_names=(chosen,),
         label="phase3",
+        route_types=route_types,
     )
 
 
@@ -923,6 +955,7 @@ async def phase4_turn(
     sig_pipe,
     plugins,
     cap=TURN_TOTAL_CAP,
+    route_types=None,
 ):
     """Sequential TURN attempts, cap total attempts.
 
@@ -931,7 +964,16 @@ async def phase4_turn(
     EXT_BIND pair and that we haven't paired with yet. Fall back to a
     previously-used dest NIC only if every fresh option is invalid.
     Stop as soon as we hit `cap` total attempts.
+
+    `route_types` (frozenset or None): TURN is intrinsically EXT_BIND;
+    if a non-None route_types is passed that excludes EXT_BIND, this
+    phase short-circuits to (None, None).
     """
+    # TURN only operates EXT_BIND -- if the caller restricted the
+    # cascade to LAN-side route_types (NIC_BIND / LOOPBACK_BIND only),
+    # skip phase4 entirely rather than running and immediately failing.
+    if route_types is not None and EXT_BIND not in route_types:
+        return None, None
     relay_names = [n for n in plugins_for_phase("relay") if n in plugins]
     if not relay_names:
         return None, None
@@ -1008,6 +1050,7 @@ async def auto_connect(
     plugins=None,
     test_all_phases=False,
     afs=None,
+    route_types=None,
 ):
     """Establish a P2P connection to dest_addr without picking a plugin.
 
@@ -1035,11 +1078,32 @@ async def auto_connect(
     dest_map before any phase runs, so af_compatible() naturally
     short-circuits the v4 branches inside each phase.
 
+    `route_types` (default None = all) restricts the binding
+    strategies the cascade will try. Pass ``[EXT_BIND]`` to force
+    cross-internet WAN paths even when LAN-side NIC_BIND combos
+    would otherwise win first, ``[NIC_BIND]`` to keep traffic on
+    the LAN, ``[LOOPBACK_BIND]`` for same-machine only, or any
+    combination. Accepts aionetiface constants (NIC_BIND, EXT_BIND,
+    LOOPBACK_BIND) as an iterable; phases whose only viable route
+    is filtered out become no-ops (phase4_turn skips entirely if
+    EXT_BIND is excluded).
+
     Returns ``(pipe, plugin)`` on success, ``(None, None)`` on failure.
     """
     if plugins is None:
         plugins = plugins_for_protocol(protocol)
     plugin_set = frozenset(plugins)
+
+    # Normalise route_types to a frozenset of ints (or None for
+    # unfiltered).  Callers above this layer (Gate.connect) handle
+    # the str -> int mapping; here we only collapse "single value"
+    # into "set of one" so phase code can do `EXT_BIND in
+    # route_types` without an isinstance() ladder.
+    if route_types is not None:
+        if isinstance(route_types, int):
+            route_types = frozenset((route_types,))
+        else:
+            route_types = frozenset(route_types)
 
     try:
         addr_bytes, dest_vk, _ = await resolve_pnp_addr(node, dest_addr)
@@ -1141,6 +1205,7 @@ async def auto_connect(
             try:
                 pipe, plugin = await phase_fn(
                     node, src_map, dest_map, sig_pipe, plugin_set,
+                    route_types=route_types,
                 )
             except asyncio.CancelledError:
                 if winner_pipe is None:
@@ -1275,6 +1340,7 @@ async def auto_connect(
     for phase_fn in phase_fns:
         pipe, plugin = await phase_fn(
             node, src_map, dest_map, sig_pipe, plugin_set,
+            route_types=route_types,
         )
         if pipe is not None:
             # Same liveness check as the test_all_phases path above:
