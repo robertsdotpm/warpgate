@@ -132,3 +132,36 @@ def b58encode(b):
 def peer_id_to_b58(peer_id_bytes):
     """Pretty-print a binary PeerID multihash as a base58btc Qm/12D string."""
     return b58encode(peer_id_bytes).decode("ascii")
+
+
+def b58decode(s):
+    """Decode base58btc text/bytes to raw bytes.
+
+    Inverse of ``b58encode`` -- used by the multiaddr text parser to
+    convert a ``/p2p/<peer_id_b58>`` segment back to the binary
+    multihash.  Raises ValueError on any non-alphabet character.
+    """
+    alphabet = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    table = {c: i for i, c in enumerate(alphabet)}
+    if isinstance(s, str):
+        s = s.encode("ascii")
+    pad = 0
+    for ch in s:
+        if ch == ord(b"1"):
+            pad += 1
+        else:
+            break
+    n = 0
+    for ch in s:
+        if ch not in table:
+            raise ValueError("b58decode: bad char {0!r}".format(bytes([ch])))
+        n = n * 58 + table[ch]
+    if n == 0:
+        return b"\x00" * pad
+    # int -> bytes (big-endian, no leading zeros).
+    body = bytearray()
+    while n > 0:
+        n, r = divmod(n, 256)
+        body.append(r)
+    body.reverse()
+    return b"\x00" * pad + bytes(body)

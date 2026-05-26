@@ -40,6 +40,10 @@ from . import yamux
 from . import identify as identify_mod
 from . import multiaddr as ma
 from . import circuit_relay as cr
+from . import kad as kad_mod
+from . import autonat as autonat_mod
+from . import autorelay as autorelay_mod
+from ....kademlia.routing import RoutingTable, PeerInfo
 from .stream_io import PipeStream
 
 
@@ -56,6 +60,8 @@ APP_PROTOCOL = "/warpgate/relay/1.0.0"
 IDENTIFY_PROTOCOL = identify_mod.IDENTIFY_PROTOCOL  # "/ipfs/id/1.0.0"
 HOP_PROTOCOL = cr.HOP_PROTOCOL    # "/libp2p/circuit/relay/0.2.0/hop"
 STOP_PROTOCOL = cr.STOP_PROTOCOL  # "/libp2p/circuit/relay/0.2.0/stop"
+KAD_PROTOCOL = kad_mod.KAD_PROTOCOL          # "/ipfs/kad/1.0.0"
+AUTONAT_PROTOCOL = autonat_mod.AUTONAT_PROTOCOL  # "/libp2p/autonat/1.0.0"
 
 # Protocols we'll advertise via Identify.  Order is informational
 # only -- libp2p Identify lists are unordered + a peer may filter.
@@ -64,6 +70,8 @@ ADVERTISED_PROTOCOLS = (
     IDENTIFY_PROTOCOL,
     HOP_PROTOCOL,
     STOP_PROTOCOL,
+    KAD_PROTOCOL,
+    AUTONAT_PROTOCOL,
 )
 
 
@@ -151,7 +159,52 @@ class Libp2pNode(object):
         # ``relayed_inbound_streams`` so plugin code can run the
         # libp2p stack on top of it.
         self.relayed_inbound_streams = asyncio.Queue()
+        # Kademlia DHT routing table.  We store libp2p PeerIDs as
+        # the transport-meaningful peer identifier; the routing
+        # table's ``key_fn=key_for_peer_id`` derives the SHA-256
+        # kad-keyspace key on demand.  This way the transport can
+        # look up sessions by their libp2p PeerID (the natural
+        # session-keying field) without an extra hash->id table.
+        self.kad_routing_table = RoutingTable(
+            local_peer_id=identity.peer_id,
+            k=20, key_bits=256,
+            key_fn=kad_mod.key_for_peer_id,
+        )
+        # Kad transport adapter (lazy-built on first use so plugin
+        # imports don't pay the cost when DHT isn't used).
+        self.kad_transport = None
+        # AutoRelay client -- opportunistically reserves on peers
+        # that advertise /hop in their Identify.  Off by default;
+        # caller flips it on with ``enable_autorelay()``.
+        self.autorelay = None
+        # AutoNAT dialer -- the callback the server-side AutoNAT
+        # handler invokes to attempt a dial-back.  Default: None,
+        # meaning we refuse AutoNAT requests.  Caller can plug in
+        # a dialer via ``set_autonat_dialer``.
+        self.autonat_dialer = None
         self.closed = False
+
+    def enable_autorelay(self, max_relays=2):
+        """Turn AutoRelay on -- opportunistically reserve on relay-capable peers."""
+        if self.autorelay is None:
+            self.autorelay = autorelay_mod.AutoRelay(self, max_relays=max_relays)
+        return self.autorelay
+
+    def set_autonat_dialer(self, dialer):
+        """Plug in the dial-back function for AutoNAT server handling.
+
+        ``dialer(multiaddr_bytes, expected_peer_id) -> bool`` -- if
+        a dial back to the requester at the given multiaddr
+        succeeds, returns True.  Setting this enables AutoNAT
+        server responses; leaving it None refuses them.
+        """
+        self.autonat_dialer = dialer
+
+    def get_kad_transport(self):
+        """Return (lazily-built) the libp2p Kad transport adapter."""
+        if self.kad_transport is None:
+            self.kad_transport = kad_mod.Libp2pKadTransport(self)
+        return self.kad_transport
 
     def enable_relay_service(self):
         """Turn this node into a libp2p Circuit Relay v2 relay.
@@ -282,12 +335,15 @@ class Libp2pNode(object):
           /libp2p/.../hop        -- handled by RelayService (if enabled)
           /libp2p/.../stop       -- handled as inbound relayed dial
         """
-        # The set we OFFER depends on whether the relay service is
-        # turned on -- without it we don't advertise /hop, so a peer
-        # can't use us as a relay.
-        offers = [APP_PROTOCOL, IDENTIFY_PROTOCOL, STOP_PROTOCOL]
+        # The set we OFFER depends on which optional services are
+        # turned on -- without enable_relay_service we don't
+        # advertise /hop, without set_autonat_dialer we don't
+        # advertise /libp2p/autonat/1.0.0.
+        offers = [APP_PROTOCOL, IDENTIFY_PROTOCOL, STOP_PROTOCOL, KAD_PROTOCOL]
         if self.relay_service is not None:
             offers.append(HOP_PROTOCOL)
+        if self.autonat_dialer is not None:
+            offers.append(AUTONAT_PROTOCOL)
         try:
             chosen = await negotiate_responder(stream, stream, tuple(offers))
         except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):
@@ -344,12 +400,67 @@ class Libp2pNode(object):
             )
             return
 
+        if chosen == KAD_PROTOCOL:
+            await kad_mod.handle_kad_stream(stream, self)
+            return
+
+        if chosen == AUTONAT_PROTOCOL and self.autonat_dialer is not None:
+            try:
+                await autonat_mod.server_handle(stream, session, self.autonat_dialer)
+            except (ConnectionError, OSError, ValueError):
+                log_exception()
+            try:
+                await stream.close()
+            except (OSError, ConnectionError):
+                pass
+            return
+
         # Unknown protocol -- shouldn't happen since multistream-select
         # narrowed to our offer set.  Drop defensively.
         try:
             await stream.close()
         except (OSError, ConnectionError):
             pass
+
+    def on_session_established(self, session):
+        """Hook: each new completed session goes through here.
+
+        Currently:
+          - Add the remote peer (BY PeerID, not by kad-key) to our
+            Kad routing table so iterative_find_node can route to
+            them via the existing session.  The table's key_fn
+            derives the SHA-256 kad-key on demand for distance
+            calc.
+          - If AutoRelay is on, kick off a consider() task.
+        """
+        self.kad_routing_table.add_peer(
+            PeerInfo(session.remote_peer_id, addrs=[], last_seen=0)
+        )
+        if self.autorelay is not None:
+            t = asyncio.ensure_future(
+                self.autorelay.consider(session),
+            )
+            self.autorelay.tasks.append(t)
+
+    async def find_peer(self, target_peer_id, timeout=30.0):
+        """Run an iterative Kad-DHT FIND_NODE walk for ``target_peer_id``.
+
+        Returns a list of ``PeerInfo`` ordered by XOR distance to
+        the target.  The list might be empty if the local routing
+        table is empty (no bootstrap was performed).
+
+        ``target_peer_id`` is the libp2p PeerID multihash bytes;
+        we hash it through SHA-256 to land in the Kad keyspace.
+        """
+        from ....kademlia.lookup import iterative_find_node
+        target_key = kad_mod.key_for_peer_id(target_peer_id)
+        transport = self.get_kad_transport()
+        return await asyncio.wait_for(
+            iterative_find_node(
+                self.kad_routing_table, target_key, transport,
+            ),
+            timeout=timeout,
+        )
 
     async def reserve_via_relay(self, session, timeout=10.0):
         """Use ``session`` (a Libp2pSession to a relay) to RESERVE a slot.
@@ -479,6 +590,7 @@ class Libp2pNode(object):
             session.side_dispatcher_task = asyncio.ensure_future(
                 self.session_stream_dispatcher(session),
             )
+            self.on_session_established(session)
             log(fstr(
                 "libp2p_native: inbound session complete from peer_id={0} sec={1}",
                 (remote_peer_id.hex()[:16], chosen_sec),
@@ -544,6 +656,7 @@ class Libp2pNode(object):
             session.side_dispatcher_task = asyncio.ensure_future(
                 self.session_stream_dispatcher(session),
             )
+            self.on_session_established(session)
             # Open the application stream + negotiate /warpgate/relay/1.0.0.
             stream = await mux.open_stream()
             chosen_app = await negotiate_initiator(stream, stream, [APP_PROTOCOL])
