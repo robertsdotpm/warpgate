@@ -77,41 +77,34 @@ class TestYggdrasilNativeLiveBootstrap(AsyncTestCase):
             "factory B: bootstrap dial didn't yield any tree info",
         )
 
-    async def test_write_to_triggers_path_discovery(self):
-        """A.write_to(B) must at least kick the path_lookup multicast
-        and result in A's pathfinder caching SOME path (even a bloom-
-        collision one).  Full byte exchange through the public mesh
-        is not reliable in a fresh test run because the bloom-
-        forwarding wrong-responder edge case + B's tree-routing
-        back to A both need a fix that's deeper than this phase.
-        Live trace doc'd in feedback memory."""
+    async def test_a_to_b_byte_exchange_via_public_mesh(self):
+        """The real integration test: A sends bytes to B through the
+        public Yggdrasil mesh, B receives them on its per-peer channel.
+
+        Exercises: bootstrap → tree formation → path_lookup via
+        bloom multicast → path_notify reply → encrypted session
+        init/ack → first traffic packet with full ratchet machinery.
+        End-to-end against real public peers (no mocks).
+        """
         await self.fac_a.ensure_overlay_started()
         await self.fac_b.ensure_overlay_started()
+        # Bootstrap settle: bloom filter propagation + first tree
+        # maintenance cycle.
         await asyncio.sleep(8)
 
+        pk_a = self.fac_a.node_core.public_key
         pk_b = self.fac_b.node_core.public_key
         pc_a = self.fac_a.packet_conn
+        pc_b = self.fac_b.packet_conn
 
-        # A sends to B -- triggers session init + path_lookup.
+        # B opens a per-peer channel for A so A's bytes are queued.
+        pc_b.open_peer_channel(pk_a)
         await pc_a.write_to(pk_b, b"hello from A via public mesh")
 
-        # Wait up to 10s for SOME path to come back.  Doesn't have
-        # to be the right one -- this test proves the lookup-
-        # multicast + notify-back machinery fires through real
-        # Yggdrasil peers.
-        for _ in range(40):
-            if len(self.fac_a.router.pathfinder.paths) > 0:
-                break
-            await asyncio.sleep(0.25)
-        self.assertGreater(
-            len(self.fac_a.router.pathfinder.paths), 0,
-            "A's pathfinder never cached any path -- the bloom-multicast "
-            "path-discovery loop didn't complete through the public mesh "
-            "within 10s.  Bootstrap state: "
-            "A.infos={0} A.peer_blooms={1}".format(
-                len(self.fac_a.router.infos),
-                len(self.fac_a.router.peer_recv_bloom),
-            ),
+        msg = await pc_b.read_from_peer(pk_a, timeout=30.0)
+        self.assertEqual(
+            msg, b"hello from A via public mesh",
+            "Expected A's message, got {0!r}".format(msg),
         )
 
 

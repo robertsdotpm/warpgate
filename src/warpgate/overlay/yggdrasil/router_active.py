@@ -573,21 +573,30 @@ class ActiveRouter(object):
         return dist
 
     async def forward_traffic(self, link, tr):
-        """Either deliver locally (if dest is us) or forward to next hop."""
+        """Either deliver locally (if dest is us) or forward to next hop.
+
+        Uses watermark-routing (loop-avoidance) per upstream
+        router.handleTraffic.  Watermark MUST monotonically
+        decrease along the forwarding chain -- if we're not
+        STRICTLY closer to the dest than the prior hop was,
+        drop the packet (path_broken back to source).
+        """
         if bytes(tr.dest) == bytes(self.public_key):
             await self.inbox.put((bytes(tr.source), bytes(tr.payload)))
             return
-        next_link = self.lookup_next_hop(tr.path)
+        watermark_ref = [tr.watermark]
+        next_link = self.lookup_next_hop_with_watermark(
+            tr.path, watermark_ref,
+        )
         if next_link is None:
-            # We're the best hop but not the dest -- the source-
-            # routed path has broken (e.g. a hop went down since
-            # the path was cached).  Tell the source so it can
-            # re-discover.
+            # Either watermark says we're not closer than the prior
+            # hop (loop guard fired) OR no peer can move closer.
+            # Tell the source so it can re-discover.
             await self.pathfinder.emit_path_broken(tr)
             return
         if next_link is link:
-            # Don't bounce back to sender.
             return
+        tr.watermark = watermark_ref[0]
         await self.send_packet_safe(next_link, WIRE_TRAFFIC, tr.encode())
 
     async def forward_outbound_traffic(self, tr):
@@ -689,6 +698,14 @@ class ActiveRouter(object):
         fast path AND cold-start (issue path_lookup via bloom
         multicast + buffer the traffic until path_notify lands).
         Loopback short-circuit for self-addressed packets.
+
+        Watermark MUST be initialized to MAX (^uint64(0) in upstream's
+        terms): the first hop's watermark check is
+        ``if self_dist >= watermark: drop``, so any non-max starting
+        value causes the very first router to refuse to forward.
+        This was the bug that broke every live A->B byte exchange
+        until 2026-05-27 -- without it path_broken loops on the
+        first hop instead of the traffic actually moving.
         """
         if bytes(dest_pubkey) == bytes(self.public_key):
             await self.inbox.put((self.public_key, bytes(payload)))
@@ -697,7 +714,7 @@ class ActiveRouter(object):
             path=[],          # filled by pathfinder if cached
             from_path=[],     # filled by pathfinder
             source=self.public_key, dest=bytes(dest_pubkey),
-            watermark=0, payload=bytes(payload),
+            watermark=(1 << 64) - 1, payload=bytes(payload),
         )
         await self.pathfinder.handle_outbound_traffic(tr)
 

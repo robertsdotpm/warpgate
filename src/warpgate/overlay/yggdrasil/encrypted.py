@@ -167,11 +167,18 @@ class SessionInit(object):
 class SessionInfo(object):
     """Per-peer encrypted-session state.
 
-    Tracks the active and "next" box keypairs on both sides + the
-    nonce counters.  Mirrors upstream's sessionInfo struct but
-    without the per-traffic key rotation (deferred to a future
-    session if needed -- nonce overflow at 2^64 packets is not
-    a real risk for warpgate's traffic profile).
+    Tracks the active AND "next" box keypairs on both sides + the
+    nonce counters AND the four precomputed shared keys upstream
+    uses (recv, send, nextSend, nextRecv).  Implements the three
+    decrypt cases from upstream session.go's doRecv:
+
+      * fromCurrent && toRecv  - boring case (recv_shared)
+      * fromNext    && toSend  - remote ratcheted (nextSend_shared)
+      * fromNext    && toRecv  - remote ratcheted early (nextRecv_shared)
+
+    The two ratchet branches also rotate keys when triggered, so
+    receiving traffic alone is sufficient to keep both sides
+    in lockstep.
     """
 
     def __init__(self, peer_ed_pub):
@@ -185,19 +192,39 @@ class SessionInfo(object):
         self.next_priv, self.next_pub = nacl_box.generate_keypair()
         self.recv_nonce = 0
         self.send_nonce = 0
+        self.next_send_nonce = 0
+        self.next_recv_nonce = 0
         self.remote_key_seq = 0
         self.local_key_seq = 0
         self.seq = 0   # peer's seq (anti-replay for init)
-        # Precomputed shared keys -- regenerated on _fix_shared.
+        self.rotated_at = 0.0   # monotonic ts of last key rotation
+        # Precomputed shared keys -- regenerated on fix_shared.
         self.recv_shared = None
         self.send_shared = None
+        self.next_send_shared = None
+        self.next_recv_shared = None
         self.fix_shared()
 
     def fix_shared(self):
-        """Recompute precomputed shared keys after a key change."""
-        if self.current and self.current != b"\x00" * BOX_PUB_SIZE:
+        """Recompute the four precomputed shared keys after a key change.
+
+        Layout matches upstream _fixShared exactly:
+          recv_shared      = precompute(peer.current, our.recv_priv)
+          send_shared      = precompute(peer.current, our.send_priv)
+          next_send_shared = precompute(peer.next,    our.send_priv)
+          next_recv_shared = precompute(peer.next,    our.recv_priv)
+        Plus reset of the next-side nonces.  Caller already
+        manages recv_nonce / send_nonce.
+        """
+        zero32 = b"\x00" * BOX_PUB_SIZE
+        if self.current and self.current != zero32:
             self.recv_shared = nacl_box.precompute(self.current, self.recv_priv)
             self.send_shared = nacl_box.precompute(self.current, self.send_priv)
+        if self.next and self.next != zero32:
+            self.next_send_shared = nacl_box.precompute(self.next, self.send_priv)
+            self.next_recv_shared = nacl_box.precompute(self.next, self.recv_priv)
+        self.next_send_nonce = 0
+        self.next_recv_nonce = 0
 
     def handle_update(self, init):
         """Apply an incoming Init/Ack -- ratchet our own keys forward."""
@@ -215,6 +242,35 @@ class SessionInfo(object):
         self.recv_nonce = 0
         self.fix_shared()
         return True
+
+    def ratchet_on_traffic(self, new_peer_next_pub, new_recv_nonce):
+        """Rotate keys when traffic arrives that proves remote ratcheted.
+
+        Mirrors upstream's onSuccess closure for the fromNext cases:
+        peer's NEXT becomes our CURRENT, peer's new NEXT is the
+        innerKey carried in the decrypted payload, we ratchet our
+        own keys forward by one step, and fix_shared rederives the
+        four shared keys.
+
+        Rate-limited to once per minute (matches upstream's
+        ``time.Since(info.rotated) > time.Minute`` guard) so we
+        don't churn keys on every traffic packet in a steady-state
+        session.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if self.rotated_at != 0.0 and now - self.rotated_at < 60.0:
+            return
+        self.current = self.next
+        self.next = bytes(new_peer_next_pub)
+        self.remote_key_seq += 1
+        self.recv_priv, self.recv_pub = self.send_priv, self.send_pub
+        self.send_priv, self.send_pub = self.next_priv, self.next_pub
+        self.next_priv, self.next_pub = nacl_box.generate_keypair()
+        self.local_key_seq += 1
+        self.recv_nonce = new_recv_nonce
+        self.fix_shared()
+        self.rotated_at = now
 
 
 class EncryptedPacketConn(object):
@@ -307,12 +363,30 @@ class EncryptedPacketConn(object):
             asyncio.ensure_future(self.flush_pending(source))
 
     def handle_traffic(self, source, data):
+        """Decode + decrypt one traffic packet from ``source``.
+
+        Implements the full 3-case switch from upstream session.go
+        doRecv.  The wire layout from sender's POV:
+          ``[tag][sender.local_key_seq][sender.remote_key_seq][nonce][sealed]``
+        From OUR perspective, sender.local_key_seq is what we'd
+        call remote_key_seq, and sender.remote_key_seq is what we'd
+        call local_key_seq.
+
+        Three accept cases:
+          1) ``fromCurrent && toRecv`` -- both sides aligned on
+             current keys.  Decrypt with recv_shared, advance recv_nonce.
+          2) ``fromNext && toSend`` -- remote ratcheted to its next
+             AHEAD of us.  Decrypt with next_send_shared; on
+             success, rotate our own keys to match.
+          3) ``fromNext && toRecv`` -- both ratcheted early.
+             Decrypt with next_recv_shared; rotate.
+
+        Anything else: send a fresh init to re-sync (upstream's
+        default branch).
+        """
         info = self.sessions.get(bytes(source))
         if info is None:
             return
-        # Layout: [tag][varint remote_key_seq][varint local_key_seq]
-        # [varint nonce][sealed].  Note: from the sender's perspective
-        # local_key_seq/remote_key_seq are swapped vs our view.
         try:
             offset = 1
             remote_key_seq, consumed = decode_uvarint(data, offset)
@@ -324,31 +398,61 @@ class EncryptedPacketConn(object):
         except ValueError:
             return
         sealed = data[offset:]
-        # In the common case (no ratchet on this packet) use recv_shared.
-        if (remote_key_seq == info.remote_key_seq
-                and local_key_seq + 1 == info.local_key_seq
-                and nonce > info.recv_nonce):
+
+        from_current = remote_key_seq == info.remote_key_seq
+        from_next = remote_key_seq == info.remote_key_seq + 1
+        to_recv = local_key_seq + 1 == info.local_key_seq
+        to_send = local_key_seq == info.local_key_seq
+
+        shared = None
+        post_action = None   # set by case branches to mutate state on success
+
+        if from_current and to_recv:
+            if nonce <= info.recv_nonce:
+                return
             shared = info.recv_shared
+            def on_success(_inner_key):
+                info.recv_nonce = nonce
+            post_action = on_success
+        elif from_next and to_send:
+            if nonce <= info.next_send_nonce:
+                return
+            shared = info.next_send_shared
+            def on_success(inner_key):
+                info.next_send_nonce = nonce
+                info.ratchet_on_traffic(inner_key, nonce)
+            post_action = on_success
+        elif from_next and to_recv:
+            if nonce <= info.next_recv_nonce:
+                return
+            shared = info.next_recv_shared
+            def on_success(inner_key):
+                info.next_recv_nonce = nonce
+                info.ratchet_on_traffic(inner_key, nonce)
+            post_action = on_success
         else:
-            # More complex cases (ratchet mid-flight) -- skip for the
-            # compact port.  Real Yggdrasil rotates rarely so most
-            # traffic falls through the boring case above.
+            # Out of sync -- send a fresh init to recover.
+            import asyncio
+            asyncio.ensure_future(self.send_init(source))
             return
+
         if shared is None:
             return
         nonce_bytes = (b"\x00" * 16) + nonce.to_bytes(8, "big")
         opened = nacl_box.open_precomputed(sealed, nonce_bytes, shared)
         if opened is None:
+            # MAC failed -- session keys probably drifted.  Try a
+            # fresh init to re-sync.  Matches upstream's "Keys
+            # somehow became out-of-sync" recovery branch.
+            import asyncio
+            asyncio.ensure_future(self.send_init(source))
             return
-        info.recv_nonce = nonce
-        # First 32 bytes of plaintext = peer's next_pub (advertised
-        # for future ratchet); rest = the app message.
         if len(opened) < BOX_PUB_SIZE:
             return
+        inner_key = opened[:BOX_PUB_SIZE]
         msg = opened[BOX_PUB_SIZE:]
+        post_action(inner_key)
         import asyncio
-        # Always feed the shared inbox AND the per-peer inbox.
-        # Both are unbounded so neither blocks the cb path.
         asyncio.ensure_future(self.inbox.put((bytes(source), msg)))
         peer_q = self.per_peer_inbox.get(bytes(source))
         if peer_q is not None:
