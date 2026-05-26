@@ -175,6 +175,11 @@ class PeerLink(object):
         # Keepalive timer handle.
         self.pending_keepalive_handle = None
 
+        # Close-watcher task -- spawned by install_msg_cb to wake
+        # the recv loop on a graceful peer disconnect.  None until
+        # install_msg_cb runs.
+        self.close_watcher = None
+
     @property
     def remote_addr(self):
         """Derived 200::/7 IPv6 address string for the remote peer."""
@@ -187,6 +192,15 @@ class PeerLink(object):
         handshake completes.  The handshake itself uses a
         BufferedReader (pull mode); this transitions to msg_cb
         push mode for the steady-state.
+
+        Also arms a background watcher that listens for the pipe's
+        ``on_close`` event and calls ``fatal_close`` when the
+        remote side disconnects.  Without this, a clean TCP FIN
+        from the peer never reaches us via msg_cb (msg_cb only
+        fires on byte arrivals, not on EOF), and the
+        ``recv_packet()`` awaiter would block forever -- which
+        is the original peer-task-leak bug caught by
+        ``test_yggdrasil_stress.TestPeerChurnLoopback``.
         """
 
         def on_bytes(data, client_tup, pipe):
@@ -225,11 +239,61 @@ class PeerLink(object):
             # handoff_to_cb; fall back to add_msg_cb + manual unsub.
             self.pipe.add_msg_cb(on_bytes)
 
+        # Arm the close-watcher.  Pipe close events live in
+        # different attributes depending on whether this is a
+        # client pipe (``pipe_events.on_close``) or a per-connection
+        # server-accepted pipe (``client_events.on_close``).  We
+        # look both up and chain on whichever is present.
+        try:
+            self.close_watcher = asyncio.ensure_future(self.watch_pipe_close())
+        except RuntimeError:
+            # No running event loop (test stubs); skip the watcher.
+            self.close_watcher = None
+
+    async def watch_pipe_close(self):
+        """Wait for the pipe's close event then mark the link closed.
+
+        Drives the recv_packet sentinel so the NodeCore.peer_recv_loop
+        wakes promptly when the remote peer disconnects.  Without
+        this, a graceful FIN from the peer leaves recv_packet
+        blocked on the inbound queue forever, and NodeCore leaks
+        the peer_tasks + PeerEntry slot.
+
+        aionetiface's Pipe exposes ``on_close`` directly as an
+        ``asyncio.Event``; ``connection_lost`` on the transport
+        sets it.  Both client and server-accepted pipes share the
+        same attribute name.
+
+        Eats CancelledError silently: cancellation is the normal
+        path when ``close()`` runs before the peer ever
+        disconnects, and the parent task has no recovery action
+        to take in that case.
+        """
+        event = getattr(self.pipe, "on_close", None)
+        if event is None:
+            return
+        try:
+            await event.wait()
+        except asyncio.CancelledError:
+            # Normal shutdown -- swallow so the task finishes
+            # cleanly without leaving a never-retrieved exception
+            # on the event loop.
+            return
+        # Pipe closed; tear our link down.  fatal_close pushes the
+        # sentinel into inbound_queue, unblocking any awaiter.
+        self.fatal_close()
+
     def fatal_close(self):
         """Mark the link closed and wake any recv_packet caller.  Sync, callable from msg_cb."""
         if self.closed:
             return
         self.closed = True
+        if self.close_watcher is not None:
+            try:
+                self.close_watcher.cancel()
+            except Exception:
+                pass
+            self.close_watcher = None
         try:
             self.inbound_queue.put_nowait((None, self.recv_closed_sentinel))
         except asyncio.QueueFull:
@@ -319,6 +383,24 @@ class PeerLink(object):
             return
         self.closed = True
         self.cancel_pending_keepalive()
+        watcher = self.close_watcher
+        self.close_watcher = None
+        if watcher is not None:
+            try:
+                watcher.cancel()
+            except Exception:
+                pass
+            # Briefly await the watcher so the cancellation
+            # propagates through the asyncio internals and the
+            # task transitions to "done" before we exit close().
+            # Without this, Python 3.5 occasionally reports
+            # "Task exception was never retrieved" for the
+            # cancelled watcher because the GC sees the task
+            # still in the not-yet-run-cancelled state.
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             self.inbound_queue.put_nowait((None, self.recv_closed_sentinel))
         except asyncio.QueueFull:
