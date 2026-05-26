@@ -6,6 +6,8 @@
 
 **Project site: <https://www.warpgate.io/>**
 
+**Watch the 2:30 demo:** <https://www.youtube.com/watch?v=e3AcOOKyRHE> — Warpgate + aionetiface in action, end-to-end.
+
 Warpgate is a 100% open-source Python 3 library for one-shot NAT traversal.
 Eight plugins, every major OS back to Windows XP, IPv4 and IPv6,
 multi-NIC, all in one library. No relays you have to run. No keys you
@@ -34,12 +36,16 @@ async def main():
         link = await gate.connect(
             peer.find("peer.bravo"),
             transport=TCP,
-            timeout=5.0,
         )
+        if link is None:
+            print("could not reach peer")
+            return
+        print("connected via", link.winner_plugin)  # "tcp_punch" / "direct_connect" / ...
         async with link:
             await link.send(b"Hello world")
             async for msg in link:
                 print(msg)
+                break
 
 
 asyncio.run(main())

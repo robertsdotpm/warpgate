@@ -52,13 +52,26 @@ async def main():
     plugins = None
     if plugins_env:
         plugins = [p.strip() for p in plugins_env.split(",") if p.strip()]
+    # WG_ROUTE_TYPES restricts the auto_connect cascade to a subset of
+    # binding strategies -- comma-separated names from
+    # {NIC_BIND, EXT_BIND, LOOPBACK_BIND}.  Gate.connect maps the names
+    # to aionetiface constants and raises ValueError on typos.  Used by
+    # the matrix harness to force EXT_BIND-only cross-WAN paths in
+    # intra-VM 2-NIC iterations (the same_machine NIC_BIND combos
+    # otherwise burn ~3-5s on Windows before falling through).
+    route_types_env = os.environ.get("WG_ROUTE_TYPES", "").strip()
+    route_types = None
+    if route_types_env:
+        route_types = [
+            rt.strip() for rt in route_types_env.split(",") if rt.strip()
+        ]
     # WG_NIC pins the connector to a single interface (see gate_listen).
     nic = os.environ.get("WG_NIC") or None
     nic_names = [nic] if nic else None
     async with (Gate(name=name, nic_names=nic_names) if name
                 else Gate(nic_names=nic_names)) as gate:
-        print("WG_CONNECTOR_READY: {0} afs={1} plugins={2}".format(
-            gate.full_name or "?", afs, plugins,
+        print("WG_CONNECTOR_READY: {0} afs={1} plugins={2} route_types={3}".format(
+            gate.full_name or "?", afs, plugins, route_types,
         ), flush=True)
         link = await gate.connect(
             peer.find(target),
@@ -66,6 +79,7 @@ async def main():
             timeout=timeout,
             afs=afs,
             plugins=plugins,
+            route_types=route_types,
         )
         if link is None:
             print("OUTCOME winner_plugin=none", flush=True)

@@ -524,6 +524,13 @@ class Link(object):
         self.client_tup = client_tup
         self.closed = False
         self.subscribed = False
+        # Convenience surface: name of the auto_connect cascade plugin
+        # that produced this pipe ("direct_connect", "tcp_punch",
+        # "udp_punch", "random_probe", "turn", etc.).  Set by
+        # auto_connect at the cascade-winner pickup.  None on
+        # listener-side Links (where the plugin set is inbound rather
+        # than cascade-driven).
+        self.winner_plugin = getattr(pipe, "winner_plugin", None)
         # managed=True is set by Gate.listen's shim: messages arrive via
         # the handler(link, msg) callback, so we must NOT subscribe the
         # pipe stream as a parallel consumer (would double-buffer and
