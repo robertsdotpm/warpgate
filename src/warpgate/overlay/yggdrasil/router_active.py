@@ -152,8 +152,19 @@ class ActiveRouter(object):
         self.requests = {}
         self.responses = {}
         self.sent = {}
-        # Latest bloom from each peer (Phase 5c will act on these).
-        self.peer_bloom = {}
+        # Per-peer bloom filters: we maintain a "send" filter
+        # (the latest we sent that peer) and a "recv" filter
+        # (the latest we received from that peer).  recv is what
+        # we test against when deciding whether to multicast a
+        # path_lookup through them.
+        self.peer_send_bloom = {}
+        self.peer_recv_bloom = {}
+        # Per-peer measured RTT from sig_req → sig_res.  Used in
+        # _fix / lookup_next_hop as the cost weight.  Stored as
+        # seconds (float).  Missing entry = unknown latency.
+        self.peer_lags = {}
+        # Per-peer sig_req send timestamp for RTT measurement.
+        self.peer_req_sent_at = {}
         # Local sequence number -- monotonic per (re)become-root.
         self.local_seq = 0
         # Maintenance timer state.
@@ -164,6 +175,11 @@ class ActiveRouter(object):
         # to the application layer in Phase 6+.  For now just
         # collect them in a queue the test can pull from.
         self.inbox = asyncio.Queue()
+        # Pathfinder for source-route discovery + caching.  Created
+        # here so handle_path_* methods can dispatch into it.
+        # Lazy import: pathfinder.py imports back from us.
+        from .pathfinder import Pathfinder
+        self.pathfinder = Pathfinder(self)
         # Become root immediately so we have a usable self.infos entry.
         self.become_root()
 
@@ -244,8 +260,9 @@ class ActiveRouter(object):
     def handle_sig_res(self, link, res):
         """Peer (our potential parent) signed our sig_req.
 
-        Verify the signature; if valid, cache and let the next
-        ``_fix`` cycle decide whether to adopt them as parent.
+        Verify the signature; if valid, cache + measure RTT and
+        let the next ``_fix`` cycle decide whether to adopt them
+        as parent.
         """
         req = self.requests.get(link.remote_pubkey)
         if req is None:
@@ -259,6 +276,23 @@ class ActiveRouter(object):
             ))
             return
         self.responses[link.remote_pubkey] = res
+        # RTT measurement: exponentially-weighted average of the
+        # round-trip between when we sent the sig_req and when
+        # the matching sig_res arrived.  Used as link cost.
+        sent_at = self.peer_req_sent_at.pop(link.remote_pubkey, None)
+        if sent_at is not None:
+            import time as _time
+            rtt = max(0.001, _time.monotonic() - sent_at)
+            prev = self.peer_lags.get(link.remote_pubkey)
+            if prev is None:
+                # First measurement -- penalize fresh links slightly
+                # to discourage churning to brand-new peers.
+                self.peer_lags[link.remote_pubkey] = rtt * 2
+            else:
+                # 7/8 old + 1/8 new (capped so a single spike can't
+                # double the value).  Matches upstream's EWMA.
+                capped = min(rtt, prev * 2)
+                self.peer_lags[link.remote_pubkey] = prev * 7 / 8 + capped / 8
 
     def handle_announce(self, link, ann):
         """Apply upstream's announce-comparison rules and propagate."""
@@ -410,23 +444,35 @@ class ActiveRouter(object):
 
         NodeCore.peers is the source of truth for live peer links;
         this scans for any pubkey we don't yet have a ``sent[]``
-        entry for, primes it, and kicks off a sig_req so the peer
-        starts replying with sig_res messages (which feed into
-        parent selection).
+        entry for, primes it, sends a sig_req (which feeds into
+        parent selection AND RTT measurement) and sends our
+        current bloom filter (which the peer uses for path-lookup
+        multicast forwarding).
         """
+        import time as _time
         for entry in self.node_core.peers.peers():
             pk = entry.link.remote_pubkey
             if pk not in self.sent:
                 self.sent[pk] = set()
                 # Send a fresh sig_req so this peer becomes a
-                # candidate parent.
+                # candidate parent.  Record the send time so the
+                # matching sig_res can compute RTT.
                 req = RouterSigReq(
                     seq=self.local_seq + 1,
                     nonce=int.from_bytes(os.urandom(8), "big"),
                 )
                 self.requests[pk] = req
+                self.peer_req_sent_at[pk] = _time.monotonic()
                 asyncio.ensure_future(self.send_packet_safe(
                     entry.link, WIRE_PROTO_SIG_REQ, req.encode(),
+                ))
+                # Send our current bloom (all our known keys
+                # transformed via bloom_transform) so the peer
+                # can forward path_lookups to us appropriately.
+                self.peer_send_bloom[pk] = self.build_bloom_for_peer(pk)
+                asyncio.ensure_future(self.send_packet_safe(
+                    entry.link, WIRE_PROTO_BLOOM_FILTER,
+                    self.peer_send_bloom[pk].encode(),
                 ))
 
     def send_pending_announces(self):
@@ -453,25 +499,64 @@ class ActiveRouter(object):
 
     # -------- traffic forwarding -----------------------------------------
 
+    def get_cost(self, peer_key):
+        """Latency-weighted cost for a peer link (uniform 1 if unknown)."""
+        lag = self.peer_lags.get(peer_key)
+        if lag is None or lag <= 0:
+            return 1
+        # Cost in ms-ish units -- multiplied by tree distance in
+        # lookup_next_hop to compute the joint cost*dist score.
+        return max(1, int(lag * 1000))
+
     def lookup_next_hop(self, dest_path):
         """Find the peer that's closest to ``dest_path`` in tree-space.
 
         Greedy: of our peers (including self), pick the one with
-        minimum tree distance to dest_path.  Returns the peer's
-        link, or None if we ARE the closest (deliver locally).
+        minimum (cost * tree-distance) to dest_path.  Returns the
+        peer's link, or None if we ARE the closest (deliver
+        locally).  Mirrors upstream router._lookup's two-stage
+        selection: first filter peers strictly closer than us by
+        distance alone, then pick among those by cost*dist.
         """
         self_dist = self.get_dist(dest_path, self.public_key)
-        best_link = None
-        best_dist = self_dist
+        # Stage 1: distance filter -- candidate must be strictly
+        # closer than us by tree distance to guarantee loop-free
+        # progress.
+        candidates = []
         for peer_key in self.infos:
             entry = self.node_core.peers.get_peer(peer_key)
             if entry is None:
                 continue
             dist = self.get_dist(dest_path, peer_key)
-            if dist < best_dist:
-                best_dist = dist
-                best_link = entry.link
-        return best_link
+            if dist < self_dist:
+                candidates.append((peer_key, entry, dist))
+        if not candidates:
+            return None
+        # Stage 2: pick min (cost * dist), ties broken by smaller dist
+        # then smaller cost.
+        best = None
+        best_score = None
+        for peer_key, entry, dist in candidates:
+            cost = self.get_cost(peer_key)
+            score = (cost * dist, dist, cost)
+            if best_score is None or score < best_score:
+                best_score = score
+                best = entry.link
+        return best
+
+    def lookup_next_hop_with_watermark(self, dest_path, watermark_ref):
+        """Watermark variant: only forward if we're STRICTLY closer than ``watermark``.
+
+        ``watermark_ref`` is a single-element list (Python pass-by-
+        reference trick) so the caller can read the updated
+        watermark back.  Mirrors upstream's pointer semantics.
+        """
+        self_dist = self.get_dist(dest_path, self.public_key)
+        if self_dist >= watermark_ref[0]:
+            # We're not closer than the previous hop -- drop.
+            return None
+        watermark_ref[0] = self_dist
+        return self.lookup_next_hop(dest_path)
 
     def get_dist(self, dest_path, key):
         """Tree distance between key's path and ``dest_path``."""
@@ -490,18 +575,74 @@ class ActiveRouter(object):
     async def forward_traffic(self, link, tr):
         """Either deliver locally (if dest is us) or forward to next hop."""
         if bytes(tr.dest) == bytes(self.public_key):
-            await self.inbox.put((tr.source, tr.payload))
+            await self.inbox.put((bytes(tr.source), bytes(tr.payload)))
             return
         next_link = self.lookup_next_hop(tr.path)
         if next_link is None:
-            # We're the best hop but not the dest -- packet is
-            # mis-routed.  Drop (or send path_broken).  Upstream
-            # would emit a path_broken; we do nothing here.
+            # We're the best hop but not the dest -- the source-
+            # routed path has broken (e.g. a hop went down since
+            # the path was cached).  Tell the source so it can
+            # re-discover.
+            await self.pathfinder.emit_path_broken(tr)
             return
         if next_link is link:
             # Don't bounce back to sender.
             return
         await self.send_packet_safe(next_link, WIRE_TRAFFIC, tr.encode())
+
+    async def forward_outbound_traffic(self, tr):
+        """Pathfinder calls this after it's filled in tr.path / tr.from_path."""
+        if bytes(tr.dest) == bytes(self.public_key):
+            await self.inbox.put((bytes(tr.source), bytes(tr.payload)))
+            return
+        next_link = self.lookup_next_hop(tr.path)
+        if next_link is None:
+            raise OSError("router.forward_outbound_traffic: no next hop")
+        await self.send_packet_safe(next_link, WIRE_TRAFFIC, tr.encode())
+
+    # -------- bloom filter helpers ---------------------------------------
+
+    def build_bloom_for_peer(self, peer_key):
+        """Build the outbound bloom filter we should send to ``peer_key``.
+
+        Contains the transformed forms of every key we know about
+        EXCEPT the destination peer's own (no point telling them
+        they're reachable through us).  Mirrors upstream's
+        ``_getBloomFor``.
+        """
+        from .pathfinder import bloom_transform
+        b = Bloom()
+        b.add_key(bloom_transform(self.public_key))
+        for k in self.infos:
+            if k == peer_key:
+                continue
+            b.add_key(bloom_transform(k))
+        return b
+
+    async def bloom_multicast(self, packet_type, payload, from_key, dest_key):
+        """Forward ``payload`` to every peer whose recv-bloom matches ``dest_key``.
+
+        Skips the sender (``from_key``) so multicasts don't
+        bounce back to whoever forwarded the lookup to us.
+        Bloom Test() may yield false positives (which only costs
+        bandwidth), never false negatives (which would lose the
+        packet).
+        """
+        from .pathfinder import bloom_transform
+        target = bloom_transform(dest_key)
+        for entry in self.node_core.peers.peers():
+            peer_key = entry.link.remote_pubkey
+            if peer_key == from_key:
+                continue
+            recv_bloom = self.peer_recv_bloom.get(peer_key)
+            if recv_bloom is None:
+                # We haven't received their bloom yet -- conservative
+                # forward so we don't black-hole during ramp-up.
+                pass
+            elif not recv_bloom.test_key(target):
+                # Definitely not interested.
+                continue
+            await self.send_packet_safe(entry.link, packet_type, payload)
 
     # -------- top-level packet dispatch ----------------------------------
 
@@ -526,11 +667,15 @@ class ActiveRouter(object):
         elif packet_type == WIRE_PROTO_ANNOUNCE:
             self.handle_announce(link, msg)
         elif packet_type == WIRE_PROTO_BLOOM_FILTER:
-            self.peer_bloom[link.remote_pubkey] = msg
+            self.peer_recv_bloom[link.remote_pubkey] = msg
+        elif packet_type == WIRE_PROTO_PATH_LOOKUP:
+            await self.pathfinder.handle_lookup(link.remote_pubkey, msg)
+        elif packet_type == WIRE_PROTO_PATH_NOTIFY:
+            await self.pathfinder.handle_notify(link.remote_pubkey, msg)
+        elif packet_type == WIRE_PROTO_PATH_BROKEN:
+            await self.pathfinder.handle_broken(link.remote_pubkey, msg)
         elif packet_type == WIRE_TRAFFIC:
             await self.forward_traffic(link, msg)
-        # path_lookup / path_notify / path_broken: stored but no-op
-        # in Phase 5b -- handled by Phase 5c pathfinder.
 
     # -------- outbound traffic helper ------------------------------------
 

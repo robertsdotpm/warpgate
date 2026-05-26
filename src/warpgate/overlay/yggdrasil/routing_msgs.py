@@ -191,15 +191,18 @@ class RouterAnnounce(object):
 class Bloom(object):
     """Bloom-filter packet -- 16+16 byte flag header + non-trivial uint64s.
 
-    Mirrors ``ironwood/network/bloomfilter.go``'s wire shape.  This
-    class handles the WIRE FORMAT only; the actual Bloom set logic
-    (Add / Test / Merge) lives in ``bloom.py`` because it needs a
-    hash function (murmur3) that's orthogonal to the framing.
+    Mirrors ``ironwood/network/bloomfilter.go``'s wire shape AND
+    its filter semantics (k=8 hashes derived from murmur3-128
+    sum256, m=BLOOM_FILTER_M bits backing array).  Bit positions
+    therefore match bits-and-blooms exactly -- two filters built
+    by Python and Go from the same key set hash to the same slots.
 
     Encoded form holds ``BLOOM_FILTER_U == 128`` slots.  Each slot
     is one of: all-zero (flagged in flags0), all-one (flagged in
     flags1), or an arbitrary uint64 (8 bytes BE in the data
     section).  Decoding rebuilds the full 128-slot array.
+
+    Add / Test / Merge expose the standard bloom set operations.
     """
 
     def __init__(self, slots=None):
@@ -211,6 +214,58 @@ class Bloom(object):
                 (len(slots), BLOOM_FILTER_U),
             ))
         self.slots = list(slots)
+
+    def add_key(self, key):
+        """Insert ``key`` (bytes) into the filter -- mirrors upstream Add."""
+        from .murmur128 import sum256
+        h = sum256(bytes(key))
+        for i in range(BLOOM_FILTER_K):
+            loc = self.location(h, i)
+            self.slots[loc // 64] |= 1 << (loc % 64)
+            self.slots[loc // 64] &= (1 << 64) - 1
+
+    def test_key(self, key):
+        """Return True if ``key`` MIGHT be present (False = definitely absent)."""
+        from .murmur128 import sum256
+        h = sum256(bytes(key))
+        for i in range(BLOOM_FILTER_K):
+            loc = self.location(h, i)
+            if (self.slots[loc // 64] >> (loc % 64)) & 1 == 0:
+                return False
+        return True
+
+    def merge(self, other):
+        """In-place bit-OR of ``other`` into self -- mirrors upstream Merge."""
+        if not isinstance(other, Bloom):
+            raise ValueError("Bloom.merge: other must be Bloom")
+        for i in range(BLOOM_FILTER_U):
+            self.slots[i] = (self.slots[i] | other.slots[i]) & ((1 << 64) - 1)
+
+    def equal(self, other):
+        """True if all slots match -- used by router maintenance to dedupe sends."""
+        if not isinstance(other, Bloom):
+            return False
+        return self.slots == other.slots
+
+    def copy(self):
+        """Deep copy of the slot array."""
+        return Bloom(slots=list(self.slots))
+
+    @staticmethod
+    def location(h, i):
+        """Compute the i-th bit position from a 4-uint64 hash.
+
+        Direct port of bits-and-blooms ``location``:
+            location(h, i) = h[i%2] + i*h[2 + (((i+(i%2))%4)/2)]
+        modulo the filter bit count.
+        """
+        ii = i
+        # Pick which two base hashes to combine based on the iteration.
+        a = h[ii % 2]
+        b_idx = 2 + (((ii + (ii % 2)) % 4) // 2)
+        b = h[b_idx]
+        loc = (a + ii * b) & ((1 << 64) - 1)
+        return loc % BLOOM_FILTER_M
 
     def size(self):
         size = BLOOM_FILTER_F * 2  # two flag byte arrays
