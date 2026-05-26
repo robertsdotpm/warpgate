@@ -6,6 +6,8 @@
 
 **Project site: <https://www.warpgate.io/>**
 
+**Watch the 2:30 demo:** <https://www.youtube.com/watch?v=e3AcOOKyRHE> — Warpgate + aionetiface in action, end-to-end.
+
 Warpgate is a 100% open-source Python 3 library for one-shot NAT traversal.
 Eight plugins, every major OS back to Windows XP, IPv4 and IPv6,
 multi-NIC, all in one library. No relays you have to run. No keys you
