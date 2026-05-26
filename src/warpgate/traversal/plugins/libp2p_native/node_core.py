@@ -170,6 +170,19 @@ class Libp2pNode(object):
             k=20, key_bits=256,
             key_fn=kad_mod.key_for_peer_id,
         )
+        # In-memory DHT key/value + provider store -- backs the
+        # responder side of GET_VALUE / PUT_VALUE / GET_PROVIDERS
+        # / ADD_PROVIDER.  Permanently present (no enable flag)
+        # because being a good Kad-DHT citizen means serving these
+        # requests for every connected peer.
+        self.kad_datastore = kad_mod.KadDatastore()
+        # Auto-dial peers discovered during Kad walks?  Off by
+        # default: the warpgate cascade use case introduces peers
+        # out-of-band (via MQTT) and we only want to talk to those.
+        # Public-mesh use cases (bootstrap to real IPFS, walk the
+        # global DHT) need it True so the walk actually progresses.
+        # Flip via ``enable_auto_dial_during_walks()``.
+        self.auto_dial_during_walks = False
         # Kad transport adapter (lazy-built on first use so plugin
         # imports don't pay the cost when DHT isn't used).
         self.kad_transport = None
@@ -189,6 +202,17 @@ class Libp2pNode(object):
         if self.autorelay is None:
             self.autorelay = autorelay_mod.AutoRelay(self, max_relays=max_relays)
         return self.autorelay
+
+    def enable_auto_dial_during_walks(self):
+        """Opt in to auto-dialling Kad-discovered peers during walks.
+
+        Needed for real public-mesh participation -- the walk only
+        progresses if we open sessions to each new peer the previous
+        hop's FIND_NODE response surfaced.  Off by default because
+        the warpgate cascade introduces peers via MQTT, where
+        spontaneous dials to random peers would defeat the point.
+        """
+        self.auto_dial_during_walks = True
 
     def set_autonat_dialer(self, dialer):
         """Plug in the dial-back function for AutoNAT server handling.
@@ -462,6 +486,225 @@ class Libp2pNode(object):
             timeout=timeout,
         )
 
+    async def walk_toward_key(self, key, timeout=30.0):
+        """Iterative-find-node walk targeting an arbitrary kad key.
+
+        Same machinery as ``find_peer`` but the key isn't required
+        to be a peer hash -- can be a content hash, an IPNS key,
+        whatever.  Returns the K closest peers we found that we
+        currently have a Kad path to.
+        """
+        from ....kademlia.lookup import iterative_find_node
+        transport = self.get_kad_transport()
+        return await asyncio.wait_for(
+            iterative_find_node(self.kad_routing_table, key, transport),
+            timeout=timeout,
+        )
+
+    async def put_value(self, key, value, time_received_str=None, timeout=30.0):
+        """Publish ``value`` at ``key`` to the K closest peers in the DHT.
+
+        Walks toward ``key`` first to discover the K closest peers
+        we can reach, then issues PUT_VALUE in parallel to each.
+        Returns the count of peers that accepted (didn't raise).
+
+        ``time_received_str`` is the RFC3339 timestamp field in
+        the Record; if omitted we generate one from the local
+        clock.  Most go-libp2p validators are permissive on this.
+
+        ``key`` is the application-level key (arbitrary bytes).
+        The kad-keyspace routing key (used to find the closest K
+        peers) is ``SHA-256(key)`` per libp2p Kad-DHT convention;
+        the wire-level Message.key field carries the original
+        bytes unchanged.
+        """
+        import time as time_mod
+        import hashlib
+        if time_received_str is None:
+            time_received_str = time_mod.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time_mod.gmtime()
+            )
+        routing_key = hashlib.sha256(key).digest()
+        # Walk to closest K candidates.
+        closest = await self.walk_toward_key(routing_key, timeout=timeout)
+        if not closest:
+            return 0
+        record_bytes = kad_mod.encode_record(key, value, time_received_str)
+        transport = self.get_kad_transport()
+
+        async def put_one(peer):
+            try:
+                await transport.put_value(peer, key, record_bytes)
+                return True
+            except (ConnectionError, OSError, ValueError, asyncio.TimeoutError):
+                return False
+
+        results = await asyncio.gather(
+            *(put_one(p) for p in closest), return_exceptions=True,
+        )
+        # Also store locally -- if we're one of the K closest, we
+        # SHOULD have it; if we're not, having a local copy still
+        # helps when peers query us as a closer-but-not-closest
+        # peer along their walk.
+        try:
+            self.kad_datastore.put_value(key, value, time_received_str)
+        except ValueError:
+            pass
+        return sum(1 for r in results if r is True)
+
+    async def get_value(self, key, timeout=30.0, max_rounds=12):
+        """Look up ``key`` in the DHT; return the value bytes or None.
+
+        Iterative walk: at each step query GET_VALUE on the closest
+        unqueried peer; if the peer has the record, return it; else
+        merge the returned closer_peers into our candidate set and
+        continue.  Returns None if no peer has a record after the
+        K-closest set has been exhausted.
+
+        Checks the local datastore first (we may have authored the
+        record ourselves via a prior put_value, or held an
+        in-progress provider record).
+        """
+        local_value, _ = self.kad_datastore.get_value(key)
+        if local_value is not None:
+            return local_value
+
+        from ....kademlia.distance import xor_distance
+        import hashlib
+        routing_key = hashlib.sha256(key).digest()
+        transport = self.get_kad_transport()
+        candidates = list(self.kad_routing_table.find_closest(
+            routing_key, self.kad_routing_table.k,
+        ))
+        if not candidates:
+            return None
+        queried = set()
+        deadline = asyncio.get_event_loop().time() + timeout
+        for _ in range(max_rounds):
+            unq = [p for p in candidates if p.peer_id not in queried]
+            if not unq:
+                return None
+            if asyncio.get_event_loop().time() > deadline:
+                return None
+            peer = unq[0]
+            queried.add(peer.peer_id)
+            try:
+                value, _time_str, closer = await transport.get_value(peer, key)
+            except (ConnectionError, OSError, ValueError, asyncio.TimeoutError):
+                continue
+            if value is not None:
+                return value
+            for fresh in closer:
+                if fresh.peer_id == self.identity.peer_id:
+                    continue
+                if any(c.peer_id == fresh.peer_id for c in candidates):
+                    continue
+                candidates.append(fresh)
+                self.kad_routing_table.add_peer(fresh)
+            candidates.sort(
+                key=lambda c: xor_distance(
+                    self.kad_routing_table.key_fn(c.peer_id), routing_key,
+                )
+            )
+            if len(candidates) > self.kad_routing_table.k:
+                candidates = candidates[:self.kad_routing_table.k]
+        return None
+
+    async def provide(self, key, timeout=30.0):
+        """Announce that we provide content addressable as ``key``.
+
+        Walks toward key, then ADD_PROVIDER on the K closest peers
+        we can reach.  Also stores the provider record locally so
+        peers querying us as a closer-but-not-closest peer get
+        served too.  Returns count of peers that accepted.
+        """
+        import time as time_mod
+        import hashlib
+        routing_key = hashlib.sha256(key).digest()
+        closest = await self.walk_toward_key(routing_key, timeout=timeout)
+        addrs = list(self.listen_multiaddrs)
+        # Local provider record.
+        self.kad_datastore.add_provider(
+            key, self.identity.peer_id, addrs, int(time_mod.time()),
+        )
+        if not closest:
+            return 0
+        transport = self.get_kad_transport()
+
+        async def announce_one(peer):
+            try:
+                await transport.add_provider(
+                    peer, key, self.identity.peer_id, addrs,
+                )
+                return True
+            except (ConnectionError, OSError, ValueError, asyncio.TimeoutError):
+                return False
+
+        results = await asyncio.gather(
+            *(announce_one(p) for p in closest), return_exceptions=True,
+        )
+        return sum(1 for r in results if r is True)
+
+    async def find_providers(self, key, max_providers=20, timeout=30.0):
+        """Look up provider records for ``key`` in the DHT.
+
+        Returns a list of ``PeerInfo`` of peers that claim to
+        provide the content addressable as key.  May return fewer
+        than ``max_providers`` if the DHT walk terminates earlier.
+        Local providers (we have one ourselves, or someone
+        announced to us) are surfaced first.
+        """
+        from ....kademlia.routing import PeerInfo as RPeerInfo
+        from ....kademlia.distance import xor_distance
+        import hashlib
+        routing_key = hashlib.sha256(key).digest()
+        out = []
+        local_provs = self.kad_datastore.get_providers(key)
+        for pid, addrs in local_provs:
+            out.append(RPeerInfo(pid, addrs=addrs))
+        if len(out) >= max_providers:
+            return out[:max_providers]
+
+        transport = self.get_kad_transport()
+        candidates = list(self.kad_routing_table.find_closest(
+            routing_key, self.kad_routing_table.k,
+        ))
+        queried = set()
+        deadline = asyncio.get_event_loop().time() + timeout
+        for _ in range(12):
+            unq = [p for p in candidates if p.peer_id not in queried]
+            if not unq:
+                break
+            if asyncio.get_event_loop().time() > deadline:
+                break
+            peer = unq[0]
+            queried.add(peer.peer_id)
+            try:
+                provs, closer = await transport.get_providers(peer, key)
+            except (ConnectionError, OSError, ValueError, asyncio.TimeoutError):
+                continue
+            for p in provs:
+                if any(o.peer_id == p.peer_id for o in out):
+                    continue
+                out.append(p)
+                if len(out) >= max_providers:
+                    return out
+            for fresh in closer:
+                if fresh.peer_id == self.identity.peer_id:
+                    continue
+                if any(c.peer_id == fresh.peer_id for c in candidates):
+                    continue
+                candidates.append(fresh)
+                self.kad_routing_table.add_peer(fresh)
+            candidates.sort(
+                key=lambda c: xor_distance(
+                    self.kad_routing_table.key_fn(c.peer_id), routing_key,
+                )
+            )
+            if len(candidates) > self.kad_routing_table.k:
+                candidates = candidates[:self.kad_routing_table.k]
+        return out
+
     async def reserve_via_relay(self, session, timeout=10.0):
         """Use ``session`` (a Libp2pSession to a relay) to RESERVE a slot.
 
@@ -603,7 +846,8 @@ class Libp2pNode(object):
                 pass
             self.inbound_pipestreams.pop(cpid, None)
 
-    async def dial(self, dest_ip, dest_port, route, expected_peer_id=None, timeout=15.0):
+    async def dial(self, dest_ip, dest_port, route, expected_peer_id=None,
+                   timeout=15.0, open_app_stream=True):
         """Open a libp2p connection to (dest_ip, dest_port) over ``route``.
 
         Returns (stream, remote_peer_id, session) on success, raises
@@ -658,13 +902,22 @@ class Libp2pNode(object):
             )
             self.on_session_established(session)
             # Open the application stream + negotiate /warpgate/relay/1.0.0.
-            stream = await mux.open_stream()
-            chosen_app = await negotiate_initiator(stream, stream, [APP_PROTOCOL])
-            if chosen_app != APP_PROTOCOL:
-                raise ConnectionError("libp2p_native: dial app mismatch")
+            # ``open_app_stream=False`` skips this -- useful when
+            # dialing a non-warpgate libp2p peer for the purpose of
+            # using Identify or Kad queries on the session (where
+            # the peer obviously doesn't speak our private app
+            # protocol).  In that case ``stream`` is None in the
+            # returned tuple.
+            stream = None
+            if open_app_stream:
+                stream = await mux.open_stream()
+                chosen_app = await negotiate_initiator(stream, stream, [APP_PROTOCOL])
+                if chosen_app != APP_PROTOCOL:
+                    raise ConnectionError("libp2p_native: dial app mismatch")
             log(fstr(
-                "libp2p_native: dial handshake complete to peer_id={0} at {1}:{2} sec={3}",
-                (remote_peer_id.hex()[:16], dest_ip, dest_port, chosen_sec),
+                "libp2p_native: dial handshake complete to peer_id={0} at {1}:{2} sec={3} app={4}",
+                (remote_peer_id.hex()[:16], dest_ip, dest_port, chosen_sec,
+                 "yes" if open_app_stream else "no"),
             ))
             return stream, remote_peer_id, session
         except (ConnectionError, asyncio.TimeoutError, OSError, ValueError):

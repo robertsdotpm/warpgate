@@ -286,11 +286,17 @@ def encode_noise_payload(identity, static_pubkey, early_data=b""):
 def decode_and_verify_noise_payload(payload_bytes, static_pubkey):
     """Decode a peer's NoiseHandshakePayload and verify the signed-static-key.
 
-    Returns ``(peer_id_bytes, ed25519_pubkey_bytes)`` -- the peer's
-    canonical libp2p PeerID + their raw Ed25519 public key.  Raises
-    ConnectionError on any verification failure.  ``static_pubkey`` is
-    the peer's X25519 static key as observed during the Noise
-    handshake (the ``rs`` field of HandshakeState).
+    Returns ``(peer_id_bytes, identity_key_bytes)``.  For Ed25519
+    keys ``identity_key_bytes`` is the raw 32-byte Ed25519 public
+    key; for RSA keys it's the marshalled DER SubjectPublicKeyInfo
+    blob (callers that just want a PeerID don't care which).
+
+    Supports BOTH Ed25519 (modern libp2p default, ``12D3...`` PeerIDs)
+    and RSA-PKCS#1-v1.5-SHA256 (legacy IPFS default, ``Qm...``
+    PeerIDs).  Real-world IPFS bootstrap peers are still RSA, so
+    we need both to interoperate.
+
+    Raises ConnectionError on any verification failure.
     """
     fields = pb_lite.parse_message(payload_bytes)
     if 1 not in fields or 2 not in fields:
@@ -298,16 +304,23 @@ def decode_and_verify_noise_payload(payload_bytes, static_pubkey):
     pubkey_marshalled = fields[1][-1]
     identity_sig = fields[2][-1]
     key_type, key_bytes = pb_lite.decode_public_key(pubkey_marshalled)
-    if key_type != pb_lite.KEY_TYPE_ED25519:
-        raise ConnectionError("noise payload key type not Ed25519")
-    if len(key_bytes) != 32:
-        raise ConnectionError("noise payload Ed25519 key wrong length")
     sig_payload = SIG_PREFIX + static_pubkey
-    if not verify_signature(key_bytes, sig_payload, identity_sig):
-        raise ConnectionError("noise payload identity_sig verification failed")
-    # Derive PeerID multihash from the marshalled PublicKey (same
-    # codepath as ``peer_id.peer_id_from_pubkey``, repeated here so
-    # noise.py doesn't drag in peer_id.* private helpers).
+
+    if key_type == pb_lite.KEY_TYPE_ED25519:
+        if len(key_bytes) != 32:
+            raise ConnectionError("noise payload Ed25519 key wrong length")
+        if not verify_signature(key_bytes, sig_payload, identity_sig):
+            raise ConnectionError("noise payload identity_sig verification failed")
+    elif key_type == pb_lite.KEY_TYPE_RSA:
+        from .rsa_verify import verify_libp2p_rsa_signature
+        if not verify_libp2p_rsa_signature(key_bytes, sig_payload, identity_sig):
+            raise ConnectionError(
+                "noise payload RSA identity_sig verification failed"
+            )
+    else:
+        raise ConnectionError(
+            "noise payload key type {0} unsupported (only Ed25519/RSA)".format(key_type)
+        )
     from .peer_id import peer_id_from_pubkey
     return peer_id_from_pubkey(pubkey_marshalled), key_bytes
 

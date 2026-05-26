@@ -124,9 +124,15 @@ async def dial_one_bootstrap(node, ma_text, iface, timeout):
         log_exception()
         return None
     try:
+        # Bootstrap dials a non-warpgate libp2p peer; we want the
+        # session for Identify / Kad use, NOT for our private
+        # /warpgate/relay/1.0.0 app stream (which the peer obviously
+        # won't speak).  open_app_stream=False keeps the handshake
+        # to Noise + yamux + the side-stream dispatcher only.
         _stream, _remote_pid, session = await node.dial(
             ip, port, route,
             expected_peer_id=peer_id, timeout=timeout,
+            open_app_stream=False,
         )
     except (OSError, ConnectionError, asyncio.TimeoutError, ValueError):
         return None
