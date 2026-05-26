@@ -957,17 +957,22 @@ async def phase4_turn(
     cap=TURN_TOTAL_CAP,
     route_types=None,
 ):
-    """Sequential TURN attempts, cap total attempts.
+    """Sequential relay attempts -- TURN first, then any other
+    registered phase=relay plugin (yggdrasil_native, ...).
 
-    Iterate AFs (IP4 then IP6). For each AF, walk our NICs in nat_type
-    order. Pick the first dest NIC with which we form a valid
-    EXT_BIND pair and that we haven't paired with yet. Fall back to a
-    previously-used dest NIC only if every fresh option is invalid.
-    Stop as soon as we hit `cap` total attempts.
+    Each relay plugin gets its own ``cap`` attempts to find a
+    working (AF, NIC-pair) combo.  TURN runs first because it
+    converges fastest when a working server exists; on TURN
+    exhaustion the cascade falls through to the next relay --
+    typically yggdrasil_native, which uses an in-process pure-
+    Python Yggdrasil overlay against a hardcoded public peer set
+    as a last-resort relay path that doesn't depend on any
+    operator-run infrastructure.
 
-    `route_types` (frozenset or None): TURN is intrinsically EXT_BIND;
-    if a non-None route_types is passed that excludes EXT_BIND, this
-    phase short-circuits to (None, None).
+    `route_types` (frozenset or None): all relay plugins are
+    intrinsically EXT_BIND; if a non-None route_types is passed
+    that excludes EXT_BIND, this phase short-circuits to (None,
+    None).
     """
     # TURN only operates EXT_BIND -- if the caller restricted the
     # cascade to LAN-side route_types (NIC_BIND / LOOPBACK_BIND only),
@@ -977,16 +982,38 @@ async def phase4_turn(
     relay_names = [n for n in plugins_for_phase("relay") if n in plugins]
     if not relay_names:
         return None, None
-    # Phase 4 is single-plugin sequential. If multiple relay plugins
-    # exist in the registry they'd need a different scheduler; for now
-    # pick the first registered one.
-    relay_name = relay_names[0]
-    if relay_name not in node.traversal.plugin_loaders:
-        return None, None
-    loader = node.traversal.plugin_loaders[relay_name]
-    if not plugin_supports_route_type(loader, EXT_BIND):
-        return None, None
+    # Try each registered relay plugin in registration order.  TURN
+    # comes first (alphabetical sort in plugin_loader); if TURN
+    # exhausts its attempts without producing a pipe, fall through
+    # to yggdrasil_native (or any other future relay) so the
+    # cascade has a real overlay fallback instead of giving up.
+    for relay_name in relay_names:
+        if relay_name not in node.traversal.plugin_loaders:
+            continue
+        loader = node.traversal.plugin_loaders[relay_name]
+        if not plugin_supports_route_type(loader, EXT_BIND):
+            continue
+        pipe, plugin = await relay_phase_attempt(
+            node, src_map, dest_map, sig_pipe,
+            relay_name, loader, cap,
+        )
+        if pipe is not None:
+            return pipe, plugin
 
+    return None, None
+
+
+async def relay_phase_attempt(
+    node, src_map, dest_map, sig_pipe,
+    relay_name, loader, cap,
+):
+    """Single-relay walk -- iterate (AF, NIC-pair) combos for one plugin.
+
+    Extracted from the body of phase4_turn so the outer loop can
+    try multiple relay plugins in sequence (turn → yggdrasil_native
+    → ...) until one succeeds.  Honours the per-plugin attempt cap
+    so a single plugin can't starve the others.
+    """
     timeout = plugin_timeout(loader)
     attempts = 0
 
@@ -1025,8 +1052,8 @@ async def phase4_turn(
             used_dests.add(id(chosen))
             attempts += 1
             log(fstr(
-                "auto_connect: phase4 turn af={0} attempt={1}/{2}",
-                (af, attempts, cap),
+                "auto_connect: phase4 {0} af={1} attempt={2}/{3}",
+                (relay_name, af, attempts, cap),
             ))
             pipe, plugin = await race_combos(
                 node, sig_pipe, src_map, dest_map,
