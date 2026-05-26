@@ -60,31 +60,45 @@ class BufferedReader(object):
     async def fill_some(self, timeout=None):
         """Pull one chunk of bytes from the Pipe into the buffer.
 
-        Returns the number of bytes added (0 on EOF / closed).
-        ``timeout`` overrides ``default_timeout`` for this single
-        fill; falls through to the Pipe's own default if both are
-        None.  Raises ``PipeClosed`` if the Pipe has been torn
-        down explicitly.
+        Returns the number of bytes added.  Raises ``PipeClosed``
+        if the underlying pipe has gone away or signalled close.
+
+        ``aionetiface.Pipe.recv`` returns ``None`` on both timeout
+        AND on close, so a None alone isn't enough to distinguish
+        the two.  We treat None as "still alive, no bytes yet"
+        and keep waiting -- our callers wrap us in
+        ``asyncio.wait_for(...)`` for the overall deadline.  The
+        only way to bail out is the Pipe raising an OSError /
+        ConnectionError or the caller's outer wait_for tripping
+        and cancelling us.
         """
         if self.closed:
             raise PipeClosed("BufferedReader: pipe already closed")
         self.ensure_subscribed()
         use_timeout = timeout if timeout is not None else self.default_timeout
-        try:
-            if use_timeout is None:
-                # Pipe.recv's own default timeout (NET_CONF recv_timeout=4s)
-                # will apply.  Pass-through path.
-                chunk = await self.pipe.recv(SUB_ALL)
-            else:
-                chunk = await self.pipe.recv(SUB_ALL, timeout=use_timeout)
-        except asyncio.CancelledError:
-            raise
-        except (OSError, ConnectionError):
-            return 0
-        if chunk is None:
-            return 0
-        self.buf.extend(chunk)
-        return len(chunk)
+        while True:
+            try:
+                if use_timeout is None:
+                    chunk = await self.pipe.recv(SUB_ALL)
+                else:
+                    chunk = await self.pipe.recv(SUB_ALL, timeout=use_timeout)
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ConnectionError):
+                raise PipeClosed("BufferedReader: pipe raised")
+            if chunk is None:
+                # Could be timeout (more bytes still coming) OR true
+                # close.  Sniff by checking sock state if the Pipe
+                # exposes one; otherwise loop and let the outer
+                # wait_for cap our wait.
+                sock = getattr(self.pipe, "sock", None)
+                if sock is None:
+                    raise PipeClosed("BufferedReader: pipe has no sock")
+                # No chunk yet; yield + retry.  Don't hot-spin --
+                # recv's own timeout means we slept at least a bit.
+                continue
+            self.buf.extend(chunk)
+            return len(chunk)
 
     async def read_exact(self, n, timeout=None):
         """Read exactly ``n`` bytes.  Raises ``PipeClosed`` on EOF.

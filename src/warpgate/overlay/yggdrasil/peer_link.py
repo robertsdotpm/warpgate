@@ -336,13 +336,22 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
                               deadline=HANDSHAKE_DEADLINE_SECONDS):
     """Drive a Yggdrasil version_metadata handshake on an open Pipe.
 
-    Returns the peer's VersionMetadata on success.  Raises
+    Returns ``(remote_meta, leftover_bytes)`` on success.  Raises
     ``HandshakeError`` on protocol-level failure, ``LinkToSelf``
     on self-connect, ``asyncio.TimeoutError`` on deadline expiry.
 
-    The handshake uses pull-mode reads via BufferedReader.  AFTER
-    the handshake returns, the caller should install msg_cb on the
-    Pipe (the PeerLink wrapper does this in ``install_msg_cb``).
+    Receive side uses an ``add_msg_cb`` from the moment we hand
+    over to ``do_handshake`` so bytes arriving immediately after
+    TCP accept (which happens BEFORE any BufferedReader could
+    subscribe) land in our buffer instead of being dropped by
+    ``stream.add_msg`` for-no-subscribers.  This is the same
+    push-mode pattern used post-handshake by ``PeerLink``; we
+    just do it from the very first byte.
+
+    AFTER this function returns, the caller installs its own
+    msg_cb for the steady-state packet stream -- our handshake
+    cb is removed via ``del_msg_cb`` before we return so the
+    PeerLink-side cb sees a clean stream.
     """
     if not isinstance(public_key, (bytes, bytearray)):
         raise ValueError("public_key must be bytes")
@@ -355,20 +364,54 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
     )
     wire = meta.encode(bytes(private_seed), password=bytes(password))
 
+    # msg_cb-fed buffer + an Event that fires every time bytes land,
+    # so the handshake reader can wake up promptly without polling.
+    incoming = bytearray()
+    bytes_arrived = asyncio.Event()
+    closed_flag = [False]
+
+    def on_bytes(data, client_tup, pipe_arg):
+        """Fire-and-forget byte accumulator -- runs from data_received."""
+        if not data:
+            return
+        incoming.extend(data)
+        bytes_arrived.set()
+
+    # Atomically drain any bytes the SUB_ALL queue already buffered
+    # (between pipe.connect and now) into our msg_cb, then route
+    # future bytes through the cb.  Without the drain, a peer that
+    # pipelines its handshake reply onto the tail of our connect()
+    # would have those bytes sit in the SUB_ALL queue forever (we
+    # never call pipe.recv -- we're push-mode now).  pipe.handoff_to_cb
+    # is the only safe atomic version of "drain + switch to push".
+    pipe.handoff_to_cb(on_bytes)
+
+    async def wait_for_n(n):
+        """Block until ``incoming`` has at least ``n`` bytes."""
+        while len(incoming) < n:
+            bytes_arrived.clear()
+            if closed_flag[0]:
+                raise HandshakeError(
+                    "handshake: pipe closed during read"
+                )
+            await bytes_arrived.wait()
+        head = bytes(incoming[:n])
+        del incoming[:n]
+        return head
+
     async def do_handshake():
         sent = await pipe.send(wire)
         if sent in (None, 0):
             raise HandshakeError("handshake: pipe send returned 0")
 
-        reader = BufferedReader(pipe)
-        head = await reader.read_exact(HEADER_LEN)
+        head = await wait_for_n(HEADER_LEN)
         if head[:4] != PREAMBLE:
             raise HandshakeError(ERR_INVALID_PREAMBLE)
         import struct
         body_len = struct.unpack(">H", head[4:6])[0]
         if body_len < 64:
             raise HandshakeError(ERR_INVALID_LENGTH)
-        body = await reader.read_exact(body_len)
+        body = await wait_for_n(body_len)
         remote_meta = VersionMetadata.decode(
             head + body, password=bytes(password),
         )
@@ -382,15 +425,22 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
             ))
         if remote_meta.public_key == bytes(public_key):
             raise LinkToSelf("handshake: remote pubkey equals local")
-        # IMPORTANT: any bytes the BufferedReader has already pulled
-        # past the handshake (because TCP coalesced them) need to
-        # be replayed into the parser when we install msg_cb.  Hand
-        # them back so the caller can seed the parser.
-        leftover = bytes(reader.buf)
-        reader.close()
-        return remote_meta, leftover
+        # Any bytes accumulated past the handshake (because the
+        # peer pipelined an early post-handshake packet onto the
+        # tail of its meta wire) need to be replayed into the
+        # PeerLink's parser when the caller installs its own cb.
+        return remote_meta, bytes(incoming)
 
-    return await asyncio.wait_for(do_handshake(), timeout=deadline)
+    try:
+        result = await asyncio.wait_for(do_handshake(), timeout=deadline)
+    finally:
+        # Remove our handshake cb so the PeerLink-installed cb sees
+        # a clean stream.  Safe to call even if we failed mid-handshake.
+        try:
+            pipe.del_msg_cb(on_bytes)
+        except Exception:
+            pass
+    return result
 
 
 async def open_outbound(dest_addr, dest_port, route,
