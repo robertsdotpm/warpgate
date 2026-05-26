@@ -243,9 +243,14 @@ class EncryptedPacketConn(object):
         # Pending app sends to peers we haven't yet established a
         # session with -- buffered until the ack arrives.
         self.pending_buffers = {}  # peer_ed_pub -> list[message]
-        # Inbox of decrypted (peer_ed_pub, message) tuples.
+        # Per-peer inbound queues.  ``read_from()`` drains the
+        # shared catch-all queue (any peer); ``read_from_peer(pk)``
+        # drains a peer-specific queue.  This eliminates the
+        # earlier "shared inbox loses other peer's traffic" race
+        # when multiple plugin instances share one PacketConn.
         import asyncio
         self.inbox = asyncio.Queue()
+        self.per_peer_inbox = {}  # peer_ed_pub -> asyncio.Queue
         # Wire ourselves into the router's traffic inbox.
         self.dispatch_task = asyncio.ensure_future(self.dispatch_loop())
 
@@ -342,7 +347,12 @@ class EncryptedPacketConn(object):
             return
         msg = opened[BOX_PUB_SIZE:]
         import asyncio
+        # Always feed the shared inbox AND the per-peer inbox.
+        # Both are unbounded so neither blocks the cb path.
         asyncio.ensure_future(self.inbox.put((bytes(source), msg)))
+        peer_q = self.per_peer_inbox.get(bytes(source))
+        if peer_q is not None:
+            asyncio.ensure_future(peer_q.put(msg))
 
     async def write_to(self, peer_ed_pub, message):
         """Encrypt + send ``message`` to ``peer_ed_pub`` (routes via the tree)."""
@@ -398,8 +408,50 @@ class EncryptedPacketConn(object):
             log_exception()
 
     async def read_from(self):
-        """Await one decrypted (peer_ed_pub, message) pair."""
+        """Await one decrypted (peer_ed_pub, message) pair from ANY peer."""
         return await self.inbox.get()
+
+    def open_peer_channel(self, peer_ed_pub):
+        """Open a per-peer inbound queue + return the Queue object.
+
+        Once a peer channel is open, every inbound packet from
+        ``peer_ed_pub`` lands in BOTH the shared inbox AND the
+        peer-specific queue.  Plugin instances should use the
+        peer-specific queue so they don't drop each other's
+        traffic on a shared PacketConn.  Idempotent: re-opening
+        for the same peer returns the existing queue.
+        """
+        import asyncio
+        key = bytes(peer_ed_pub)
+        q = self.per_peer_inbox.get(key)
+        if q is None:
+            q = asyncio.Queue()
+            self.per_peer_inbox[key] = q
+        return q
+
+    def close_peer_channel(self, peer_ed_pub):
+        """Drop the per-peer inbound queue for ``peer_ed_pub``."""
+        self.per_peer_inbox.pop(bytes(peer_ed_pub), None)
+
+    async def read_from_peer(self, peer_ed_pub, timeout=None):
+        """Await the next decrypted message from a SPECIFIC peer.
+
+        Caller must have called ``open_peer_channel`` first.
+        Returns None on timeout.
+        """
+        import asyncio
+        key = bytes(peer_ed_pub)
+        q = self.per_peer_inbox.get(key)
+        if q is None:
+            raise RuntimeError(
+                "read_from_peer: no channel open for this peer"
+            )
+        try:
+            if timeout is None:
+                return await q.get()
+            return await asyncio.wait_for(q.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
 
     async def close(self):
         if self.dispatch_task is not None:

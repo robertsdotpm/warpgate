@@ -597,7 +597,10 @@ class ActiveRouter(object):
             return
         next_link = self.lookup_next_hop(tr.path)
         if next_link is None:
-            raise OSError("router.forward_outbound_traffic: no next hop")
+            # No next hop -- buffer-and-retry would belong here, but
+            # the pathfinder already buffers in its rumor map, so
+            # silently drop and let the next path_notify drive a retry.
+            return
         await self.send_packet_safe(next_link, WIRE_TRAFFIC, tr.encode())
 
     # -------- bloom filter helpers ---------------------------------------
@@ -680,29 +683,23 @@ class ActiveRouter(object):
     # -------- outbound traffic helper ------------------------------------
 
     async def send_to(self, dest_pubkey, payload):
-        """Send application-level payload to ``dest_pubkey`` via the tree.
+        """Send application-level payload to ``dest_pubkey`` via the overlay.
 
-        Looks up the path from root → dest, builds a Traffic
-        packet, hands to the next-hop peer (or delivers
-        locally if dest is us).
+        Delegates to the pathfinder which handles both cached-path
+        fast path AND cold-start (issue path_lookup via bloom
+        multicast + buffer the traffic until path_notify lands).
+        Loopback short-circuit for self-addressed packets.
         """
         if bytes(dest_pubkey) == bytes(self.public_key):
-            # Loopback.
             await self.inbox.put((self.public_key, bytes(payload)))
             return
-        _, path = self.get_root_and_path(dest_pubkey)
-        if path is None:
-            # Don't know how to reach dest yet.
-            raise OSError("router.send_to: no route to dest")
         tr = Traffic(
-            path=path, from_path=[],
+            path=[],          # filled by pathfinder if cached
+            from_path=[],     # filled by pathfinder
             source=self.public_key, dest=bytes(dest_pubkey),
             watermark=0, payload=bytes(payload),
         )
-        next_link = self.lookup_next_hop(path)
-        if next_link is None:
-            raise OSError("router.send_to: no next hop")
-        await next_link.send_packet(WIRE_TRAFFIC, tr.encode())
+        await self.pathfinder.handle_outbound_traffic(tr)
 
     # -------- diagnostic helper ------------------------------------------
 
