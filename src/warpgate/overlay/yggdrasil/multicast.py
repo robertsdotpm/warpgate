@@ -87,8 +87,17 @@ class MulticastDiscovery(object):
     def __init__(self, node_core, password=b""):
         self.node_core = node_core
         self.password = bytes(password)
-        # Hash advertised in our beacon -- blake2b-512 of password.
-        self.hash_bytes = blake2b_hash(self.password, digest_size=64)
+        # Hash advertised in our beacon -- matches upstream
+        # multicast.go:214-230 exactly: blake2b-512 KEYED with the
+        # password, hashing OUR public key.  Both ends must agree on
+        # the password AND know each other's public key (carried in
+        # the beacon) for the hash compare to succeed.  Earlier this
+        # was wrongly computed as blake2b-512(password) which made
+        # us byte-incompatible with real yggdrasil peers.
+        self.hash_bytes = blake2b_hash(
+            self.node_core.public_key,
+            key=self.password, digest_size=64,
+        )
         self.pipe = None
         self.beacon_task = None
         self.listen_task = None
@@ -201,7 +210,16 @@ class MulticastDiscovery(object):
         if adv.public_key == self.node_core.public_key:
             return
         # Skip beacons from peers using a different password.
-        if adv.hash_bytes != self.hash_bytes:
+        # The hash carried in the beacon is
+        # blake2b-512-keyed(password)(SENDER's_pubkey) -- so we
+        # recompute it locally with OUR password and THEIR pubkey
+        # and compare.  This proves the sender knows the shared
+        # password without revealing it.  Mirrors upstream
+        # multicast.go:430-441 exactly.
+        expected = blake2b_hash(
+            adv.public_key, key=self.password, digest_size=64,
+        )
+        if adv.hash_bytes != expected:
             return
         # Version compat -- mirror upstream's check.
         if (adv.major_ver != PROTOCOL_VERSION_MAJOR

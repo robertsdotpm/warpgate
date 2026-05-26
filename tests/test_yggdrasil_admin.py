@@ -92,6 +92,123 @@ class TestAdminListCommand(AsyncTestCase):
         self.assertEqual(resp["status"], "error")
         self.assertEqual(resp["error"], "custom error message")
 
+    async def test_empty_request_name_returns_specific_error(self):
+        """Upstream admin.go:330-332 returns 'no request specified' when
+        the request field is empty -- distinct from 'unknown action'.
+        Verify we propagate that distinction so tooling that branches
+        on the error string gets the same answer.
+        """
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": ""},
+        )
+        self.assertEqual(resp["status"], "error")
+        self.assertIn("no request", resp["error"].lower())
+
+    async def test_standard_upstream_handlers_registered(self):
+        """All ~8 standard yggctl commands upstream registers in
+        admin.go:SetupAdminHandlers() must be present.  Earlier
+        revisions only had 3 (list/getself/getpeers); the missing
+        5 (getNodeInfo / getPaths / getSessions / getTree / addPeer
+        / removePeer) made ``yggctl`` against this socket error
+        out on common commands.
+        """
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": "list"},
+        )
+        self.assertEqual(resp["status"], "success")
+        commands = set(item["command"] for item in resp["response"]["list"])
+        for cmd in (
+            "list", "getself", "getpeers",
+            "getnodeinfo", "getpaths", "getsessions", "gettree",
+            "addpeer", "removepeer",
+        ):
+            self.assertIn(cmd, commands,
+                          "missing standard handler: " + cmd)
+
+    async def test_getnodeinfo_returns_dict(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": "getnodeinfo"},
+        )
+        self.assertEqual(resp["status"], "success")
+        self.assertIn("nodeinfo", resp["response"])
+
+    async def test_getpaths_returns_paths_list(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": "getpaths"},
+        )
+        self.assertEqual(resp["status"], "success")
+        self.assertIn("paths", resp["response"])
+        self.assertIsInstance(resp["response"]["paths"], list)
+
+    async def test_getsessions_returns_sessions_list(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": "getsessions"},
+        )
+        self.assertEqual(resp["status"], "success")
+        self.assertIn("sessions", resp["response"])
+        self.assertIsInstance(resp["response"]["sessions"], list)
+
+    async def test_gettree_returns_tree_list(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port, {"request": "gettree"},
+        )
+        self.assertEqual(resp["status"], "success")
+        self.assertIn("tree", resp["response"])
+        self.assertIsInstance(resp["response"]["tree"], list)
+
+    async def test_addpeer_without_uri_returns_clean_error(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port,
+            {"request": "addpeer", "arguments": {}},
+        )
+        self.assertEqual(resp["status"], "error")
+        self.assertIn("uri", resp["error"].lower())
+
+    async def test_removepeer_without_uri_returns_clean_error(self):
+        resp = await send_admin_request(
+            self.admin_host, self.admin_port,
+            {"request": "removepeer", "arguments": {}},
+        )
+        self.assertEqual(resp["status"], "error")
+        self.assertIn("uri", resp["error"].lower())
+
+    async def test_keepalive_allows_multiple_requests_on_single_conn(self):
+        """Upstream admin.go:354-358: ``if !req.KeepAlive break else continue``
+        keeps the connection open for repeated requests when the client
+        sets ``keepalive: true``.  Validate that two consecutive list
+        requests on the same TCP socket both succeed.
+        """
+        iface = Interface("default")
+        route = await iface.route(IP4).bind(ips="0.0.0.0", port=0)
+        pipe = Pipe(TCP, dest=(self.admin_host, self.admin_port), route=route)
+        await pipe.connect()
+        try:
+            pipe.subscribe(SUB_ALL)
+            buf = bytearray()
+            # Send TWO requests over the same connection.  Both must
+            # respond with a success line.
+            for i in range(2):
+                req = {"request": "list", "keepalive": True}
+                line = (json.dumps(req) + "\n").encode("utf-8")
+                await pipe.send(line)
+                while b"\n" not in buf:
+                    chunk = await pipe.recv(SUB_ALL, timeout=5)
+                    if chunk is None:
+                        self.fail(
+                            "keepalive: connection closed before request "
+                            + str(i),
+                        )
+                    buf.extend(chunk)
+                line_bytes, _, rest = bytes(buf).partition(b"\n")
+                buf = bytearray(rest)
+                resp = json.loads(line_bytes.decode("utf-8"))
+                self.assertEqual(
+                    resp["status"], "success",
+                    "keepalive: request " + str(i) + " failed",
+                )
+        finally:
+            await pipe.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,7 +58,13 @@ class AdminSocket(object):
         self.listener_pipe = None
         self.accept_task = None
         self.closed = False
-        # Register the standard handlers.
+        # Register the standard handlers.  These mirror the upstream
+        # set registered in admin.go:SetupAdminHandlers() so a stock
+        # ``yggctl`` client (or any code that targets the upstream
+        # JSON-RPC surface) talks to us unchanged.  Handlers that
+        # don't have a meaningful payload yet (no peer table yet,
+        # no path table yet) return empty lists -- mirrors upstream
+        # behaviour when those slots are empty.
         self.add_handler(
             "list", "List the admin commands available on this socket",
             [], self.handle_list,
@@ -69,7 +75,31 @@ class AdminSocket(object):
         )
         self.add_handler(
             "getpeers", "Return the list of currently-connected peers",
-            [], self.handle_getpeers,
+            ["sort"], self.handle_getpeers,
+        )
+        self.add_handler(
+            "getnodeinfo", "Return arbitrary node-info from this node",
+            [], self.handle_getnodeinfo,
+        )
+        self.add_handler(
+            "getpaths", "Show established paths through this node",
+            [], self.handle_getpaths,
+        )
+        self.add_handler(
+            "getsessions", "Show established traffic sessions with remote nodes",
+            [], self.handle_getsessions,
+        )
+        self.add_handler(
+            "gettree", "Show known tree entries from this node",
+            [], self.handle_gettree,
+        )
+        self.add_handler(
+            "addpeer", "Add a peer to the peer list",
+            ["uri", "interface"], self.handle_addpeer,
+        )
+        self.add_handler(
+            "removepeer", "Remove a peer from the peer list",
+            ["uri", "interface"], self.handle_removepeer,
         )
 
     def add_handler(self, name, desc, args, handler):
@@ -166,11 +196,21 @@ class AdminSocket(object):
         """Look up the handler, run it, build the response envelope."""
         name = str(req.get("request", "")).lower()
         args = req.get("arguments") or {}
+        # Mirror upstream admin.go:330-332: an empty ``request`` field
+        # is a distinct error case ("no request specified") rather
+        # than an unknown-command lookup miss.
+        if not name:
+            return {
+                "status": "error",
+                "error": "no request specified",
+                "request": req,
+                "response": {},
+            }
         handler_info = self.handlers.get(name)
         if handler_info is None:
             return {
                 "status": "error",
-                "error": "unknown command: " + name,
+                "error": "unknown action '" + name + "', try 'list' for help",
                 "request": req,
                 "response": {},
             }
@@ -242,6 +282,115 @@ class AdminSocket(object):
                 "bytes_recvd": entry.link.rx_bytes,
             })
         return {"peers": peers}
+
+    def handle_getnodeinfo(self, args):
+        """Return arbitrary opaque node-info -- matches upstream's getNodeInfo.
+
+        Upstream returns a json.RawMessage the operator sets via
+        config.NodeInfo.  We honour ``self.node_info`` if set,
+        otherwise return an empty dict (matches upstream's default).
+        """
+        info = getattr(self, "node_info", None)
+        if info is None:
+            info = {}
+        return {"nodeinfo": info}
+
+    def handle_getpaths(self, args):
+        """Return the per-destination path-table.
+
+        Empty if pathfinder hasn't formed any paths yet -- matches
+        upstream's behaviour when getPathsHandler finds no entries.
+        """
+        paths = []
+        try:
+            pf = getattr(self.node_core, "pathfinder", None)
+            if pf is not None and hasattr(pf, "paths"):
+                for dest, entry in pf.paths.items():
+                    paths.append({
+                        "key": bytes(dest).hex(),
+                        "path": list(getattr(entry, "path", [])),
+                    })
+        except (AttributeError, TypeError):
+            pass
+        return {"paths": paths}
+
+    def handle_getsessions(self, args):
+        """Return the live encrypted-sessions list.
+
+        Sources from the EncryptedPacketConn registered on ``self.pc``
+        if any -- otherwise empty (no sessions exist).  Matches
+        upstream's GetSessionsResponse shape.
+        """
+        sessions = []
+        pc = getattr(self, "pc", None)
+        if pc is not None:
+            try:
+                for peer_key, sess in pc.sessions.items():
+                    sessions.append({
+                        "key": bytes(peer_key).hex(),
+                        "bytes_sent": getattr(sess, "tx_bytes", 0),
+                        "bytes_recvd": getattr(sess, "rx_bytes", 0),
+                        "uptime": 0.0,
+                    })
+            except (AttributeError, TypeError):
+                pass
+        return {"sessions": sessions}
+
+    def handle_gettree(self, args):
+        """Return the known tree entries (announce table)."""
+        tree = []
+        try:
+            if self.router is not None and hasattr(self.router, "infos"):
+                for pub, info in self.router.infos.items():
+                    tree.append({
+                        "key": bytes(pub).hex(),
+                        "parent": (bytes(info.get_announce(pub).peerKey).hex()
+                                   if hasattr(info, "get_announce") else ""),
+                    })
+        except (AttributeError, TypeError):
+            pass
+        return {"tree": tree}
+
+    def handle_addpeer(self, args):
+        """Add a new outbound peer URI.
+
+        Mirrors upstream's addPeer (admin/addpeer.go) shape: accepts
+        ``uri`` (required) and optional ``interface``.  Delegates to
+        ``node_core.add_peer_uri`` if available.
+        """
+        uri = args.get("uri") if isinstance(args, dict) else None
+        if not uri:
+            raise AdminError("missing 'uri' argument")
+        interface = args.get("interface", "") if isinstance(args, dict) else ""
+        added = False
+        try:
+            adder = getattr(self.node_core, "add_peer_uri", None)
+            if adder is not None:
+                adder(uri, interface)
+                added = True
+        except Exception as exc:
+            raise AdminError("add_peer failed: " + str(exc))
+        if not added:
+            raise AdminError("node_core has no add_peer_uri method")
+        return {"added": [uri]}
+
+    def handle_removepeer(self, args):
+        """Remove an outbound peer URI -- mirrors upstream's removePeer."""
+        uri = args.get("uri") if isinstance(args, dict) else None
+        if not uri:
+            raise AdminError("missing 'uri' argument")
+        interface = args.get("interface", "") if isinstance(args, dict) else ""
+        removed = False
+        try:
+            remover = getattr(self.node_core, "remove_peer_uri", None)
+            if remover is not None:
+                remover(uri, interface)
+                removed = True
+        except Exception as exc:
+            raise AdminError("remove_peer failed: " + str(exc))
+        if not removed:
+            raise AdminError("node_core has no remove_peer_uri method")
+        return {"removed": [uri]}
 
     async def stop(self):
         if self.closed:

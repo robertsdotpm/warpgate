@@ -57,6 +57,11 @@ BOX_PRIV_SIZE = nacl_box.BOX_PRIV_SIZE
 BOX_OVERHEAD = nacl_box.BOX_OVERHEAD
 ED_SIG_SIZE = 64
 
+# Idle session lifetime -- matches upstream session.go const
+# sessionTimeout = time.Minute.  Sessions that haven't sent or
+# received traffic in this many seconds are reaped.
+SESSION_TIMEOUT = 60.0
+
 # sessionInitSize from upstream: 1 + boxPub + boxOverhead + edSig + boxPub*2 + 8 + 8
 SESSION_INIT_SIZE = 1 + BOX_PUB_SIZE + BOX_OVERHEAD + ED_SIG_SIZE + BOX_PUB_SIZE * 2 + 8 + 8
 
@@ -106,10 +111,23 @@ class SessionInit(object):
         self.key_seq = int(key_seq)
         self.seq = int(seq)
 
-    def encode(self, from_ed_seed, to_ed_pub, type_byte=SESSION_TYPE_INIT):
-        """Sign + encrypt the init/ack for transmission to ``to_ed_pub``."""
-        # Fresh box keypair for this init transmission.
-        from_box_priv, from_box_pub = nacl_box.generate_keypair()
+    def encode(self, from_ed_seed, to_ed_pub, type_byte=SESSION_TYPE_INIT,
+               test_ephemeral_box_keypair=None):
+        """Sign + encrypt the init/ack for transmission to ``to_ed_pub``.
+
+        ``test_ephemeral_box_keypair`` is a (priv, pub) tuple that
+        overrides the random ephemeral box keypair.  Test-only --
+        production callers always leave it ``None`` so the ephemeral
+        keypair comes from ``nacl_box.generate_keypair`` (os.urandom).
+        Vector tests pass a deterministic pair so the wire bytes are
+        reproducible across runs and across the Go reference impl.
+        """
+        # Fresh box keypair for this init transmission, unless tests
+        # have pinned one for byte-parity verification.
+        if test_ephemeral_box_keypair is None:
+            from_box_priv, from_box_pub = nacl_box.generate_keypair()
+        else:
+            from_box_priv, from_box_pub = test_ephemeral_box_keypair
         # Build the sig payload: from_box_pub || current || next ||
         # key_seq (8 BE) || seq (8 BE).
         sig_bytes = (from_box_pub + self.current + self.next
@@ -198,12 +216,22 @@ class SessionInfo(object):
         self.local_key_seq = 0
         self.seq = 0   # peer's seq (anti-replay for init)
         self.rotated_at = 0.0   # monotonic ts of last key rotation
+        # Monotonic timestamp of last in/out activity -- used by the
+        # session-timeout reaper to drop idle sessions, mirroring
+        # upstream's per-session time.AfterFunc(sessionTimeout) reset.
+        import time as _time
+        self.last_activity = _time.monotonic()
         # Precomputed shared keys -- regenerated on fix_shared.
         self.recv_shared = None
         self.send_shared = None
         self.next_send_shared = None
         self.next_recv_shared = None
         self.fix_shared()
+
+    def touch(self):
+        """Bump the activity timestamp -- called on every send/recv."""
+        import time as _time
+        self.last_activity = _time.monotonic()
 
     def fix_shared(self):
         """Recompute the four precomputed shared keys after a key change.
@@ -309,6 +337,51 @@ class EncryptedPacketConn(object):
         self.per_peer_inbox = {}  # peer_ed_pub -> asyncio.Queue
         # Wire ourselves into the router's traffic inbox.
         self.dispatch_task = asyncio.ensure_future(self.dispatch_loop())
+        # Per-peer session-timeout reaper -- drops idle sessions
+        # after SESSION_TIMEOUT seconds (matches upstream's
+        # time.AfterFunc(sessionTimeout) reset on every send/recv).
+        # Pending-send buffers are dropped after the same window so
+        # they don't grow without bound when the peer is unreachable.
+        self.pending_buffer_times = {}  # peer_ed_pub -> last-write monotonic ts
+        self.reaper_task = asyncio.ensure_future(self.reaper_loop())
+
+    async def reaper_loop(self):
+        """Periodically drop idle sessions + stale pending buffers.
+
+        Mirrors upstream session.go's per-session time.AfterFunc(
+        sessionTimeout) reset-on-activity pattern, but implemented
+        as one shared loop rather than one timer per session (to
+        keep the asyncio surface small).  Wakes every SESSION_TIMEOUT/2
+        and removes anything older than SESSION_TIMEOUT.
+        """
+        import asyncio
+        import time as _time
+        try:
+            while True:
+                await asyncio.sleep(SESSION_TIMEOUT / 2.0)
+                now = _time.monotonic()
+                # Drop idle sessions.
+                expired = []
+                for key, info in self.sessions.items():
+                    if now - info.last_activity > SESSION_TIMEOUT:
+                        expired.append(key)
+                for key in expired:
+                    self.sessions.pop(key, None)
+                # Drop stale pending buffers.  Upstream's
+                # _bufferAndInit installs a timer with the same
+                # sessionTimeout window so undeliverable sends
+                # don't accumulate without bound.
+                stale = []
+                for key, t in self.pending_buffer_times.items():
+                    if now - t > SESSION_TIMEOUT:
+                        stale.append(key)
+                for key in stale:
+                    self.pending_buffers.pop(key, None)
+                    self.pending_buffer_times.pop(key, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_exception()
 
     async def dispatch_loop(self):
         """Pull each routing-layer traffic packet, dispatch by session type."""
@@ -352,15 +425,35 @@ class EncryptedPacketConn(object):
             asyncio.ensure_future(self.send_raw(source, wire))
             # Flush any pending buffers for this peer.
             asyncio.ensure_future(self.flush_pending(source))
+        info.touch()
 
     def handle_ack(self, source, data):
-        info = self.session_for(source)
         ack = SessionInit.decode(data, self.box_priv, source)
         if ack is None:
             return
+        # Upstream session.go:113-124 (_handleAck): if no prior
+        # session existed for this peer, treat the ack as an init --
+        # i.e. ALSO send an ack back so the peer locks on (recovery
+        # path for the "our init reached them, their ack got lost
+        # then they sent another ack" case AND for the bootstrap-
+        # init-with-throwaway-keys recovery path).
+        was_known = bytes(source) in self.sessions
+        info = self.session_for(source)
         if info.handle_update(ack):
+            if not was_known:
+                # Treat as init: ack back with our send/next keys.
+                ack_init = SessionInit(
+                    current=info.send_pub, next_pub=info.next_pub,
+                    key_seq=info.local_key_seq,
+                    seq=int(time.time()),
+                )
+                wire = ack_init.encode(self.ed_seed, source,
+                                       type_byte=SESSION_TYPE_ACK)
+                import asyncio
+                asyncio.ensure_future(self.send_raw(source, wire))
             import asyncio
             asyncio.ensure_future(self.flush_pending(source))
+        info.touch()
 
     def handle_traffic(self, source, data):
         """Decode + decrypt one traffic packet from ``source``.
@@ -386,6 +479,16 @@ class EncryptedPacketConn(object):
         """
         info = self.sessions.get(bytes(source))
         if info is None:
+            # Mirror upstream session.go:_handleTraffic for the
+            # unknown-peer case (lines 131-140): the peer thinks
+            # we have a session but we don't (we restarted, or were
+            # spoofed).  Reply with an init containing FRESH
+            # throwaway keys -- if the peer is legit it'll ack with
+            # its own ack, we'll set up a session via the recovery
+            # path, and the peer's retry of the traffic packet will
+            # succeed.  If it was spoof, throwaway keys leak nothing.
+            import asyncio
+            asyncio.ensure_future(self.send_throwaway_init(source))
             return
         try:
             offset = 1
@@ -452,6 +555,7 @@ class EncryptedPacketConn(object):
         inner_key = opened[:BOX_PUB_SIZE]
         msg = opened[BOX_PUB_SIZE:]
         post_action(inner_key)
+        info.touch()
         import asyncio
         asyncio.ensure_future(self.inbox.put((bytes(source), msg)))
         peer_q = self.per_peer_inbox.get(bytes(source))
@@ -463,9 +567,14 @@ class EncryptedPacketConn(object):
         info = self.session_for(peer_ed_pub)
         if info.send_shared is None or info.current == b"\x00" * BOX_PUB_SIZE:
             # No session yet -- buffer + send an init.
+            import time as _time
             self.pending_buffers.setdefault(
                 bytes(peer_ed_pub), []
             ).append(bytes(message))
+            # Touch the buffer timestamp on every enqueue so a
+            # peer that becomes reachable gets the most recent
+            # backlog rather than a 60s-old one.
+            self.pending_buffer_times[bytes(peer_ed_pub)] = _time.monotonic()
             await self.send_init(peer_ed_pub)
             return
         await self.send_traffic(info, peer_ed_pub, message)
@@ -480,15 +589,38 @@ class EncryptedPacketConn(object):
                            type_byte=SESSION_TYPE_INIT)
         await self.send_raw(peer_ed_pub, wire)
 
+    async def send_throwaway_init(self, peer_ed_pub):
+        """Send an init with throwaway box keys -- recovery path.
+
+        Mirrors upstream session.go:135-138.  When traffic arrives
+        for an unknown peer, we send an init with FRESH keys we
+        immediately discard, so if the peer is a spoofer we leak
+        nothing.  If the peer is legit (we restarted while they
+        kept their session), they'll ack the init and a fresh
+        session is bootstrapped via the standard path.
+        """
+        throwaway_current_priv, throwaway_current_pub = nacl_box.generate_keypair()
+        throwaway_next_priv, throwaway_next_pub = nacl_box.generate_keypair()
+        init = SessionInit(
+            current=throwaway_current_pub,
+            next_pub=throwaway_next_pub,
+            key_seq=0, seq=int(time.time()),
+        )
+        wire = init.encode(self.ed_seed, peer_ed_pub,
+                           type_byte=SESSION_TYPE_INIT)
+        await self.send_raw(peer_ed_pub, wire)
+
     async def flush_pending(self, peer_ed_pub):
         info = self.session_for(peer_ed_pub)
         if info.send_shared is None:
             return
+        self.pending_buffer_times.pop(bytes(peer_ed_pub), None)
         for msg in self.pending_buffers.pop(bytes(peer_ed_pub), []):
             await self.send_traffic(info, peer_ed_pub, msg)
 
     async def send_traffic(self, info, peer_ed_pub, message):
         info.send_nonce += 1
+        info.touch()
         nonce = info.send_nonce
         nonce_bytes = (b"\x00" * 16) + nonce.to_bytes(8, "big")
         # Inner payload: our next_pub + the app message (lets the
@@ -564,3 +696,9 @@ class EncryptedPacketConn(object):
             except Exception:
                 pass
             self.dispatch_task = None
+        if getattr(self, "reaper_task", None) is not None:
+            try:
+                self.reaper_task.cancel()
+            except Exception:
+                pass
+            self.reaper_task = None
