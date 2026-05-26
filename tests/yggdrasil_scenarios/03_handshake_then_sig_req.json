@@ -1,0 +1,36 @@
+{
+  "actors": {
+    "A": {
+      "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "B": {
+      "seed_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "asserts": [],
+  "description": "Two-peer version_metadata exchange.  Each side sends its 'meta' preamble + signed handshake body, the other side verifies the ed25519 signature over blake2b-keyed(password)(pubkey), and both end up with peer pubkeys.  This is the first frame any peer link exchanges.  Then A sends a router sig_req -- A wants B to sign A's tree position so A can adopt B as parent.",
+  "frames": [
+    {
+      "comment": "A's handshake meta.  Layout: 4-byte 'meta' preamble + uint16 BE body length + TLV body (major+minor+pubkey+priority) + 64-byte ed25519 signature.  Signature is over blake2b-keyed(empty_password)(A_pubkey).",
+      "from": "A",
+      "kind": "version_metadata",
+      "to": "B",
+      "wire_hex": "6d657461007500000002000000010002000500020020d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370003000100ed113cff42c85fbbde03546828712592ddb7ea2b95a80c1245a50decba3ba47f04f4689abb9edff1916a3771c9d30b8a35c7955b20238c18cfab3ffea3510102"
+    },
+    {
+      "comment": "B's handshake reply -- same layout, B's pubkey, B's ed25519 signature.  Both sides may send concurrently; the order in this scenario is canonical-A-first but the protocol doesn't care.",
+      "from": "B",
+      "kind": "version_metadata",
+      "to": "A",
+      "wire_hex": "6d657461007500000002000000010002000500020020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00003000100d4d7275dadd8dcd31a8c24a9258737ed2d73c711967bf5377f0a0768979a137022d60d35d39b3053eab821612758568a976bbe30a100ef604eb7b0d815c88300"
+    },
+    {
+      "comment": "RouterSigReq(seq=1, nonce=0x12345678).  Body is varint(seq) + varint(nonce).  Type byte = WIRE_PROTO_SIG_REQ = 2.  Triggers B's handle_sig_req which constructs + signs a sig_res with port=A's port at B.",
+      "from": "A",
+      "kind": "sig_req",
+      "to": "B",
+      "wire_hex": "070201f8acd19101"
+    }
+  ],
+  "name": "handshake_then_sig_req"
+}

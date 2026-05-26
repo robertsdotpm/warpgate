@@ -1,0 +1,22 @@
+{
+  "actors": {
+    "A": {
+      "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "B": {
+      "seed_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "asserts": [],
+  "description": "Standalone scenario: a single multicast beacon advertisement on ff02::114:9001.  Layout: 2-byte major + 2-byte minor + 32-byte pubkey + 2-byte port + 2-byte hash_len + hash_len bytes hash.  Hash is blake2b-keyed(password)(pubkey) -- the keyed form was wrong in early versions (commit cad64b6 fixed it).",
+  "frames": [
+    {
+      "comment": "Multicast beacon advertising A's identity + listen port + password hash.  B's listener decodes this, checks the hash matches its own password derivation, and if so dials A's port + pubkey.",
+      "from": "A",
+      "kind": "multicast_beacon",
+      "to": "B",
+      "wire_hex": "00000005d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873723290040ac9ea8f75d9fa8716761a5fd24c78c9d57316da3607c99dcd31c5f536836e2dfcf73183112dc0075dd2b128b14ad0097e04eb25e7124043ee73f47d7109bbeef"
+    }
+  ],
+  "name": "multicast_beacon"
+}

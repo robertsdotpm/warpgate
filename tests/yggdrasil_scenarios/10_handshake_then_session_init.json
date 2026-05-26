@@ -1,0 +1,36 @@
+{
+  "actors": {
+    "A": {
+      "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "B": {
+      "seed_hex": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "asserts": [],
+  "description": "Two-peer version_metadata exchange.  Each side sends its 'meta' preamble + signed handshake body, the other side verifies the ed25519 signature over blake2b-keyed(password)(pubkey), and both end up with peer pubkeys.  This is the first frame any peer link exchanges.  Then A sends a SessionInit -- the first packet of an encrypted session.  Carries A's box pubkey + signed metadata, all sealed under ECDH(A's_ephemeral, B's_box_pub_from_ed_pub).",
+  "frames": [
+    {
+      "comment": "A's handshake meta.  Layout: 4-byte 'meta' preamble + uint16 BE body length + TLV body (major+minor+pubkey+priority) + 64-byte ed25519 signature.  Signature is over blake2b-keyed(empty_password)(A_pubkey).",
+      "from": "A",
+      "kind": "version_metadata",
+      "to": "B",
+      "wire_hex": "6d657461007500000002000000010002000500020020d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370003000100ed113cff42c85fbbde03546828712592ddb7ea2b95a80c1245a50decba3ba47f04f4689abb9edff1916a3771c9d30b8a35c7955b20238c18cfab3ffea3510102"
+    },
+    {
+      "comment": "B's handshake reply -- same layout, B's pubkey, B's ed25519 signature.  Both sides may send concurrently; the order in this scenario is canonical-A-first but the protocol doesn't care.",
+      "from": "B",
+      "kind": "version_metadata",
+      "to": "A",
+      "wire_hex": "6d657461007500000002000000010002000500020020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00003000100d4d7275dadd8dcd31a8c24a9258737ed2d73c711967bf5377f0a0768979a137022d60d35d39b3053eab821612758568a976bbe30a100ef604eb7b0d815c88300"
+    },
+    {
+      "comment": "SessionInit byte structure: [type=1][32-byte ephemeral box pub][nacl-box-sealed(64-byte ed sig || 32-byte current box pub || 32-byte next box pub || 8-byte BE key_seq || 8-byte BE seq)].  Sealed under ECDH(ephemeral_priv, ed25519_pk_to_curve25519(B_pub)).  Pinned ephemeral keypair for test reproducibility.",
+      "from": "A",
+      "kind": "session_init",
+      "to": "B",
+      "wire_hex": "017f115a43399180f6c05b02e1265fef92c2d91961b0cd3c6d8fa1cd001589fc0f2119a2ed72b50837075234698c53906dc2c492117dc23c98f9278bd313fefdbe7871d92f467f5fcd87de2c746d07e1205bd009ce8803f6fe1f9889576138cfb5022b98590e8ad05329af944c0bdf7768bfaf2b5cc5e0916cfca4cadb4bb4de60dea8ab393725a3703c53f89802827950279048aa567ad547819dec582fd8933bd9ebddf93cbdc3ede28bd7bbe7043c5d1c3ce88e7d16443a85ee55aa66866b0e"
+    }
+  ],
+  "name": "handshake_then_session_init"
+}

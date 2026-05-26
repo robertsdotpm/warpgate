@@ -144,8 +144,21 @@ class PeerLink(object):
     directly.
     """
 
-    def __init__(self, pipe, remote_meta, local_pubkey, link_type):
-        self.pipe = pipe
+    def __init__(self, transport, remote_meta, local_pubkey, link_type):
+        # v2: transport is a yggdrasil.transport.Transport (PipeTransport
+        # in production; LoopbackTransport / ReplayTransport in tests).
+        # The Transport interface gives us send/recv/close/msg_cb +
+        # closed_event uniformly across real and simulated I/O, so
+        # this code no longer has any pipe-specific knowledge.
+        #
+        # Backwards-compat: if a caller still passes a raw Pipe
+        # (older tests or warpgate plugin code that hasn't been
+        # ported), auto-wrap in PipeTransport so the upgrade is
+        # incremental.
+        from .transport import Transport, PipeTransport
+        if not isinstance(transport, Transport):
+            transport = PipeTransport(transport)
+        self.transport = transport
         self.remote_meta = remote_meta
         self.remote_pubkey = remote_meta.public_key
         self.remote_priority = remote_meta.priority
@@ -186,24 +199,23 @@ class PeerLink(object):
         return ipv6_str_from_bytes(addr_for_key(self.remote_pubkey))
 
     def install_msg_cb(self):
-        """Switch the Pipe to push mode and route bytes through the parser.
+        """Register our byte-parser cb on the transport.
 
         Called by ``open_outbound`` / ``open_inbound`` AFTER the
-        handshake completes.  The handshake itself uses a
-        BufferedReader (pull mode); this transitions to msg_cb
-        push mode for the steady-state.
+        handshake completes.  The handshake function uses an
+        ad-hoc cb that drives wait-for-N-bytes; this method
+        installs the long-running parser cb that decodes
+        varint-framed packets.
 
-        Also arms a background watcher that listens for the pipe's
-        ``on_close`` event and calls ``fatal_close`` when the
-        remote side disconnects.  Without this, a clean TCP FIN
-        from the peer never reaches us via msg_cb (msg_cb only
-        fires on byte arrivals, not on EOF), and the
-        ``recv_packet()`` awaiter would block forever -- which
-        is the original peer-task-leak bug caught by
-        ``test_yggdrasil_stress.TestPeerChurnLoopback``.
+        Also wires the transport's ``closed_event`` to our
+        ``fatal_close`` so a graceful peer disconnect wakes any
+        pending ``recv_packet()`` awaiter promptly (without
+        this, a clean FIN leaves recv_packet blocked forever --
+        the peer-task-leak bug caught by
+        ``test_yggdrasil_stress.TestPeerChurnLoopback``).
         """
 
-        def on_bytes(data, client_tup, pipe):
+        def on_bytes(data, transport):
             """msg_cb: feed bytes into the parser, drain complete frames."""
             if self.closed:
                 return
@@ -229,29 +241,20 @@ class PeerLink(object):
                 log_exception()
                 self.fatal_close()
 
-        # handoff_to_cb atomically drops the SUB_ALL subscription
-        # and registers our cb, replaying any already-buffered
-        # bytes through us in arrival order.
-        try:
-            self.pipe.handoff_to_cb(on_bytes)
-        except AttributeError:
-            # Older pipe versions or test stubs may not expose
-            # handoff_to_cb; fall back to add_msg_cb + manual unsub.
-            self.pipe.add_msg_cb(on_bytes)
+        self.transport.add_msg_cb(on_bytes)
 
-        # Arm the close-watcher.  Pipe close events live in
-        # different attributes depending on whether this is a
-        # client pipe (``pipe_events.on_close``) or a per-connection
-        # server-accepted pipe (``client_events.on_close``).  We
-        # look both up and chain on whichever is present.
+        # Arm the close-watcher on the transport's unified close
+        # event.  Transport.closed_event fires on any underlying
+        # close source (Pipe FIN, LoopbackTransport peer-close,
+        # ReplayTransport stage_eof) so this works uniformly.
         try:
-            self.close_watcher = asyncio.ensure_future(self.watch_pipe_close())
+            self.close_watcher = asyncio.ensure_future(self.watch_transport_close())
         except RuntimeError:
-            # No running event loop (test stubs); skip the watcher.
+            # No running event loop (sync tests); skip the watcher.
             self.close_watcher = None
 
-    async def watch_pipe_close(self):
-        """Wait for the pipe's close event then mark the link closed.
+    async def watch_transport_close(self):
+        """Wait for the transport's close event then mark the link closed.
 
         Drives the recv_packet sentinel so the NodeCore.peer_recv_loop
         wakes promptly when the remote peer disconnects.  Without
@@ -259,28 +262,16 @@ class PeerLink(object):
         blocked on the inbound queue forever, and NodeCore leaks
         the peer_tasks + PeerEntry slot.
 
-        aionetiface's Pipe exposes ``on_close`` directly as an
-        ``asyncio.Event``; ``connection_lost`` on the transport
-        sets it.  Both client and server-accepted pipes share the
-        same attribute name.
-
         Eats CancelledError silently: cancellation is the normal
         path when ``close()`` runs before the peer ever
         disconnects, and the parent task has no recovery action
         to take in that case.
         """
-        event = getattr(self.pipe, "on_close", None)
-        if event is None:
-            return
+        event = self.transport.closed_event
         try:
             await event.wait()
         except asyncio.CancelledError:
-            # Normal shutdown -- swallow so the task finishes
-            # cleanly without leaving a never-retrieved exception
-            # on the event loop.
             return
-        # Pipe closed; tear our link down.  fatal_close pushes the
-        # sentinel into inbound_queue, unblocking any awaiter.
         self.fatal_close()
 
     def fatal_close(self):
@@ -317,9 +308,14 @@ class PeerLink(object):
             ))
         wire = encode_uvarint(body_size) + bytes([packet_type]) + bytes(payload)
         async with self.send_lock:
-            sent = await self.pipe.send(wire)
+            try:
+                sent = await self.transport.send(wire)
+            except Exception as exc:
+                raise PipeClosed(
+                    "send_packet: transport send raised: {0}".format(repr(exc))
+                )
             if sent in (None, 0):
-                raise PipeClosed("send_packet: pipe send returned 0")
+                raise PipeClosed("send_packet: transport send returned 0")
             self.tx_bytes += len(wire)
             # Sender-side keepalive logic: clear pending keepalive
             # if we just sent non-keepalive traffic (no need to chase).
@@ -406,34 +402,30 @@ class PeerLink(object):
         except asyncio.QueueFull:
             pass
         try:
-            await self.pipe.close()
+            await self.transport.close()
         except asyncio.CancelledError:
             raise
         except Exception:
             log_exception()
 
 
-async def handshake_over_pipe(pipe, private_seed, public_key,
-                              password=b"", priority=0,
-                              deadline=HANDSHAKE_DEADLINE_SECONDS):
-    """Drive a Yggdrasil version_metadata handshake on an open Pipe.
+async def handshake_over_transport(transport, private_seed, public_key,
+                                   password=b"", priority=0,
+                                   deadline=HANDSHAKE_DEADLINE_SECONDS):
+    """Drive a Yggdrasil version_metadata handshake on a Transport.
 
     Returns ``(remote_meta, leftover_bytes)`` on success.  Raises
     ``HandshakeError`` on protocol-level failure, ``LinkToSelf``
     on self-connect, ``asyncio.TimeoutError`` on deadline expiry.
 
-    Receive side uses an ``add_msg_cb`` from the moment we hand
-    over to ``do_handshake`` so bytes arriving immediately after
-    TCP accept (which happens BEFORE any BufferedReader could
-    subscribe) land in our buffer instead of being dropped by
-    ``stream.add_msg`` for-no-subscribers.  This is the same
-    push-mode pattern used post-handshake by ``PeerLink``; we
-    just do it from the very first byte.
+    v2: takes a Transport (not a raw Pipe) so the same code runs
+    against real TCP, in-memory loopback, or replay-from-bytes.
 
-    AFTER this function returns, the caller installs its own
-    msg_cb for the steady-state packet stream -- our handshake
-    cb is removed via ``del_msg_cb`` before we return so the
-    PeerLink-side cb sees a clean stream.
+    The receive side uses ``transport.add_msg_cb`` from the moment
+    we start, so any bytes the transport already delivered land
+    in our buffer.  AFTER this function returns, the caller is
+    expected to install the PeerLink steady-state msg_cb; the
+    handshake cb is removed via ``del_msg_cb`` before we return.
     """
     if not isinstance(public_key, (bytes, bytearray)):
         raise ValueError("public_key must be bytes")
@@ -446,35 +438,23 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
     )
     wire = meta.encode(bytes(private_seed), password=bytes(password))
 
-    # msg_cb-fed buffer + an Event that fires every time bytes land,
-    # so the handshake reader can wake up promptly without polling.
     incoming = bytearray()
     bytes_arrived = asyncio.Event()
-    closed_flag = [False]
 
-    def on_bytes(data, client_tup, pipe_arg):
-        """Fire-and-forget byte accumulator -- runs from data_received."""
+    def on_bytes(data, transport_arg):
         if not data:
             return
         incoming.extend(data)
         bytes_arrived.set()
 
-    # Atomically drain any bytes the SUB_ALL queue already buffered
-    # (between pipe.connect and now) into our msg_cb, then route
-    # future bytes through the cb.  Without the drain, a peer that
-    # pipelines its handshake reply onto the tail of our connect()
-    # would have those bytes sit in the SUB_ALL queue forever (we
-    # never call pipe.recv -- we're push-mode now).  pipe.handoff_to_cb
-    # is the only safe atomic version of "drain + switch to push".
-    pipe.handoff_to_cb(on_bytes)
+    transport.add_msg_cb(on_bytes)
 
     async def wait_for_n(n):
-        """Block until ``incoming`` has at least ``n`` bytes."""
         while len(incoming) < n:
             bytes_arrived.clear()
-            if closed_flag[0]:
+            if transport.is_closed():
                 raise HandshakeError(
-                    "handshake: pipe closed during read"
+                    "handshake: transport closed during read"
                 )
             await bytes_arrived.wait()
         head = bytes(incoming[:n])
@@ -482,9 +462,14 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
         return head
 
     async def do_handshake():
-        sent = await pipe.send(wire)
+        try:
+            sent = await transport.send(wire)
+        except Exception as exc:
+            raise HandshakeError(
+                "handshake: send raised: {0}".format(repr(exc))
+            )
         if sent in (None, 0):
-            raise HandshakeError("handshake: pipe send returned 0")
+            raise HandshakeError("handshake: transport send returned 0")
 
         head = await wait_for_n(HEADER_LEN)
         if head[:4] != PREAMBLE:
@@ -507,22 +492,37 @@ async def handshake_over_pipe(pipe, private_seed, public_key,
             ))
         if remote_meta.public_key == bytes(public_key):
             raise LinkToSelf("handshake: remote pubkey equals local")
-        # Any bytes accumulated past the handshake (because the
-        # peer pipelined an early post-handshake packet onto the
-        # tail of its meta wire) need to be replayed into the
-        # PeerLink's parser when the caller installs its own cb.
         return remote_meta, bytes(incoming)
 
     try:
         result = await asyncio.wait_for(do_handshake(), timeout=deadline)
     finally:
-        # Remove our handshake cb so the PeerLink-installed cb sees
-        # a clean stream.  Safe to call even if we failed mid-handshake.
         try:
-            pipe.del_msg_cb(on_bytes)
+            transport.del_msg_cb(on_bytes)
         except Exception:
             pass
     return result
+
+
+async def handshake_over_pipe(pipe_or_transport, private_seed, public_key,
+                              password=b"", priority=0,
+                              deadline=HANDSHAKE_DEADLINE_SECONDS):
+    """Backwards-compat shim.  Auto-wraps a raw Pipe in PipeTransport.
+
+    Existing tests and the warpgate plugin layer call this with
+    raw aionetiface Pipe objects.  Detect that by absence of
+    ``is_closed`` (a Transport method) and wrap before delegating.
+    """
+    from .transport import PipeTransport, Transport
+    if isinstance(pipe_or_transport, Transport):
+        transport = pipe_or_transport
+    else:
+        transport = PipeTransport(pipe_or_transport)
+    return await handshake_over_transport(
+        transport, private_seed, public_key,
+        password=password, priority=priority,
+        deadline=deadline,
+    )
 
 
 async def open_outbound(dest_addr, dest_port, route,
@@ -555,19 +555,21 @@ async def open_outbound(dest_addr, dest_port, route,
         "yggdrasil: outbound dial dest={0}:{1}",
         (dest_addr, dest_port),
     ))
+    from .transport import PipeTransport
+    transport = PipeTransport(pipe)
     try:
-        remote_meta, leftover = await handshake_over_pipe(
-            pipe, private_seed, public_key,
+        remote_meta, leftover = await handshake_over_transport(
+            transport, private_seed, public_key,
             password=password, priority=priority,
             deadline=deadline,
         )
     except Exception:
         try:
-            await pipe.close()
+            await transport.close()
         except Exception:
             pass
         raise
-    link = PeerLink(pipe, remote_meta, public_key, "outbound")
+    link = PeerLink(transport, remote_meta, public_key, "outbound")
     if leftover:
         link.parser.feed(leftover)
     link.install_msg_cb()
@@ -581,12 +583,63 @@ async def open_inbound(pipe, private_seed, public_key,
 
     Returns a fully-open PeerLink in msg_cb push mode.
     """
-    remote_meta, leftover = await handshake_over_pipe(
-        pipe, private_seed, public_key,
+    from .transport import PipeTransport
+    transport = PipeTransport(pipe)
+    remote_meta, leftover = await handshake_over_transport(
+        transport, private_seed, public_key,
         password=password, priority=priority,
         deadline=deadline,
     )
-    link = PeerLink(pipe, remote_meta, public_key, "inbound")
+    link = PeerLink(transport, remote_meta, public_key, "inbound")
+    if leftover:
+        link.parser.feed(leftover)
+    link.install_msg_cb()
+    return link
+
+
+# Transport-native variants for v2 callers (loopback / replay)
+# that already have a Transport in hand and don't want the Pipe
+# wrapping dance.  These exist alongside open_outbound /
+# open_inbound for the warpgate-plugin use case which still
+# operates on Pipe objects from aionetiface.
+
+async def open_inbound_transport(transport, private_seed, public_key,
+                                 password=b"", priority=0,
+                                 deadline=HANDSHAKE_DEADLINE_SECONDS):
+    """Accept-side handshake driven directly on a Transport.
+
+    No Pipe wrapping -- use this when the caller built a
+    LoopbackTransport / ReplayTransport for testing or already
+    has a non-Pipe transport (a future TLS-wrapped variant, a
+    WebSocket transport, etc.).
+    """
+    remote_meta, leftover = await handshake_over_transport(
+        transport, private_seed, public_key,
+        password=password, priority=priority,
+        deadline=deadline,
+    )
+    link = PeerLink(transport, remote_meta, public_key, "inbound")
+    if leftover:
+        link.parser.feed(leftover)
+    link.install_msg_cb()
+    return link
+
+
+async def open_outbound_transport(transport, private_seed, public_key,
+                                  password=b"", priority=0,
+                                  deadline=HANDSHAKE_DEADLINE_SECONDS):
+    """Outbound-side handshake driven directly on a Transport.
+
+    Symmetric with ``open_inbound_transport``; the protocol is
+    initiator-agnostic so the distinction is just bookkeeping
+    (and the ``link_type`` field set on the returned PeerLink).
+    """
+    remote_meta, leftover = await handshake_over_transport(
+        transport, private_seed, public_key,
+        password=password, priority=priority,
+        deadline=deadline,
+    )
+    link = PeerLink(transport, remote_meta, public_key, "outbound")
     if leftover:
         link.parser.feed(leftover)
     link.install_msg_cb()
