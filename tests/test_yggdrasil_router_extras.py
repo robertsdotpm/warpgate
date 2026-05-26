@@ -177,6 +177,77 @@ class TestF8BloomMergesPeerFilters(AsyncTestCase):
             await node.close()
 
 
+class TestF9PeriodicBloomResend(AsyncTestCase):
+    """F9: maintenance tick re-sends bloom if it changed.
+
+    Without this, the initial bloom we sent each peer is stuck
+    forever, and F8's transitive-reachability merges never
+    propagate to existing peers as our peer_recv_bloom map
+    learns more keys.
+    """
+
+    async def test_resend_only_fires_on_change(self):
+        from warpgate.overlay.yggdrasil.pathfinder import bloom_transform
+        from warpgate.overlay.yggdrasil.routing_msgs import Bloom
+
+        node, router = make_router()
+        try:
+            # Two fake peers, both already in sent[] (i.e. past
+            # the sync_peers gate).  Stub out send_packet_safe so
+            # we can count outbound bloom sends per peer.
+            peer_a = b"\xa1" * 32
+            peer_b = b"\xa2" * 32
+
+            class FakeLink(object):
+                def __init__(self, pk):
+                    self.remote_pubkey = pk
+            class FakeEntry(object):
+                def __init__(self, pk):
+                    self.link = FakeLink(pk)
+            entries = [FakeEntry(peer_a), FakeEntry(peer_b)]
+
+            class FakePeers(object):
+                def peers(self): return entries
+            router.node_core.peers = FakePeers()
+            router.sent[peer_a] = set()
+            router.sent[peer_b] = set()
+
+            sent_calls = []
+            async def fake_send(link, ptype, payload):
+                sent_calls.append((bytes(link.remote_pubkey), ptype, payload))
+            router.send_packet_safe = fake_send
+
+            # First tick: no prior bloom, should send to both peers.
+            router.resend_changed_blooms()
+            # Drain the ensure_future calls.
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(sent_calls), 2,
+                "first resend should hit both peers")
+            sent_calls.clear()
+
+            # Second tick: nothing changed, expect zero sends.
+            router.resend_changed_blooms()
+            await asyncio.sleep(0.05)
+            self.assertEqual(len(sent_calls), 0,
+                "second resend with no change should not fire")
+
+            # Now: simulate a third party teaching peer_a's recv-bloom
+            # about a new key.  Peer B's outbound bloom needs to merge
+            # this change in (per F8), so the resend should now fire
+            # to peer B but NOT to peer A (we don't merge A into A).
+            external_key = b"\x88" * 32
+            new_bloom_for_a = Bloom()
+            new_bloom_for_a.add_key(bloom_transform(external_key))
+            router.peer_recv_bloom[peer_a] = new_bloom_for_a
+            router.resend_changed_blooms()
+            await asyncio.sleep(0.05)
+            target_peers = set(c[0] for c in sent_calls)
+            self.assertIn(peer_b, target_peers,
+                "peer B's bloom should resend after A's update")
+        finally:
+            await node.close()
+
+
 class TestF12PathLookupOffTreeGate(AsyncTestCase):
     """F12: handle_lookup drops lookups from peers not in our tree neighborhood."""
 

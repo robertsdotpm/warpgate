@@ -532,23 +532,51 @@ class ActiveRouter(object):
         return root, ports
 
     def do_maintenance(self):
-        """Periodic tick: sync new peers, expire stale infos, fix parent
-        selection, send pending announces.
+        """Periodic tick: sweep stale infos, fix parent, send announces,
+        resend blooms if they changed.
 
         Sweep order matters: expire BEFORE fix so a freshly-stale
         peer doesn't get picked as parent.  Sweep BEFORE sync_peers
         so a peer that timed out but reconnects gets a fresh sig_req.
+        Refresh self-info from a peer's echo BEFORE sync, in case
+        the new sig_req would otherwise carry a stale local_seq.
         """
         self.sweep_expired_infos()
         if self.refresh:
-            # Self-info marked stale -- re-become-root to mint a fresh
-            # ann with a higher seq.  This also flushes the sent-dedup
-            # so every peer gets the refreshed info.
             self.become_root()
             self.refresh = False
         self.sync_peers()
         self.fix()
         self.send_pending_announces()
+        self.resend_changed_blooms()
+
+    def resend_changed_blooms(self):
+        """F9 fix: re-send our outbound bloom to each peer if it changed.
+
+        Without periodic resend, the bloom we sent at peer-attach
+        time is stuck even as our ``peer_recv_bloom`` map updates
+        (other peers learning about new keys).  With F8's merge
+        semantics, that means transitive reachability info never
+        propagates -- multi-hop chains can't discover paths to
+        nodes that appear AFTER initial bootstrap.
+
+        Mirrors upstream bloomfilter.go:269-290 ``_sendAllBlooms``,
+        minus the "force-resend every 3600 ticks" anti-quiet-link
+        clause (deferred -- not yet seen to matter).
+        """
+        for entry in self.node_core.peers.peers():
+            pk = entry.link.remote_pubkey
+            if pk not in self.sent:
+                # Hasn't gone through sync_peers yet -- skip.
+                continue
+            new_bloom = self.build_bloom_for_peer(pk)
+            old_bloom = self.peer_send_bloom.get(pk)
+            if old_bloom is not None and old_bloom.equal(new_bloom):
+                continue   # nothing changed; no resend needed
+            self.peer_send_bloom[pk] = new_bloom
+            asyncio.ensure_future(self.send_packet_safe(
+                entry.link, WIRE_PROTO_BLOOM_FILTER, new_bloom.encode(),
+            ))
 
     def sync_peers(self):
         """Initialize routing state for any newly-connected peers.
