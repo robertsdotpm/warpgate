@@ -581,18 +581,32 @@ class ActiveRouter(object):
     def sync_peers(self):
         """Initialize routing state for any newly-connected peers.
 
-        NodeCore.peers is the source of truth for live peer links;
-        this scans for any pubkey we don't yet have a ``sent[]``
-        entry for, primes it, sends a sig_req (which feeds into
-        parent selection AND RTT measurement) and sends our
-        current bloom filter (which the peer uses for path-lookup
-        multicast forwarding).
+        Gate keyed on ``self.requests`` (set ONLY by this method) --
+        NOT on ``self.sent``, which ``handle_announce`` also populates
+        as a side effect of announce-dedup bookkeeping.  Using
+        ``self.sent`` skipped sig_req emission for any peer whose
+        first packet was an announce (a common race in line/tree
+        topologies where the maintenance tick runs after both ends
+        have already exchanged announces).  Caught porting
+        ironwood's ``TestLineNetwork``: convergence stalled ~30 %
+        of runs because the middle node never got a sig_res back
+        from the smaller-keyed neighbour and so couldn't pick it
+        as parent.  Mirrors upstream router.addPeer (router.go:137)
+        which gates on ``r.requests`` and always sends sig_req on
+        peer attach.
         """
         import time as _time
         for entry in self.node_core.peers.peers():
             pk = entry.link.remote_pubkey
+            # Ensure the announce-dedup set exists for EVERY peer --
+            # send_pending_announces iterates self.sent.items() and
+            # silently skips peers missing from it.  Done outside the
+            # sig_req gate so peers that already exchanged announces
+            # (and thus have a sent[] entry seeded by handle_announce)
+            # still get covered when they show up here.
             if pk not in self.sent:
                 self.sent[pk] = set()
+            if pk not in self.requests:
                 # Send a fresh sig_req so this peer becomes a
                 # candidate parent.  Record the send time so the
                 # matching sig_res can compute RTT.

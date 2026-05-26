@@ -95,7 +95,7 @@ class NodeCore(object):
     """
 
     def __init__(self, seed=None, password=b"", priority=0,
-                 packet_handler=None):
+                 packet_handler=None, allowed_pubkeys=None):
         if seed is None:
             import os
             seed = os.urandom(32)
@@ -107,6 +107,22 @@ class NodeCore(object):
         self.password = bytes(password)
         self.priority = int(priority) & 0xFF
         self.packet_handler = packet_handler
+        # Optional peer allow-list: if provided, any link whose remote
+        # ed25519 pubkey is not in this set is closed immediately
+        # after handshake.  ``None`` (default) = accept all peers,
+        # matching pre-allow-list behaviour.  Mirrors upstream Go's
+        # ``AllowedPublicKey`` option (core/core_test.go:226).
+        if allowed_pubkeys is None:
+            self.allowed_pubkeys = None
+        else:
+            normalized = set()
+            for pk in allowed_pubkeys:
+                if not isinstance(pk, (bytes, bytearray)) or len(pk) != 32:
+                    raise ValueError(
+                        "NodeCore: allowed_pubkeys entries must be 32-byte keys"
+                    )
+                normalized.add(bytes(pk))
+            self.allowed_pubkeys = normalized
 
         self.peers = PeerTable()
         # Per-peer recv-loop tasks.  Removed on link teardown so
@@ -196,6 +212,20 @@ class NodeCore(object):
 
     async def register_link(self, link):
         """Insert a successful PeerLink into the table + start its recv loop."""
+        # Allow-list gate: drop peers whose pubkey isn't permitted.
+        # Mirrors upstream's AllowedPublicKey behaviour
+        # (core/core.go:131-150): the link's TLS handshake completes
+        # but the post-handshake gate refuses to register.  Peer-side
+        # observes a transport-level disconnect.
+        if self.allowed_pubkeys is not None \
+                and bytes(link.remote_pubkey) not in self.allowed_pubkeys:
+            log(fstr(
+                "yggdrasil[node {0}]: peer {1} rejected (pubkey not "
+                "in allowed list), closing",
+                (self.address, link.remote_addr),
+            ))
+            await link.close()
+            return
         try:
             self.peers.add_peer(link)
         except DuplicatePeerError:
