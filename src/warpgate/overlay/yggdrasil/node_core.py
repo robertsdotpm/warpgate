@@ -43,18 +43,22 @@ from .wire import WIRE_TYPE_NAMES
 
 
 def derive_pubkey(seed):
-    """Return the 32-byte ed25519 public key for the given 32-byte seed."""
+    """Return the 32-byte ed25519 public key for the given 32-byte seed.
+
+    ``ecdsa.VerifyingKey.to_string()`` returns a ``bytearray`` in
+    0.19; coerce to ``bytes`` so callers can use the pubkey as a
+    dict key without surprise hashability errors.
+    """
     if not isinstance(seed, (bytes, bytearray)) or len(seed) != 32:
         raise ValueError("derive_pubkey: seed must be 32 bytes")
     sk = SigningKey.from_string(bytes(seed), curve=Ed25519)
-    return sk.verifying_key.to_string()
+    return bytes(sk.verifying_key.to_string())
 
 
 def parse_peer_uri(uri):
-    """Parse a ``tcp://host:port`` URI into ``(scheme, host, port)``.
+    """Parse a ``tcp://`` or ``tls://`` URI into ``(scheme, host, port)``.
 
-    Only TCP is supported in this phase.  Raises ``ValueError``
-    on any other scheme or malformed URI.
+    Raises ``ValueError`` on any other scheme or malformed URI.
     """
     try:
         from urllib.parse import urlparse
@@ -62,9 +66,9 @@ def parse_peer_uri(uri):
         # Python 2 fallback; warpgate is 3.5+ so this shouldn't fire.
         from urlparse import urlparse
     parsed = urlparse(str(uri))
-    if parsed.scheme != "tcp":
+    if parsed.scheme not in ("tcp", "tls"):
         raise ValueError(fstr(
-            "parse_peer_uri: only tcp:// supported, got {0}",
+            "parse_peer_uri: only tcp:// or tls:// supported, got {0}",
             (parsed.scheme,),
         ))
     host = parsed.hostname
@@ -296,6 +300,7 @@ class NodeCore(object):
                     host, port, route,
                     self.seed, self.public_key,
                     password=self.password, priority=self.priority,
+                    link_proto=scheme,
                 )
             except LinkToSelf:
                 log(fstr(

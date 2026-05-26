@@ -116,11 +116,17 @@ class TestParsePeerURI(AsyncTestCase):
         self.assertEqual(host, "2001:db8::1")
         self.assertEqual(port, 9001)
 
-    async def test_rejects_non_tcp_scheme(self):
-        with self.assertRaises(ValueError):
-            parse_peer_uri("tls://1.2.3.4:9001")
+    async def test_accepts_tls_scheme(self):
+        scheme, host, port = parse_peer_uri("tls://1.2.3.4:9001")
+        self.assertEqual(scheme, "tls")
+        self.assertEqual(host, "1.2.3.4")
+        self.assertEqual(port, 9001)
+
+    async def test_rejects_non_tcp_non_tls_scheme(self):
         with self.assertRaises(ValueError):
             parse_peer_uri("https://example.com")
+        with self.assertRaises(ValueError):
+            parse_peer_uri("quic://1.2.3.4:9001")
 
     async def test_rejects_missing_port(self):
         with self.assertRaises(ValueError):

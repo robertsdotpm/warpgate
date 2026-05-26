@@ -448,15 +448,24 @@ async def open_outbound(dest_addr, dest_port, route,
                         password=b"", priority=0,
                         link_proto="tcp",
                         deadline=HANDSHAKE_DEADLINE_SECONDS):
-    """Dial a Yggdrasil peer over TCP and complete the handshake.
+    """Dial a Yggdrasil peer over TCP or TLS and complete the handshake.
 
-    Returns a fully-open PeerLink in msg_cb push mode.
+    ``link_proto`` is "tcp" or "tls".  TLS uses aionetiface Pipe's
+    ``use_ssl`` conf flag (which sets up a TLS context with
+    cert-verify disabled -- Yggdrasil peers use self-signed certs
+    and the link-layer identity proof is the ed25519 handshake,
+    not the TLS cert).  Returns a fully-open PeerLink in msg_cb
+    push mode.
     """
-    if link_proto != "tcp":
+    if link_proto not in ("tcp", "tls"):
         raise ValueError(fstr(
-            "open_outbound: only 'tcp' supported, got {0}", (link_proto,),
+            "open_outbound: only 'tcp' or 'tls' supported, got {0}",
+            (link_proto,),
         ))
-    pipe = Pipe(TCP, dest=(dest_addr, int(dest_port)), route=route)
+    from aionetiface import NET_CONF
+    conf = dict(NET_CONF)
+    conf["use_ssl"] = (link_proto == "tls")
+    pipe = Pipe(TCP, dest=(dest_addr, int(dest_port)), route=route, conf=conf)
     await pipe.connect()
     if pipe.sock is None:
         raise OSError("open_outbound: pipe failed to connect")
