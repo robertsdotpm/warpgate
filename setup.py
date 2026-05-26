@@ -16,7 +16,7 @@ install_reqs = [
     "ecdsa",
 ]
 setup(
-    version="4.0.11",
+    version="4.0.12",
     name="warpgate",
     description="Any peer, any NAT — one-shot Python NAT traversal: 8-plugin cascade, IPv4 + IPv6, multi-NIC, zero infrastructure to run.",
     keywords=(
