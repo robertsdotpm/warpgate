@@ -18,13 +18,17 @@ install_reqs = [
 setup(
     version="4.0.11",
     name="warpgate",
-    description="Async NAT traversal library",
+    description="Any peer, any NAT — one-shot Python NAT traversal: 8-plugin cascade, IPv4 + IPv6, multi-NIC, zero infrastructure to run.",
     keywords=(
-        "NAT traversal, TCP hole punching, simultaneous open, UPnP, STUN, TURN, SIP, DHCP, add IP to interface, NATPMP, P2P, Peer-to-peer networking library, python"
+        "NAT traversal, hole punching, TCP hole punching, UDP hole punching, "
+        "simultaneous open, STUN, TURN, ICE, UPnP, NAT-PMP, PCP, "
+        "P2P, peer-to-peer, decentralized, rendezvous, WebRTC alternative, "
+        "asyncio, async networking, IPv6, multi-NIC, cross-platform, "
+        "Windows XP, self-hosted, serverless networking"
     ),
     long_description_content_type="text/markdown",
     long_description=long_description,
-    url="http://github.com/robertsdotpm/p2pd",
+    url="https://www.warpgate.io/",
     author="Matthew Roberts",
     author_email="matthew@roberts.pm",
     license="public domain",
