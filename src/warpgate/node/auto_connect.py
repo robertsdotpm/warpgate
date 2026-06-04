@@ -52,7 +52,7 @@ from ..traversal.traversal_utils import close_plugin
 from ..traversal.strategy_registry import plugin_registry
 
 
-async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3):
+def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3):
     """Round-trip a WG-LIVENESS-PING over *pipe* and return True iff the
     matching PONG comes back within the budget.
 
@@ -130,7 +130,7 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
     try:
         for attempt in range(attempts):
             try:
-                await pipe.send(ping)
+                pipe.send(ping)
                 log("[LIVENESS] mono={0:.4f} PING sent attempt={1}".format(
                     time.monotonic(), attempt + 1,
                 ))
@@ -143,7 +143,7 @@ async def verify_pipe_alive(pipe, transport=TCP, per_try_timeout=3.0, retries=3)
                 return False
 
             try:
-                await asyncio.wait_for(
+                asyncio.wait_for(
                     asyncio.shield(pong_fut), per_try_timeout,
                 )
                 return True
@@ -430,7 +430,7 @@ def plugin_timeout(loader):
 # Attempt + race helpers
 # ---------------------------------------------------------------------------
 
-async def attempt_one_combo(
+def attempt_one_combo(
     node,
     sig_pipe,
     src_map,
@@ -449,7 +449,7 @@ async def attempt_one_combo(
     """
     plugin_name, af, route_type, src, dest = combo
     try:
-        plugin = await node.traversal.attempt_plugin(
+        plugin = node.traversal.attempt_plugin(
             src_map=src_map,
             dest_map=dest_map,
             sig_pipe=sig_pipe,
@@ -467,7 +467,7 @@ async def attempt_one_combo(
     if plugin is None or plugin.result.done():
         return plugin
     try:
-        await asyncio.wait_for(plugin.result, timeout=plugin.timeout)
+        asyncio.wait_for(plugin.result, timeout=plugin.timeout)
     except asyncio.TimeoutError:
         log("attempt_one_combo: plugin.result timed out for {0}".format(plugin_name))
     except asyncio.CancelledError:
@@ -516,7 +516,7 @@ def plugin_pipe(plugin):
         return None
 
 
-async def race_combos(
+def race_combos(
     node,
     sig_pipe,
     src_map,
@@ -546,7 +546,7 @@ async def race_combos(
     try:
         for fut in asyncio.as_completed(tasks, timeout=timeout):
             try:
-                plugin = await fut
+                plugin = fut
             except asyncio.CancelledError:  # pylint: disable=try-except-raise
                 raise
             except (asyncio.TimeoutError, OSError, ConnectionError, ValueError):
@@ -570,7 +570,7 @@ async def race_combos(
         # our tasks are still alive but as_completed has already raised.
         # Waiting PHASE_GRACE_S lets any task that completes in that window
         # resolve as a winner before we cancel everything.
-        await asyncio.sleep(PHASE_GRACE_S)
+        asyncio.sleep(PHASE_GRACE_S)
         for t in tasks:
             if not t.done():
                 continue
@@ -589,7 +589,7 @@ async def race_combos(
         for t in tasks:
             if not t.done():
                 t.cancel()
-        late = await asyncio.gather(*tasks, return_exceptions=True)
+        late = asyncio.gather(*tasks, return_exceptions=True)
         for item in late:
             if (
                 item is not None
@@ -598,13 +598,13 @@ async def race_combos(
             ):
                 plugins.append(item)
         for p in plugins:
-            await close_plugin(p, node.traversal.plugins, node.traversal.inbound_pipes)
+            close_plugin(p, node.traversal.plugins, node.traversal.inbound_pipes)
         raise
 
     for t in tasks:
         if not t.done():
             t.cancel()
-    late = await asyncio.gather(*tasks, return_exceptions=True)
+    late = asyncio.gather(*tasks, return_exceptions=True)
     for item in late:
         if (
             item is not None
@@ -616,7 +616,7 @@ async def race_combos(
 
     for p in plugins:
         if p is not winner_plugin:
-            await close_plugin(p, node.traversal.plugins, node.traversal.inbound_pipes)
+            close_plugin(p, node.traversal.plugins, node.traversal.inbound_pipes)
 
     return winner_pipe, winner_plugin
 
@@ -702,7 +702,7 @@ def derive_sorted_nics(
 # Phase implementations
 # ---------------------------------------------------------------------------
 
-async def phase1_direct(
+def phase1_direct(
     node,
     src_map,
     dest_map,
@@ -745,12 +745,12 @@ async def phase1_direct(
         "auto_connect: phase1 racing {0} combos (budget={1}s)",
         (len(combos), PHASE1_BUDGET),
     ))
-    return await race_combos(
+    return race_combos(
         node, sig_pipe, src_map, dest_map, combos, PHASE1_BUDGET,
     )
 
 
-async def punch_phase(
+def punch_phase(
     node,
     src_map,
     dest_map,
@@ -828,7 +828,7 @@ async def punch_phase(
                     "auto_connect: {0} route={1} af={2} slot={3} pairs={4} timeout={5}s",
                     (label, route_type, af, slot_idx, len(slot), slot_to),
                 ))
-                pipe, plugin = await race_combos(
+                pipe, plugin = race_combos(
                     node, sig_pipe, src_map, dest_map, combos, slot_to,
                 )
                 if pipe is not None:
@@ -866,7 +866,7 @@ def pair_has_symmetric(src, dest):
 SYMMETRIC_INCOMPATIBLE_PLUGINS = frozenset({"tcp_punch", "udp_punch"})
 
 
-async def phase2_tcp_punch(
+def phase2_tcp_punch(
     node,
     src_map,
     dest_map,
@@ -905,7 +905,7 @@ async def phase2_tcp_punch(
     # like every other OS; if a given XP pair genuinely can't punch,
     # the cascade falls through to phase3/phase4 on its own.
     names = tuple(n for n in names if n != "tcp_punch_pcap")
-    return await punch_phase(
+    return punch_phase(
         node, src_map, dest_map, sig_pipe,
         plugin_names=names,
         label="phase2",
@@ -913,7 +913,7 @@ async def phase2_tcp_punch(
     )
 
 
-async def phase3_udp_probe(
+def phase3_udp_probe(
     node,
     src_map,
     dest_map,
@@ -940,7 +940,7 @@ async def phase3_udp_probe(
     else:
         chosen = "udp_punch" if "udp_punch" in names else names[0]
     log("phase3_udp_probe: chose plugin={0} from {1}".format(chosen, names))
-    return await punch_phase(
+    return punch_phase(
         node, src_map, dest_map, sig_pipe,
         plugin_names=(chosen,),
         label="phase3",
@@ -948,7 +948,7 @@ async def phase3_udp_probe(
     )
 
 
-async def phase4_turn(
+def phase4_turn(
     node,
     src_map,
     dest_map,
@@ -1028,7 +1028,7 @@ async def phase4_turn(
                 "auto_connect: phase4 turn af={0} attempt={1}/{2}",
                 (af, attempts, cap),
             ))
-            pipe, plugin = await race_combos(
+            pipe, plugin = race_combos(
                 node, sig_pipe, src_map, dest_map,
                 [(relay_name, af, EXT_BIND, src, chosen)],
                 timeout,
@@ -1043,7 +1043,7 @@ async def phase4_turn(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-async def auto_connect(
+def auto_connect(
     node,
     dest_addr,
     protocol=TCP,
@@ -1106,7 +1106,7 @@ async def auto_connect(
             route_types = frozenset(route_types)
 
     try:
-        addr_bytes, dest_vk, _ = await resolve_pnp_addr(node, dest_addr)
+        addr_bytes, dest_vk, _ = resolve_pnp_addr(node, dest_addr)
         dest_map = parse_node_addr(addr_bytes)
     except (ValueError, OSError, ConnectionError, asyncio.TimeoutError):
         log_exception()
@@ -1117,7 +1117,7 @@ async def auto_connect(
     enrich_addr_map_with_loopback(dest_map)
 
     try:
-        sig_pipe = await node.router.pipe(
+        sig_pipe = node.router.pipe(
             dest_map["pub_key_hex"],
             use_cache=True,
             hint_brokers=dest_map.get("mqtt_brokers") or [],
@@ -1203,7 +1203,7 @@ async def auto_connect(
             # error as "no pipe" and carry on. A CancelledError with no
             # winner yet is a genuine teardown and is re-raised.
             try:
-                pipe, plugin = await phase_fn(
+                pipe, plugin = phase_fn(
                     node, src_map, dest_map, sig_pipe, plugin_set,
                     route_types=route_types,
                 )
@@ -1248,7 +1248,7 @@ async def auto_connect(
             if pipe is not None:
                 transport = getattr(plugin, "transport", TCP)
                 try:
-                    alive = await verify_pipe_alive(pipe, transport=transport)
+                    alive = verify_pipe_alive(pipe, transport=transport)
                 except (OSError, ConnectionError, asyncio.TimeoutError):
                     log_exception()
                     alive = False
@@ -1329,7 +1329,7 @@ async def auto_connect(
                 # Failed verify, OR we already have a winner -- close
                 # this phase's pipe so it doesn't leak.
                 try:
-                    await close_plugin(
+                    close_plugin(
                         plugin, node.traversal.plugins, node.traversal.inbound_pipes,
                     )
                 except (OSError, asyncio.TimeoutError):
@@ -1358,7 +1358,7 @@ async def auto_connect(
     # plugin gets a clean stage with no concurrent flow pressure.
     phase_fns = (phase1_direct, phase2_tcp_punch, phase3_udp_probe, phase4_turn)
     for phase_fn in phase_fns:
-        pipe, plugin = await phase_fn(
+        pipe, plugin = phase_fn(
             node, src_map, dest_map, sig_pipe, plugin_set,
             route_types=route_types,
         )
@@ -1370,7 +1370,7 @@ async def auto_connect(
             # connection" failure mode.  On failure, close the
             # plugin and let the next phase have a shot.
             transport = getattr(plugin, "transport", TCP)
-            alive = await verify_pipe_alive(pipe, transport=transport)
+            alive = verify_pipe_alive(pipe, transport=transport)
             if alive:
                 winner_pipe = pipe
                 winner_plugin = plugin
@@ -1394,7 +1394,7 @@ async def auto_connect(
             except Exception:  # pylint: disable=broad-except
                 log_exception()
             try:
-                await close_plugin(
+                close_plugin(
                     plugin, node.traversal.plugins, node.traversal.inbound_pipes,
                 )
             except (OSError, asyncio.TimeoutError):

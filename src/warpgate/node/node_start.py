@@ -44,7 +44,7 @@ from ..install_check import verify_sibling_installs
 # ==========================================
 # Orchestrates the startup sequence for a P2P node.
 # ==========================================
-async def node_start(node, sys_clock=None, out=False, cout=print):
+def node_start(node, sys_clock=None, out=False, cout=print):
     """Execute the full ordered startup sequence for a P2P node and return it when ready.
 
     WARNING -- propagation race after node_start returns
@@ -87,7 +87,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
         ))
 
     # Hardware & Network Setup
-    await load_network_interfaces(node)
+    load_network_interfaces(node)
     mark("interfaces")
 
     # Validate --ip / listen_ips against the now-loaded NIC set.
@@ -98,7 +98,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
         apply_listen_ips(node)
 
     # Identity & Security
-    await load_machine_identity(node)
+    load_machine_identity(node)
     kp = load_cryptography_and_auth(node)
     mark("identity")
 
@@ -110,7 +110,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # MQTTClients, which silently kept using time.time -- the silent
     # fallback that hid a multi-hour clock-skew bug between
     # XP/Vista (BIOS clock drift) and modern VMs (NTP-synced).
-    await initialize_system_clock(node, sys_clock, out, cout)
+    initialize_system_clock(node, sys_clock, out, cout)
     mark("sys_clock")
 
     # STUN clients + Router can run concurrently now that sys_clock
@@ -118,21 +118,21 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     # Each is wrapped so it marks when its own coroutine finishes --
     # they still run concurrently, but the timeline shows which of the
     # two dominates the parallel window.
-    async def timed_step(coro, label):
-        await coro
+    def timed_step(coro, label):
+        coro
         mark(label)
 
-    await asyncio.gather(
+    asyncio.gather(
         timed_step(load_p2p_stun_clients(node, out, cout), "stun"),
         timed_step(setup_router_and_signal(node, kp, out, cout), "router"),
     )
 
-    await initialize_punch_coordination(node, out, cout)
+    initialize_punch_coordination(node, out, cout)
     mark("punch_coord")
 
     # Start Servers
     start_maintenance_tasks(node)
-    await listen_on_ifs(node)
+    listen_on_ifs(node)
     mark("listen")
 
     # Finalize Connectivity — start UPnP only after the node is listening and
@@ -152,12 +152,12 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
     node.resources.add_task(node.nat_classify_task)
 
     # High-Level Services
-    await setup_nickname_service(node)
+    setup_nickname_service(node)
     mark("nickname")
-    await setup_traversal_plugins(node)
+    setup_traversal_plugins(node)
     mark("plugins")
 
-    await finalize_port_forwarding(node, upnp_task, out, cout)
+    finalize_port_forwarding(node, upnp_task, out, cout)
     mark("port_forward")
 
     return node
@@ -166,7 +166,7 @@ async def node_start(node, sys_clock=None, out=False, cout=print):
 # ==========================================
 # Phase: Hardware & Network Setup
 # ==========================================
-async def load_network_interfaces(node):
+def load_network_interfaces(node):
     """Discover and sort all available network interfaces, raising if none are found.
 
     Respects node.nic_names (list of str): when non-empty, only interfaces
@@ -175,12 +175,12 @@ async def load_network_interfaces(node):
 
     Idempotent: skips discovery when node.ifs is already populated.
     NAT validation for manually-passed NICs is the caller's responsibility
-    (Gate.__aenter__ checks this before invoking node.start).
+    (Gate.__enter__ checks this before invoking node.start).
     """
     if not node.ifs:
         nic_names = getattr(node, "nic_names", [])
         try:
-            if_names = await list_interfaces()
+            if_names = list_interfaces()
             if nic_names:
                 # Each wanted name is either a canonical (description
                 # on Windows; device path elsewhere) or an alias the
@@ -191,7 +191,7 @@ async def load_network_interfaces(node):
                 # through to canonical-only matching.
                 aliases = {}
                 try:
-                    netifaces = await aionetiface_setup_netifaces()
+                    netifaces = aionetiface_setup_netifaces()
                     aliases = getattr(netifaces, "by_name_index", {}) or {}
                 except Exception:  # pylint: disable=broad-except
                     pass
@@ -216,7 +216,7 @@ async def load_network_interfaces(node):
             # placeholder_nat seeds nic.nat below; classify_nat_
             # background does the real probe after the node is up.
             # timeout scales up on XP/Vista (slow interface enum).
-            node.ifs = await load_interfaces(
+            node.ifs = load_interfaces(
                 if_names, Interface, skip_nat=True,
                 timeout=os_net_timeouts()["interface_load"],
             )
@@ -274,7 +274,7 @@ def apply_cached_or_placeholder_nat(node):
             nic.set_nat(nat_info())
 
 
-async def classify_nat_background(node, out):
+def classify_nat_background(node, out):
     """Run real NAT classification off the startup path, then cache + republish.
 
     node_start publishes the node address seeded with cached-or-
@@ -336,7 +336,7 @@ async def classify_nat_background(node, out):
     nat_by_nic = {}
     for nic in node.ifs:
         try:
-            await asyncio.wait_for(
+            asyncio.wait_for(
                 nic.load_nat(
                     timeout=nat_timeout,
                     is_cold_start=is_cold_for_nic.get(getattr(nic, "name", None), False),
@@ -379,7 +379,7 @@ async def classify_nat_background(node, out):
     build_node_address(node, out)
     register_name = getattr(node, "pnp_name", None) or node.node_id
     try:
-        await register_and_persist(node, register_name)
+        register_and_persist(node, register_name)
     except asyncio.CancelledError:
         raise
     except Exception:  # pylint: disable=broad-except
@@ -401,9 +401,9 @@ def start_background_port_forwarding(node):
     if node.conf["enable_upnp"] and not all_open_internet:
         reachability = {IP4: {}, IP6: {}}
 
-        async def reachability_cb(msg, client_tup, pipe):
+        def reachability_cb(msg, client_tup, pipe):
             """Forward inbound messages to the shared reachability checker."""
-            await remote_reachability_cb(reachability, msg, client_tup, pipe)
+            remote_reachability_cb(reachability, msg, client_tup, pipe)
 
         node.add_msg_cb(reachability_cb)
 
@@ -416,9 +416,9 @@ def start_background_port_forwarding(node):
 # ==========================================
 # Phase: Identity & Security
 # ==========================================
-async def load_machine_identity(node):
+def load_machine_identity(node):
     """Load or derive a stable machine ID and set the node's listen port deterministically."""
-    node.machine_id = await load_machine_id("warpgate", node.ifs[0].netifaces)
+    node.machine_id = load_machine_id("warpgate", node.ifs[0].netifaces)
 
     if node.machine_id in (None, ""):
         raise AssertionError("Could not load machine id.")
@@ -467,12 +467,12 @@ def load_cryptography_and_auth(node):
 # ==========================================
 # Phase: Time & Synchronization (concurrent)
 # ==========================================
-async def initialize_system_clock(node, sys_clock, out, cout):
+def initialize_system_clock(node, sys_clock, out, cout):
     """Create or reuse the system clock, optionally synchronising it against NTP."""
     if sys_clock is None:
         if node.conf["init_clock_skew"]:
             sys_clock = SysClock(interface=node.ifs[0])
-            await sys_clock.start()
+            sys_clock.start()
         else:
             sys_clock = SysClock(node.ifs[0], ntp=time.time())
             node.sys_clock = sys_clock
@@ -482,13 +482,13 @@ async def initialize_system_clock(node, sys_clock, out, cout):
         node.sys_clock = sys_clock
 
 
-async def load_p2p_stun_clients(node, out, cout):
+def load_p2p_stun_clients(node, out, cout):
     """Load TCP STUN clients for each interface and AF if hole-punching is enabled."""
     if node.conf.get("enable_punching", True):
         if out:
             cout("\tLoading STUN clients...")
         # Returns TCP STUN clients using PUNCH_CONF.
-        node.stun_clients = await load_stun_clients(node.ifs)
+        node.stun_clients = load_stun_clients(node.ifs)
 
         if out:
             buf = ""
@@ -507,7 +507,7 @@ async def load_p2p_stun_clients(node, out, cout):
             cout(buf)
 
 
-async def setup_router_and_signal(node, kp, out, cout):
+def setup_router_and_signal(node, kp, out, cout):
     """Instantiate the MQTT router, install default traversal plugins, and start the signal channel."""
     # node.sys_clock is established by initialize_system_clock which
     # runs before this in node_start. Threading get_time at Router
@@ -549,10 +549,10 @@ async def setup_router_and_signal(node, kp, out, cout):
     # double-write a no-op.
     register_plugin_wire_names(node)
 
-    await setup_signal_router(node, router, out, cout)
+    setup_signal_router(node, router, out, cout)
 
 
-async def setup_signal_router(node, router, out, cout):
+def setup_signal_router(node, router, out, cout):
     """Attach the router to the node and start MQTT subscriptions for inbound signalling."""
     node.router = router
 
@@ -566,7 +566,7 @@ async def setup_signal_router(node, router, out, cout):
     # multiple MQTT brokers and racing the slower of them past 15s
     # is genuinely unhealthy.
     try:
-        clients = await asyncio.wait_for(router.start(), timeout=15)
+        clients = asyncio.wait_for(router.start(), timeout=15)
     except asyncio.TimeoutError as exc:
         raise OSError("Router MQTT start timed out - signaling may be degraded") from exc
 
@@ -574,7 +574,7 @@ async def setup_signal_router(node, router, out, cout):
 # ==========================================
 # Phase: Connectivity Clients
 # ==========================================
-async def initialize_punch_coordination(node, out, cout):
+def initialize_punch_coordination(node, out, cout):
     """Log the NTP clock skew value used to coordinate hole-punch timing across peers."""
     if out:
         cout("\tLoading NTP clock skew...")
@@ -665,7 +665,7 @@ def build_node_address(node, out):
     enrich_addr_map_with_loopback(node.addr_map)
 
 
-async def finalize_port_forwarding(node, upnp_task, out, cout):
+def finalize_port_forwarding(node, upnp_task, out, cout):
     """Hand the UPnP/PCP task off to background tracking; do not block startup on it.
 
     Port forwarding only benefits the direct / reverse-connect path,
@@ -689,7 +689,7 @@ async def finalize_port_forwarding(node, upnp_task, out, cout):
 # ==========================================
 # Phase: High-Level Services
 # ==========================================
-async def setup_nickname_service(node):
+def setup_nickname_service(node):
     """Initialise the PNP nickname client and optionally register this node's ID.
 
     Skips the entire client construction when enable_nickname=False --
@@ -705,7 +705,7 @@ async def setup_nickname_service(node):
         node.nick_client = None
         return
 
-    node.nick_client = await Nickname(
+    node.nick_client = Nickname(
         node.sk,
         node.ifs,
         node.sys_clock,
@@ -719,7 +719,7 @@ async def setup_nickname_service(node):
     node.nickname_register_task = task
 
 
-async def register_and_persist(node, name):
+def register_and_persist(node, name):
     """Register name in PNP and stash the full name (with TLD) on node.full_name.
 
     On failure, captures the exception on ``node.nickname_error`` so
@@ -731,7 +731,7 @@ async def register_and_persist(node, name):
     register_t0 = time.monotonic()
     log("[REGISTER-TIME] t=0ms step=put_start")
     try:
-        node.full_name = await node.nickname(name)
+        node.full_name = node.nickname(name)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pylint: disable=broad-except
@@ -747,7 +747,7 @@ async def register_and_persist(node, name):
     ))
 
 
-async def setup_traversal_plugins(node):
+def setup_traversal_plugins(node):
     """Discover and install all traversal plugins found under the plugins/ directory."""
-    await load_plugins(node)
+    load_plugins(node)
     log("traversal plugin_loaders: " + str(node.traversal.plugin_loaders))

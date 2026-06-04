@@ -11,7 +11,7 @@ class GetAddrPlugin(Plugin):
 
     name = "get_addr"
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Resolve the peer's address: extract from reply or send a GetAddr request."""
         if reply:
             log(fstr(
@@ -31,5 +31,5 @@ class GetAddrPlugin(Plugin):
         msg.meta.plugin_name = "return_addr"
 
         # Send this message to the dest_addr for this plugin instance.
-        await self.send_signal(msg)
+        self.send_signal(msg)
 

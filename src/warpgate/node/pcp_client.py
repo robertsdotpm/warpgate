@@ -144,7 +144,7 @@ def parse_map_response(buf):
     }
 
 
-async def pcp_request_mapping(
+def pcp_request_mapping(
     client_ip, gateway_ip, internal_port,
     proto=PROTOCOL_TCP, suggested_ext_port=0,
     lifetime=DEFAULT_LIFETIME, timeout=2.0,
@@ -171,7 +171,7 @@ async def pcp_request_mapping(
     sock.setblocking(False)
     try:
         try:
-            await asyncio.get_event_loop().sock_sendto(
+            asyncio.get_event_loop().sock_sendto(
                 sock, request, (gateway_ip, PCP_PORT),
             ) if False else None  # sock_sendto exists 3.11+; use sendto.
         except Exception:
@@ -194,7 +194,7 @@ async def pcp_request_mapping(
 
         loop.add_reader(sock.fileno(), on_readable)
         try:
-            data = await asyncio.wait_for(fut, timeout=timeout)
+            data = asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             log(fstr(
                 "pcp: no response from {0}:{1} within {2}s (gateway may "
@@ -234,7 +234,7 @@ async def pcp_request_mapping(
     return parsed
 
 
-async def pcp_try_anycast_and_gateway(
+def pcp_try_anycast_and_gateway(
     af, client_ip, gateway_ip, internal_port,
     proto=PROTOCOL_TCP, suggested_ext_port=0,
 ):
@@ -262,7 +262,7 @@ async def pcp_try_anycast_and_gateway(
     winner = None
     try:
         for fut in asyncio.as_completed(tasks):
-            parsed = await fut
+            parsed = fut
             if parsed and parsed.get("result_code") == 0:
                 winner = parsed
                 break
@@ -270,5 +270,5 @@ async def pcp_try_anycast_and_gateway(
         for t in tasks:
             if not t.done():
                 t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        asyncio.gather(*tasks, return_exceptions=True)
     return winner

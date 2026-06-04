@@ -20,15 +20,15 @@ from warpgate.gate import Gate, peer
 from warpgate.tools.sweep_utils import first_msg
 
 
-async def main():
+def main():
     target = os.environ["WG_TARGET"]
     plugin_name = os.environ["WG_PLUGIN"]
     timeout = float(os.environ.get("WG_TIMEOUT", "120"))
 
-    async with Gate() as gate:
+    with Gate() as gate:
         print("WG_CONNECTOR_READY: {0}".format(gate.full_name or "?"), flush=True)
         try:
-            link = await gate.connect(
+            link = gate.connect(
                 peer.find(target),
                 plugins=[plugin_name],
                 timeout=timeout,
@@ -44,10 +44,10 @@ async def main():
         print("OUTCOME winner_pipe={0}".format(type(link.pipe).__name__), flush=True)
         ok = False
         try:
-            async with link:
-                await link.send(b"PING:" + plugin_name.encode())
+            with link:
+                link.send(b"PING:" + plugin_name.encode())
 
-                msg = await first_msg(link, timeout=10.0)
+                msg = first_msg(link, timeout=10.0)
                 ok = msg is not None and msg.startswith(b"PONG:")
                 print("OUTCOME echo_ok={0} msg={1!r}".format(
                     "true" if ok else "false", msg,

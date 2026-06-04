@@ -176,7 +176,7 @@ class Gate(object):
         # afs: optional set of address families this Gate REQUIRES support
         # for.  When None (default) the gate accepts whatever its loaded
         # NICs provide -- existing permissive behaviour.  When set (e.g.
-        # (IP4,) or (IP4, IP6)), __aenter__ validates that every
+        # (IP4,) or (IP4, IP6)), __enter__ validates that every
         # requested AF is supported by at least one loaded NIC and
         # raises GateAfNotSupported if not.  Orchestrators (matrix_full,
         # gate_sweep) MUST always pass this explicitly so a v4-only NIC
@@ -234,7 +234,7 @@ class Gate(object):
         self.node.nic_names = self.nic_names
         self.node.add_msg_cb(cb)
 
-    async def __aenter__(self):
+    def __enter__(self):
         # Startup timeline outside node_start: the pre-start interface
         # load + name derivation, node.start() itself, and the await on
         # the PNP nickname registration task. [NODE-START] only covers
@@ -274,8 +274,8 @@ class Gate(object):
         # idempotent (guards on node.ifs / node.listen_port) so the
         # subsequent node.start() re-running them is a no-op.
         if self.requested_name is None:
-            await load_network_interfaces(self.node)
-            await load_machine_identity(self.node)
+            load_network_interfaces(self.node)
+            load_machine_identity(self.node)
             nic_macs = [getattr(nic, "mac", None) for nic in self.node.ifs]
             self.node.pnp_name = derive_default_pnp_name(
                 nic_macs, self.node.listen_port,
@@ -293,7 +293,7 @@ class Gate(object):
         # node.start() doesn't repeat the work.
         if self.afs is not None:
             if not self.node.ifs:
-                await load_network_interfaces(self.node)
+                load_network_interfaces(self.node)
             available = set()
             for nic in self.node.ifs:
                 try:
@@ -317,17 +317,17 @@ class Gate(object):
             from aionetiface import SysClock
             sys_clock = SysClock(interface=self.node.ifs[0], ntp_addr=self.ntp_addr)
 
-        await self.node.start(sys_clock=sys_clock)
+        self.node.start(sys_clock=sys_clock)
         gate_mark("node_start")
 
         # Wait for the in-flight nickname registration task so the
         # keystore entry (and therefore self.full_name) is populated
-        # by the time __aenter__ returns.
+        # by the time __enter__ returns.
         register_task = getattr(self.node, "nickname_register_task", None)
         if register_task is not None:
             from .node.nickname import FullNameFailure
             try:
-                await register_task
+                register_task
             except (OSError, asyncio.TimeoutError, FullNameFailure):
                 pass
         gate_mark("register")
@@ -350,16 +350,16 @@ class Gate(object):
         "didn't register" message."""
         return getattr(self.node, "nickname_error", None) if self.node else None
 
-    async def __aexit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb):
         self.closed.set()
         if self.node is not None:
             try:
-                await self.node.close()
+                self.node.close()
             except (OSError, asyncio.TimeoutError):
                 pass
         return False
 
-    async def connect(self, target, transport=None, timeout=None,
+    def connect(self, target, transport=None, timeout=None,
                       plugins=None, test_all_phases=False, afs=None,
                       route_types=None):
         """Resolve a PeerHandle / nickname / addr_bytes and return a Link.
@@ -439,21 +439,21 @@ class Gate(object):
         coro = auto_connect(self.node, dest, **kwargs)
         if timeout is not None:
             try:
-                pipe, _plugin = await asyncio.wait_for(coro, timeout=timeout)
+                pipe, _plugin = asyncio.wait_for(coro, timeout=timeout)
             except asyncio.TimeoutError:
                 return None
             except FullNameFailure:
                 return None
         else:
             try:
-                pipe, _plugin = await coro
+                pipe, _plugin = coro
             except FullNameFailure:
                 return None
         if pipe is None:
             return None
         return Link(pipe)
 
-    async def listen(self, handler):
+    def listen(self, handler):
         """Run forever, dispatching each inbound message to ``handler(link, msg)``.
 
         ``link`` is a per-peer ``Link`` wrapper; ``await link.send(msg)``
@@ -469,13 +469,13 @@ class Gate(object):
         """
         owns_gate = False
         if self.node is None:
-            await self.__aenter__()
+            self.__enter__()
             owns_gate = True
 
         peers = {}
         pending_handler_tasks = set()
 
-        async def shim(msg, client_tup, raw_pipe):
+        def shim(msg, client_tup, raw_pipe):
             if getattr(raw_pipe, "proto", None) == TCP:
                 key = id(raw_pipe)
                 ctup = None
@@ -495,16 +495,16 @@ class Gate(object):
 
         self.node.add_msg_cb(shim)
         try:
-            await self.closed.wait()
+            self.closed.wait()
         finally:
             self.node.msg_cbs.discard(shim)
             if pending_handler_tasks:
                 for t in list(pending_handler_tasks):
                     if not t.done():
                         t.cancel()
-                await asyncio.gather(*pending_handler_tasks, return_exceptions=True)
+                asyncio.gather(*pending_handler_tasks, return_exceptions=True)
             if owns_gate:
-                await self.__aexit__(None, None, None)
+                self.__exit__(None, None, None)
 
 
 class Link(object):
@@ -537,7 +537,7 @@ class Link(object):
         # split the stream between handler calls and recv() awaiters).
         # Clear any stale stream.subs left by an earlier consumer too --
         # otherwise add_msg keeps queueing into them and bloats memory.
-        # ensure_subscribed / recv / __anext__ short-circuit in this
+        # ensure_subscribed / recv / __next__ short-circuit in this
         # mode -- listen users should consume via the handler signature.
         self.managed = managed
         if managed:
@@ -546,11 +546,11 @@ class Link(object):
             except AttributeError:
                 pass
 
-    async def send(self, msg):
+    def send(self, msg):
         if self.client_tup is None:
-            await self.pipe.send(msg)
+            self.pipe.send(msg)
         else:
-            await self.pipe.send(msg, self.client_tup)
+            self.pipe.send(msg, self.client_tup)
 
     def ensure_subscribed(self):
         # No-op in managed (Gate.listen) mode: messages already arrive
@@ -563,7 +563,7 @@ class Link(object):
             self.pipe.subscribe(SUB_ALL)
             self.subscribed = True
 
-    async def recv(self):
+    def recv(self):
         """Await one inbound message on the link and return its bytes,
         or None if the link has been closed.  Convenience over the
         ``async for`` iterator for one-shot reads.  Returns None
@@ -573,32 +573,32 @@ class Link(object):
             return None
         self.ensure_subscribed()
         from aionetiface import SUB_ALL
-        msg = await self.pipe.recv(SUB_ALL)
+        msg = self.pipe.recv(SUB_ALL)
         if self.closed:
             return None
         return msg
 
-    def __aiter__(self):
+    def __iter__(self):
         return self
 
-    async def __anext__(self):
+    def __next__(self):
         if self.closed or self.managed:
-            raise StopAsyncIteration
+            raise StopIteration
         self.ensure_subscribed()
         from aionetiface import SUB_ALL
-        msg = await self.pipe.recv(SUB_ALL)
+        msg = self.pipe.recv(SUB_ALL)
         if msg is None or self.closed:
-            raise StopAsyncIteration
+            raise StopIteration
         return msg
 
-    async def __aenter__(self):
+    def __enter__(self):
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb):
         self.closed = True
         if self.client_tup is None:
             try:
-                await self.pipe.close()
+                self.pipe.close()
             except (OSError, asyncio.TimeoutError):
                 pass
         return False

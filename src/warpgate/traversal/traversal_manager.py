@@ -121,7 +121,7 @@ class TraversalManager:
 
     # Plugins return pipes directly or await a pipe future that is resolved
     # elsewhere when a reply arrives over the signaling channel.
-    async def run_plugin(self, plugin, reply=None):
+    def run_plugin(self, plugin, reply=None):
         """Run a single traversal plugin, optionally providing a reply message."""
         # Don't run if result is set.
         if plugin.result.done():
@@ -156,7 +156,7 @@ class TraversalManager:
         # produce a result; resolve plugin.result to None so callers
         # awaiting it (demo, race_plugin_results) return immediately.
         try:
-            await asyncio.wait_for(plugin.run(reply), timeout=plugin.timeout)
+            asyncio.wait_for(plugin.run(reply), timeout=plugin.timeout)
         except asyncio.CancelledError:
             log("[TM] run_plugin CancelledError plugin={0} id={1} -- "
                 "cancelling plugin.result".format(
@@ -201,7 +201,7 @@ class TraversalManager:
                     getattr(plugin, "plugin_id", "?"),
                 ))
             else:
-                await close_plugin(plugin, self.plugins, self.inbound_pipes)
+                close_plugin(plugin, self.plugins, self.inbound_pipes)
 
     def create_plugin(
         self,
@@ -334,7 +334,7 @@ class TraversalManager:
     # viable pair from get_if_infos_order. Keeping the pair out of this
     # method makes multi-interface fan-out work: launch one plugin per pair
     # and let race_plugin_results pick the winner.
-    async def attempt_plugin(
+    def attempt_plugin(
         self,
         src_map,
         dest_map,
@@ -369,7 +369,7 @@ class TraversalManager:
         plugin.sig_pipe = sig_pipe
 
         # Run plugin function -- timeout based on plugin meta.
-        await self.run_plugin(plugin)
+        self.run_plugin(plugin)
         return plugin
 
     # create_plugin builds a plugin from explicit parameters — used when we are
@@ -428,7 +428,7 @@ class TraversalManager:
         return plugin
 
     # Use signal router to send a message to the destination.
-    async def send_signal(self, msg, plugin, relay_no=2):
+    def send_signal(self, msg, plugin, relay_no=2):
         """Encrypt and deliver a signalling message to the peer via the MQTT router."""
         try:
             # Specify the plugin to use in the destination.
@@ -467,13 +467,13 @@ class TraversalManager:
 
             # Convert to bytes and send via MQTT.
             buf = to_s(sig_msg_to_buf(msg, h_to_b(plugin.dest_map["pub_key_hex"])))
-            await plugin.sig_pipe.send(buf)
+            plugin.sig_pipe.send(buf)
         except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
             log_exception()
 
     # Receive a signal message from the router and pass it to a plugin.
     # Called by the MQTT client as: handler(msg, src_pk, queue_id, client)
-    async def recv_signal_msg(self, msg, src_pk_hex, pipe_id_hex, client):
+    def recv_signal_msg(self, msg, src_pk_hex, pipe_id_hex, client):
         """Decrypt an incoming signal message and dispatch it to the matching or new plugin."""
         msg = try_unpack_msg(to_b(msg), self.kp.private_key, self.sig_proto)
 
@@ -530,7 +530,7 @@ class TraversalManager:
 
         # Route to destination via MQTT.
         if plugin.sig_pipe is None:
-            plugin.sig_pipe = await self.router.pipe(
+            plugin.sig_pipe = self.router.pipe(
                 plugin.dest_map["pub_key_hex"], use_cache=True
             )
 
@@ -559,23 +559,23 @@ class TraversalManager:
             return
         fut.set_result(pipe)
 
-    async def close(self):
+    def close(self):
         """Cancel all pending plugins and background tasks, releasing their resources."""
-        await cancel_task(self.cleanup_task)
+        cancel_task(self.cleanup_task)
         for plugin in list(self.plugins.values()):
             try:
-                await close_plugin(plugin, self.plugins, self.inbound_pipes)
+                close_plugin(plugin, self.plugins, self.inbound_pipes)
             except (OSError, asyncio.TimeoutError):
                 log_exception()
 
-        await cancel_tasks(self.tasks)
+        cancel_tasks(self.tasks)
         self.tasks.clear()
 
     # Cleanup timed out plugins.
-    async def cleanup_loop(self):
+    def cleanup_loop(self):
         """Periodically scan for expired plugins and close them to free resources."""
         while True:
-            await asyncio.sleep(5)
+            asyncio.sleep(5)
             try:
                 now = get_running_loop().time()
                 for plugin in list(self.plugins.values()):
@@ -591,7 +591,7 @@ class TraversalManager:
                                 now, expires_at, now - expires_at,
                             ))
                         try:
-                            await close_plugin(plugin, self.plugins, self.inbound_pipes)
+                            close_plugin(plugin, self.plugins, self.inbound_pipes)
                         except asyncio.CancelledError:
                             raise
                         except (OSError, asyncio.TimeoutError):

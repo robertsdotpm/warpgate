@@ -36,7 +36,7 @@ class TURNPlugin(Plugin):
     )
 
     @classmethod
-    async def setup(cls, node):
+    def setup(cls, node):
         factory = TURNPluginFactory(node.msg_cb, node.node_id)
         node.resources.register(factory)
         return factory
@@ -64,7 +64,7 @@ class TURNPlugin(Plugin):
         self.tried_servers = set()
         self.renego_count = 0
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Allocate a TURN relay, exchange addresses with the peer, and establish the channel.
 
         Server selection is initiator-decides with renegotiation. Mirrors
@@ -184,7 +184,7 @@ class TURNPlugin(Plugin):
                 except (IndexError, TypeError, ValueError):
                     pass
                 try:
-                    await existing.close()
+                    existing.close()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -228,7 +228,7 @@ class TURNPlugin(Plugin):
                         (self.plugin_id, target_host, target_port),
                     ))
                     self.tried_servers.add(initiator_choice)
-                    await self.send_rejection("not_in_infra")
+                    self.send_rejection("not_in_infra")
                     if not self.result.done():
                         self.result.set_result(None)
                     return
@@ -240,7 +240,7 @@ class TURNPlugin(Plugin):
                 "turn[{0}]: trying {1} candidate server(s)",
                 (self.plugin_id, len(chosen_servers)),
             ))
-            client = await get_first_working_turn_client(
+            client = get_first_working_turn_client(
                 self.af,
                 chosen_servers,
                 self.nic,
@@ -259,7 +259,7 @@ class TURNPlugin(Plugin):
                         (self.plugin_id, initiator_choice[0], initiator_choice[1]),
                     ))
                     self.tried_servers.add(initiator_choice)
-                    await self.send_rejection("unreachable")
+                    self.send_rejection("unreachable")
                     if not self.result.done():
                         self.result.set_result(None)
                     return
@@ -287,7 +287,7 @@ class TURNPlugin(Plugin):
             # already stored a client — reuse it and discard ours.
             existing = self.turn_clients.get(self.plugin_id)
             if existing is not None:
-                await client.close()
+                client.close()
                 client = existing
             else:
                 self.turn_clients[self.plugin_id] = client
@@ -304,12 +304,12 @@ class TURNPlugin(Plugin):
             dest_peer = reply.payload.peer_tup
             dest_relay = reply.payload.relay_tup
             try:
-                already_accepted = await asyncio.wait_for(
+                already_accepted = asyncio.wait_for(
                     client.accept_peer(dest_peer, dest_relay), 4,
                 )
             except asyncio.TimeoutError:
-                await self.send_rejection("accept_peer_timeout")
-                await self.close()
+                self.send_rejection("accept_peer_timeout")
+                self.close()
                 if not self.result.done():
                     self.result.set_result(None)
                 return
@@ -326,7 +326,7 @@ class TURNPlugin(Plugin):
                 if not self.result.done():
                     self.result.set_result(client)
 
-            our_relay = await client.relay_tup_future
+            our_relay = client.relay_tup_future
             log_p2p(
                 fstr(
                     "Whitelist {0} -> {1} to '{2}'",
@@ -348,8 +348,8 @@ class TURNPlugin(Plugin):
         msg = TURNMsg(
             {
                 "payload": {
-                    "peer_tup": await client.client_tup_future,
-                    "relay_tup": await client.relay_tup_future,
+                    "peer_tup": client.client_tup_future,
+                    "relay_tup": client.relay_tup_future,
                     "server_host": server_host,
                     "server_port": server_port,
                     "tried_servers": [list(t) for t in sorted(self.tried_servers)],
@@ -357,7 +357,7 @@ class TURNPlugin(Plugin):
             }
         )
         msg.meta.plugin_name = "turn"
-        await self.send_signal(msg)
+        self.send_signal(msg)
 
         # --- Wait for the peer to whitelist our relay ---
         # self.ready is resolved by a second run() call when the peer's
@@ -368,7 +368,7 @@ class TURNPlugin(Plugin):
         # Without this cap a non-responding peer would burn the whole
         # plugin timeout at the initiator side.
         try:
-            pipe = await asyncio.wait_for(self.ready, 8)
+            pipe = asyncio.wait_for(self.ready, 8)
         except asyncio.TimeoutError:
             if not self.result.done():
                 self.result.set_result(None)
@@ -376,7 +376,7 @@ class TURNPlugin(Plugin):
         if not self.result.done():
             self.result.set_result(pipe)
 
-    async def send_rejection(self, reason):
+    def send_rejection(self, reason):
         """Tell the peer we cannot allocate on the server they just asked us
         to use. Carries our full tried_servers set so the peer's next pick
         excludes everything we've ruled out, not just the one server we
@@ -398,9 +398,9 @@ class TURNPlugin(Plugin):
             "turn[{0}]: sending rejection reason={1} tried={2}",
             (self.plugin_id, reason, sorted(self.tried_servers)),
         ))
-        await self.send_signal(msg)
+        self.send_signal(msg)
 
-    async def close(self):
+    def close(self):
         """Clean up after a TURN connection attempt.
 
         On failure (timeout, cancellation, error) the TURNClient is closed
@@ -428,7 +428,7 @@ class TURNPlugin(Plugin):
             # allocation while the original is still tearing down.
             turn_client = self.turn_clients.get(self.plugin_id)
             if turn_client is not None:
-                await turn_client.close()
+                turn_client.close()
 
         if not self.ready.done():
             self.ready.cancel()
@@ -450,11 +450,11 @@ class TURNPluginFactory:
         plugin.node_id = self.node_id
         return plugin
 
-    async def close(self):
+    def close(self):
         """Close all shared TURN clients and clear the pool."""
         for client in list(self.turn_clients.values()):
             try:
-                await client.close()
+                client.close()
             except (OSError, asyncio.TimeoutError):
                 pass
 

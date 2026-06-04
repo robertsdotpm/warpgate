@@ -111,7 +111,7 @@ def register_plugin_wire_names(node):
             node.traversal.proto_handlers[wire_name] = handler
 
 
-async def load_plugins(node):
+def load_plugins(node):
     """Discover and install every registered traversal strategy onto node."""
     import_internal_plugins()
     discover()  # external entry-point plugins, if any
@@ -123,7 +123,7 @@ async def load_plugins(node):
         setup = getattr(cls, "setup", None)
         if setup is not None:
             try:
-                factory = await setup(node)
+                factory = setup(node)
             except asyncio.CancelledError:
                 raise
             except (OSError, ValueError, RuntimeError) as exc:

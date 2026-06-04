@@ -85,9 +85,9 @@ class Node(Daemon):
         # Optional TelemetryWriter; set by caller after Node() to opt in.
         self.telemetry = None
 
-    async def msg_cb(self, msg, client_tup, pipe):
+    def msg_cb(self, msg, client_tup, pipe):
         """Route inbound pipe messages through the node protocol dispatcher."""
-        await node_protocol(self, msg, client_tup, pipe)
+        node_protocol(self, msg, client_tup, pipe)
 
     def up_cb(self, _data, _client_tup, pipe):
         """Notify on every newly-accepted inbound TCP pipe.
@@ -100,19 +100,19 @@ class Node(Daemon):
         frame as part of normal data flow.
         """
 
-    async def start(self, sys_clock=None, out=False, cout=print):
+    def start(self, sys_clock=None, out=False, cout=print):
         """Run the full node startup sequence and return self when the node is ready."""
-        await node_start(self, sys_clock=sys_clock, out=out, cout=cout)
+        node_start(self, sys_clock=sys_clock, out=out, cout=cout)
         return self
 
-    async def connect(self, af, route_type, pnp_addr, plugin_name=None):
+    def connect(self, af, route_type, pnp_addr, plugin_name=None):
         """Establish a P2P connection to pnp_addr using the given AF, route type, and optional plugin."""
-        return await node_connect(self, af, route_type, pnp_addr, plugin_name)
+        return node_connect(self, af, route_type, pnp_addr, plugin_name)
 
-    async def nickname(self, name, value=None):
+    def nickname(self, name, value=None):
         """Register name in the PNP system, defaulting value to this node's address bytes."""
         value = value or self.addr_bytes
-        return await self.nick_client.put(name, value)
+        return self.nick_client.put(name, value)
 
     def address(self):
         """Return the node's address bytes, or None if the node has not started."""
@@ -155,17 +155,17 @@ class Node(Daemon):
         """Resolve the Future for pipe_id with the given pipe, unblocking any waiters."""
         return pipe_ready(self.inbound_pipes, pipe_id, pipe)
 
-    async def close(self):
+    def close(self):
         """Gracefully shut down the node, closing all connections, tasks, and services."""
-        await node_stop(self)
+        node_stop(self)
 
     def __await__(self):
         return self.start().__await__()
 
-    async def __aenter__(self):
-        await self.start()
+    def __enter__(self):
+        self.start()
         return self
 
-    async def __aexit__(self, *_):
-        await self.close()
+    def __exit__(self, *_):
+        self.close()
         return False

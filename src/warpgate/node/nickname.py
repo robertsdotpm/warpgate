@@ -150,7 +150,7 @@ class Nickname:
         self.clients = {IP4: {}, IP6: {}}
         self.started = False
 
-    async def start(self, timeout=2):
+    def start(self, timeout=2):
         """Connect to all reachable PNP servers and mark the client as started."""
         tasks = []
 
@@ -170,12 +170,12 @@ class Nickname:
                 )
                 client.kp = namebump.Keypair(self.sk)
 
-                async def job(af=af, index=index, client=client):
+                def job(af=af, index=index, client=client):
                     """Start the namebump client and verify connectivity, returning (af, index, client)."""
                     pipe = None
                     try:
-                        await client.start()
-                        pipe = await asyncio.wait_for(
+                        client.start()
+                        pipe = asyncio.wait_for(
                             client.get_dest_pipe(), timeout=timeout
                         )
                         if pipe is None:
@@ -185,12 +185,12 @@ class Nickname:
                         return (af, index, None)
                     finally:
                         if pipe is not None:
-                            await pipe.close()
+                            pipe.close()
                     return (af, index, client)
 
                 tasks.append(asyncio.create_task(job()))
 
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        results = asyncio.gather(*tasks, return_exceptions=False)
 
         for af, index, client in results:
             self.clients[af][index] = client
@@ -212,7 +212,7 @@ class Nickname:
         self.started = True
         return self
 
-    async def put(
+    def put(
         self,
         name,
         value,
@@ -253,7 +253,7 @@ class Nickname:
         # Single coro for storing at one server. namebump.Client.put
         # retries internally on transient network errors, so this worker
         # only needs to walk the AFs and surface any non-network failure.
-        async def worker(offset):
+        def worker(offset):
             """Attempt to store the name on the PNP server at offset and return offset on success."""
             
             for af in VALID_AFS:
@@ -270,7 +270,7 @@ class Nickname:
                         "Nickname.put: offset={0} af={1} -> client.put",
                         (offset, af),
                     ))
-                    ret = await client.put(name, wrapped_value, client.kp, behavior)
+                    ret = client.put(name, wrapped_value, client.kp, behavior)
                     dt = int((time.time() - t0) * 1000)
                     if ret is None:
                         log(fstr(
@@ -321,7 +321,7 @@ class Nickname:
 
         # Attempt storage at all PNP servers.
         log(fstr("Nickname.put: gathering {0} workers", (len(tasks),)))
-        results = await asyncio.gather(*tasks)
+        results = asyncio.gather(*tasks)
         log(fstr("Nickname.put: gather done, results={0}", (results,)))
         success_offsets = set(strip_none(results))
         expected_offsets = set(range(len(self.clients[IP4])))
@@ -343,7 +343,7 @@ class Nickname:
         tld = pnp_get_tld(sorted(expected_offsets))
         return fstr("{0}{1}", (name, tld))
 
-    async def get(
+    def get(
         self,
         name,
         timeout=NAMING_TIMEOUT,
@@ -380,7 +380,7 @@ class Nickname:
         if not self.started:
             raise AssertionError("Nickname client not started. Call start() first.")
 
-        async def worker(offset, name):
+        def worker(offset, name):
             """Query the PNP server at offset for name and return the first non-None record."""
             
             for af in VALID_AFS:
@@ -397,7 +397,7 @@ class Nickname:
                         "Nickname.get: offset={0} af={1} -> client.get",
                         (offset, af),
                     ))
-                    ret = await client.get(name)
+                    ret = client.get(name)
                     dt = time.time() - t0
                     has_val = ret is not None and ret.value is not None
                     log(fstr(
@@ -440,7 +440,7 @@ class Nickname:
         offsets = pnp_get_offsets(tld)
         name = name[: -len(tld)]
 
-        async def one_sweep():
+        def one_sweep():
             """Fan out one round of PNP queries and return the first
             non-None result, or None if no server responded with a
             record that passed the freshness filter."""
@@ -451,7 +451,7 @@ class Nickname:
             first_in = asyncio.as_completed(tasks, timeout=t)
             try:
                 for task in first_in:
-                    ret = await task
+                    ret = task
                     if ret is not None and ret.value is not None:
                         return ret
             except asyncio.TimeoutError:
@@ -462,7 +462,7 @@ class Nickname:
         # freshness filter at all, or a filter that should fail-fast
         # so the caller decides what to do (retry, fall back, abort).
         if not wait_for_fresh:
-            ret = await one_sweep()
+            ret = one_sweep()
             if ret is not None:
                 return ret
             raise FullNameFailure(fstr("Could not fetch {0}", (name,)))
@@ -478,7 +478,7 @@ class Nickname:
         attempt = 0
         while True:
             attempt += 1
-            ret = await one_sweep()
+            ret = one_sweep()
             if ret is not None:
                 log(fstr(
                     "Nickname.get: wait_for_fresh succeeded attempt={0} ts={1}",
@@ -500,9 +500,9 @@ class Nickname:
                 "sleeping {1}s",
                 (attempt, retry_interval),
             ))
-            await asyncio.sleep(retry_interval)
+            asyncio.sleep(retry_interval)
 
-    async def usage(self, timeout=NAMING_TIMEOUT):
+    def usage(self, timeout=NAMING_TIMEOUT):
         """Return current per-IP quota usage from the first reachable
         PNP server, as a dict::
 
@@ -519,7 +519,7 @@ class Nickname:
                 if client is None:
                     continue
                 try:
-                    info = await asyncio.wait_for(
+                    info = asyncio.wait_for(
                         client.usage(client.kp), timeout,
                     )
                     if info is not None:
@@ -529,7 +529,7 @@ class Nickname:
                     continue
         return None
 
-    async def usage_all(self, timeout=NAMING_TIMEOUT):
+    def usage_all(self, timeout=NAMING_TIMEOUT):
         """Return per-AF quota usage, keyed by address family::
 
             {IP4: {"af": int, "names_used": int, "name_limit": int},
@@ -555,7 +555,7 @@ class Nickname:
                 if client is None:
                     continue
                 try:
-                    info = await asyncio.wait_for(
+                    info = asyncio.wait_for(
                         client.usage(client.kp), timeout,
                     )
                 except (OSError, ConnectionError, asyncio.TimeoutError):
@@ -566,20 +566,20 @@ class Nickname:
                     break
         return out
 
-    async def delete(self, name, timeout=NAMING_TIMEOUT):
+    def delete(self, name, timeout=NAMING_TIMEOUT):
         """Delete the record for name from all reachable PNP servers concurrently."""
         if not self.started:
             raise AssertionError("Nickname client not started. Call start() first.")
         name = pnp_strip_tlds(name)
 
-        async def worker(offset):
+        def worker(offset):
             """Send a delete request for name to the PNP server at offset and return the result."""
             for af in VALID_AFS:
                 try:
                     client = self.clients[af][offset]
                     if client is None:
                         continue
-                    ret = await client.delete(name, client.kp)
+                    ret = client.delete(name, client.kp)
                     if ret is not None:
                         return ret
                 except (OSError, ConnectionError, asyncio.TimeoutError):
@@ -589,27 +589,27 @@ class Nickname:
         for offset in range(0, len(self.clients[IP4])):
             tasks.append(async_wrap_errors(worker(offset), timeout))
 
-        await asyncio.gather(*tasks)
+        asyncio.gather(*tasks)
 
-    async def close(self):
+    def close(self):
         """Close all active PNP client connections and reset the started flag."""
         for af in self.clients:
             for index in list(self.clients[af]):
                 client = self.clients[af][index]
                 if client is not None and hasattr(client, "close"):
                     try:
-                        await client.close()
+                        client.close()
                     except (OSError, asyncio.TimeoutError):
                         pass
                 self.clients[af][index] = None
         self.started = False
 
-    async def __aenter__(self):
-        await self.start()
+    def __enter__(self):
+        self.start()
         return self
 
-    async def __aexit__(self, *_):
-        await self.close()
+    def __exit__(self, *_):
+        self.close()
         return False
 
     def __await__(self):

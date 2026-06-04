@@ -135,7 +135,7 @@ def punching_process(puncher, reverse_server_dest, stop_reader, ready_writer=Non
                 pass
 
 
-async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node_msg_cb=None):
+def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node_msg_cb=None):
     """Start the out-of-process punch worker and accept the reverse connection it makes back."""
     log("[PUNCH-PROC] start_punching_process enter af={0} src_ip={1} dest_ip={2} nic={3} node_msg_cb={4}".format(
         getattr(puncher, "af", None),
@@ -162,7 +162,7 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
         # the worker then connects to 127.0.0.1 / ::1 and the bridge
         # works on every Windows version.
         reverse_route = nic.route(puncher.af)
-        reverse_route = await reverse_route.bind(ips=puncher.src_ip)
+        reverse_route = reverse_route.bind(ips=puncher.src_ip)
 
         if puncher.af == 2:  # IP4
             any_addr = "0.0.0.0"
@@ -176,7 +176,7 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
         listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener_sock.bind((any_addr, 0))
         listener_sock.setblocking(False)
-        reverse_server = await Pipe(
+        reverse_server = Pipe(
             TCP, None, reverse_route, sock=listener_sock,
         ).connect()
         if reverse_server is None:
@@ -281,7 +281,7 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
         # for setup overhead.  Was 60s when there was only a single
         # fire, which silently truncated the secondary attempt.
         log("[PUNCH-PROC] awaiting reverse_server.accept (130s)")
-        punch_process_connection = await asyncio.wait_for(
+        punch_process_connection = asyncio.wait_for(
             reverse_server.accept(), timeout=130
         )
         log("[PUNCH-PROC] reverse_server.accept returned conn={0}".format(
@@ -304,7 +304,7 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
         # beats discarding a successful punch.
         if punch_process_connection is not None and ready_main is not None:
             try:
-                await asyncio.wait_for(loop.sock_recv(ready_main, 1), timeout=10)
+                asyncio.wait_for(loop.sock_recv(ready_main, 1), timeout=10)
                 log("[PUNCH-PROC] bridge copy loop confirmed live")
             except asyncio.TimeoutError:
                 log("[PUNCH-PROC] bridge-ready signal timed out; "
@@ -325,7 +325,7 @@ async def start_punching_process(nic, puncher, stop_reader, proc_pool=None, node
             worker_fut.cancel()
             log("[PUNCH-PROC] worker_fut cancelled in finally")
         if reverse_server is not None:
-            await async_wrap_errors(reverse_server.close(keep_clients=True))
+            async_wrap_errors(reverse_server.close(keep_clients=True))
         # ready_main is ours to close.  ready_worker belongs to the
         # worker thread once dispatched -- punching_process's own
         # finally closes it; closing it here too would race that

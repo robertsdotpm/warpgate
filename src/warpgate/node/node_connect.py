@@ -27,7 +27,7 @@ def apply_listen_ips(node):
         raise ValueError("listen IPs not found on any interface: " + ", ".join(missing))
 
 
-async def resolve_pnp_addr(node, pnp_addr):
+def resolve_pnp_addr(node, pnp_addr):
     """Resolve a PNP nickname to (addr_bytes, dest_vk, source).
 
     source is "mqtt" if the address was refreshed via the MQTT router,
@@ -60,7 +60,7 @@ async def resolve_pnp_addr(node, pnp_addr):
         tld = pnp_get_tld(list(range(len(PNP_SERVERS[IP4]))))
         pnp_addr = pnp_addr + tld
 
-    pkt = await node.nick_client.get(pnp_addr)
+    pkt = node.nick_client.get(pnp_addr)
     if pkt is None or pkt.value is None:
         raise LookupError(fstr("Nickname '{0}' not found", (pnp_addr,)))
     # Strip the PNP1<ts>... staleness envelope that pnp_wrap_with_ts
@@ -76,7 +76,7 @@ async def resolve_pnp_addr(node, pnp_addr):
         ))
     source = "nickname"
     try:
-        updated_addr_bytes = await asyncio.wait_for(
+        updated_addr_bytes = asyncio.wait_for(
             get_updated_addr_from_mqtt(node, addr_bytes), timeout=10
         )
         if updated_addr_bytes:
@@ -124,7 +124,7 @@ def iter_viable_pairs(
         yield src, dest
 
 
-async def connect(node, af, route_type, pnp_addr, plugin_name=None):
+def connect(node, af, route_type, pnp_addr, plugin_name=None):
     """Resolve the destination address and run the traversal plugin to establish a P2P connection.
 
     reverse_connect is special-cased: per the any-pathway design the
@@ -134,7 +134,7 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
     of those is None the constraint is left as the any-pathway sentinel
     so the responder iterates compatible options.
     """
-    addr_bytes, dest_vk, _ = await resolve_pnp_addr(node, pnp_addr)
+    addr_bytes, dest_vk, _ = resolve_pnp_addr(node, pnp_addr)
     dest_map = parse_node_addr(addr_bytes)
     if dest_map is None:
         # The PNP record exists but its value isn't a valid serialised
@@ -155,7 +155,7 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
     # over rendezvous discovery -- the dest GUARANTEED subscribed
     # at those brokers when it published the addr, sidestepping
     # cross-peer broker-set non-convergence.
-    sig_pipe = await node.router.pipe(
+    sig_pipe = node.router.pipe(
         dest_map["pub_key_hex"],
         use_cache=True,
         hint_brokers=dest_map.get("mqtt_brokers") or [],
@@ -190,7 +190,7 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
         plugin.set_addrs(src_map, dest_map)
         plugin.sig_pipe = sig_pipe
         plugin.configure_target(plugin_name, af=af, route_type=route_type)
-        await node.traversal.run_plugin(plugin)
+        node.traversal.run_plugin(plugin)
         return plugin
 
     if not af:
@@ -249,7 +249,7 @@ async def connect(node, af, route_type, pnp_addr, plugin_name=None):
     for src, dest in iter_viable_pairs(af, route_type, src_map, dest_map):
         tried += 1
         try:
-            return await node.traversal.attempt_plugin(
+            return node.traversal.attempt_plugin(
                 src_map=src_map,
                 dest_map=dest_map,
                 sig_pipe=sig_pipe,

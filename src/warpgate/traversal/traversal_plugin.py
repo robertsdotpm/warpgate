@@ -46,9 +46,9 @@ class Plugin:
         self.dest = dest
         self.nic = nic
 
-    async def bind(self, port=0):
+    def bind(self, port=0):
         """Return a route bound to this plugin's resolved src IP."""
-        return await self.nic.route(self.af).bind(ips=self.src["ip"], port=port)
+        return self.nic.route(self.af).bind(ips=self.src["ip"], port=port)
 
     def set_context(self, route_type, same_machine, set_bind, timeout):
         """Set the route type, same-machine flag, bind preference, and timeout for this plugin.
@@ -72,9 +72,9 @@ class Plugin:
         """Register the manager-level function plugins call to send signal messages."""
         self.signal_sender = send_signal
 
-    async def send_signal(self, msg, relay_no=2):
+    def send_signal(self, msg, relay_no=2):
         """Delegate sending a signal message to the manager, passing self as the plugin context."""
-        return await self.signal_sender(msg, self, relay_no)
+        return self.signal_sender(msg, self, relay_no)
 
     def register_inbound(self):
         """Pre-register a Future in inbound_pipes so arriving connections are not missed."""
@@ -82,7 +82,7 @@ class Plugin:
         # connection arrives before the future exists.
         self.inbound_pipes[self.plugin_id] = asyncio.Future()
 
-    async def wait_for_inbound(self):
+    def wait_for_inbound(self):
         """Await the Future for this plugin's inbound connection and clean up on failure."""
         # Per-run cleanup intentionally does NOT pop inbound_pipes
         # here. Cleanup semantics across plugins will be revisited in
@@ -91,7 +91,7 @@ class Plugin:
         timeout = getattr(self, "timeout", None)
         if timeout is not None:
             try:
-                return await asyncio.wait_for(
+                return asyncio.wait_for(
                     asyncio.shield(self.inbound_pipes[self.plugin_id]),
                     timeout=timeout * 0.9,
                 )
@@ -101,9 +101,9 @@ class Plugin:
                 if fut is not None and not fut.done():
                     fut.cancel()
                 return None
-        return await self.inbound_pipes[self.plugin_id]
+        return self.inbound_pipes[self.plugin_id]
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Execute the traversal strategy; subclasses must override this method."""
         log(
             "Plugin.run() called on base class - subclass should override this."

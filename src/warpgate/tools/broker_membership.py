@@ -43,10 +43,10 @@ def fmt_client(client):
     }
 
 
-async def main_async(peer_pub_hexes):
+def main_async(peer_pub_hexes):
     """Start a node, dump self + (optional) per-peer broker membership."""
     print("starting node (this takes a few seconds)...", file=sys.stderr)
-    node = await Node().start()
+    node = Node().start()
 
     out = {
         "self_pub_hex": node.kp.public_key_hex,
@@ -68,7 +68,7 @@ async def main_async(peer_pub_hexes):
         print("sync wait {0}s for matrix peers to finish subscribing...".format(
             sync_wait,
         ), file=sys.stderr)
-        await asyncio.sleep(sync_wait)
+        asyncio.sleep(sync_wait)
 
     # Phase 2: for each provided peer pubkey, run get_dest_clients
     # and dump the resulting client set. Local import keeps phase 1
@@ -77,7 +77,7 @@ async def main_async(peer_pub_hexes):
         from sidewire.utils import get_dest_clients
         for tgt in peer_pub_hexes:
             try:
-                clients = await get_dest_clients(
+                clients = get_dest_clients(
                     node.router.nic,
                     tgt,
                     node.router.servers,
@@ -105,12 +105,12 @@ async def main_async(peer_pub_hexes):
         print("post-query stay-alive {0}s before shutdown...".format(
             stay_alive,
         ), file=sys.stderr)
-        await asyncio.sleep(stay_alive)
+        asyncio.sleep(stay_alive)
 
     print(json.dumps(out, indent=2))
 
     try:
-        await asyncio.wait_for(node.close(), timeout=10)
+        asyncio.wait_for(node.close(), timeout=10)
     except (asyncio.TimeoutError, OSError, ConnectionError):
         pass
 

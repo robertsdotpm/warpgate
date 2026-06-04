@@ -83,15 +83,15 @@ class PunchPlugin(Plugin):
     )
 
     @classmethod
-    async def setup(cls, node):
+    def setup(cls, node):
         if not node.conf.get("enable_punching", True):
             return None
-        factory = await PunchPluginFactory.create(node.stun_clients, node.sys_clock)
+        factory = PunchPluginFactory.create(node.stun_clients, node.sys_clock)
         node.resources.punch_factory = factory
         node.resources.register(factory)
         return factory
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Coordinate the hole-punch exchange and launch the background punching process."""
         if getattr(self, "stage_t0", None) is None:
             self.stage_t0 = time.monotonic()
@@ -164,7 +164,7 @@ class PunchPlugin(Plugin):
                 self.plugin_id,
             ))
             try:
-                puncher, stuns = await self.setup_puncher_client(reply)
+                puncher, stuns = self.setup_puncher_client(reply)
             except BaseException as exc:
                 raise
             stamp("setup_done", puncher=(puncher is not None), stuns=len(stuns) if stuns else 0)
@@ -182,7 +182,7 @@ class PunchPlugin(Plugin):
                     self.plugin_id,
                 ))
                 try:
-                    puncher = await self.configure_puncher_process(puncher, stuns)
+                    puncher = self.configure_puncher_process(puncher, stuns)
                 except BaseException as exc:
                     raise
                 stamp("configure_done")
@@ -195,7 +195,7 @@ class PunchPlugin(Plugin):
         # Each call computes the next round of port predictions and checks
         # whether both sides have exchanged enough mappings to attempt punching.
         try:
-            outgoing_msg = await self.advance_punching_protocol(
+            outgoing_msg = self.advance_punching_protocol(
                 puncher, reply, puncher.punch_time
             )
         except BaseException as exc:
@@ -226,10 +226,10 @@ class PunchPlugin(Plugin):
         log("[PUNCH-RUN] sending outgoing PunchMsg plugin_id={0}".format(self.plugin_id))
         self.outgoing_sent_at = time.time()
         stamp("send_signal_start")
-        await self.send_signal(outgoing_msg)
+        self.send_signal(outgoing_msg)
         stamp("send_signal_done")
 
-    async def setup_puncher_client(self, reply):
+    def setup_puncher_client(self, reply):
         """
         Determines the source/destination addresses and the decider IP,
         creates a new PunchClient, and sets the coordinated time references.
@@ -261,7 +261,7 @@ class PunchPlugin(Plugin):
             )
             from .punch_defs import PUNCH_CONF
             try:
-                retry = await asyncio.wait_for(
+                retry = asyncio.wait_for(
                     get_n_stun_clients(
                         af=self.af, n=USE_MAP_NO, mode=RFC5389,
                         interface=self.nic, proto=TCP, conf=PUNCH_CONF,
@@ -398,7 +398,7 @@ class PunchPlugin(Plugin):
         # Return the new puncher and the STUN clients
         return puncher, stuns
 
-    async def configure_puncher_process(self, puncher, stuns):
+    def configure_puncher_process(self, puncher, stuns):
         """
         Initializes the NAT Prediction Allocator, saves the PunchClient,
         and schedules the delayed asynchronous punching process.
@@ -434,7 +434,7 @@ class PunchPlugin(Plugin):
 
         return puncher
 
-    async def advance_punching_protocol(self, puncher, reply, punch_time):
+    def advance_punching_protocol(self, puncher, reply, punch_time):
         """Compute the next round of port predictions and return an outgoing PunchMsg, or None when done."""
         # For LAN, STUN is useless (returns each side's own port).
         # Boundary ports from setup_puncher_client already align both sides.
@@ -498,7 +498,7 @@ class PunchPlugin(Plugin):
             return None
 
         # Compute the next round of port predictions.
-        port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
+        port_alloc, is_end = self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
 
         # Mark that the peer's mappings have now been folded.  The
@@ -568,7 +568,7 @@ class PunchPlugin(Plugin):
     # whatever port_allocs are already set.  Do NOT make reply_delay
     # derive from RTT or anything else clock-adjacent -- it's a
     # fallback ceiling, not a synchronisation primitive.
-    async def delayed_start_punching_proc(self, nic, puncher):
+    def delayed_start_punching_proc(self, nic, puncher):
         """Wait for mapping_reply (or reply_delay timeout) then launch the punching process and resolve the result."""
         reply_delay = puncher.params.get("reply_delay", 2.0)
         log("[PUNCH-DELAY] enter plugin_id={0} reply_delay={1}s".format(
@@ -576,7 +576,7 @@ class PunchPlugin(Plugin):
         ))
         try:
             try:
-                await asyncio.wait_for(self.mapping_reply, reply_delay)
+                asyncio.wait_for(self.mapping_reply, reply_delay)
                 log("[PUNCH-DELAY] mapping_reply resolved; calling start_punching_process plugin_id={0}".format(
                     self.plugin_id,
                 ))
@@ -584,7 +584,7 @@ class PunchPlugin(Plugin):
                 log("[PUNCH-DELAY] mapping_reply timed out after {0}s; proceeding plugin_id={1}".format(
                     reply_delay, self.plugin_id,
                 ))
-            pipe = await start_punching_process(
+            pipe = start_punching_process(
                 nic,
                 puncher,
                 self.stop_reader,
@@ -602,7 +602,7 @@ class PunchPlugin(Plugin):
             elif pipe is not None:
                 # result was already cancelled/resolved by race_combos while
                 # start_punching_process was in flight; close the orphaned pipe.
-                await async_wrap_errors(pipe.close())
+                async_wrap_errors(pipe.close())
         except asyncio.CancelledError:
             log("[PUNCH-DELAY] CANCELLED plugin_id={0}".format(self.plugin_id))
             raise
@@ -623,7 +623,7 @@ class PunchPlugin(Plugin):
             log("[PUNCH-DELAY] finally plugin_id={0}".format(self.plugin_id))
             self.completed_pipe_ids.add(self.plugin_id)
 
-    async def close(self):
+    def close(self):
         """Cancel any in-flight punch task and remove this plugin's shared state.
 
         Safe to call multiple times: pop() is a no-op when the key is absent
@@ -636,7 +636,7 @@ class PunchPlugin(Plugin):
             task is not None and not task.done() if task else False,
             self.result.done(),
         ))
-        await cancel_task(task)
+        cancel_task(task)
 
         # Cancel the result future if nobody resolved it (e.g. outer timeout).
         if not self.result.done():
@@ -664,10 +664,10 @@ self,
         self.completed_pipe_ids = set()
 
     @classmethod
-    async def create(cls, stun_clients, sys_clock):
+    def create(cls, stun_clients, sys_clock):
         """Async factory that allocates a process pool executor and returns a ready factory."""
         factory = cls(stun_clients, sys_clock)
-        factory.max_workers, factory.proc_pool = await get_pp_executors()
+        factory.max_workers, factory.proc_pool = get_pp_executors()
         factory.active_punchers = 0
         return factory
 
@@ -682,11 +682,11 @@ self,
         plugin.completed_pipe_ids = self.completed_pipe_ids
         return plugin
 
-    async def close(self):
+    def close(self):
         """Shut down the process pool executor used for running punch workers."""
         if not self.proc_pool:
             return
-        await shutdown_proc_pool(self.proc_pool)
+        shutdown_proc_pool(self.proc_pool)
         self.proc_pool = None
 
 

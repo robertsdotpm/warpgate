@@ -77,7 +77,7 @@ from .upnp_utils import (
 )
 
 
-async def brute_force_port_forward(
+def brute_force_port_forward(
 af,
     interface,
     ext_port,
@@ -88,23 +88,23 @@ af,
 ):
     """Probe known UPnP ports on local gateways and attempt port forwarding via all found services."""
     # Check if a port is open.
-    async def try_connect(port, host):
+    def try_connect(port, host):
         """Attempt a TCP connection to host:port and return the dest tuple on success."""
         dest = (host, port)
-        route = await interface.route(af).bind()
+        route = interface.route(af).bind()
         try:
-            pipe = await Pipe(TCP, dest, route, conf=UPNP_CONF).connect()
-            await pipe.close()
+            pipe = Pipe(TCP, dest, route, conf=UPNP_CONF).connect()
+            pipe.close()
             return dest
         except (OSError, ConnectionError, asyncio.TimeoutError):
             return None
 
     # Try to load forwarding services at path and use them.
-    async def try_service_path(path, dest):
+    def try_service_path(path, dest):
         """Fetch the UPnP description at path on dest and attempt to apply the forwarding rule."""
         # Get service URLs for port forwarding or pin hole.
-        route = await interface.route(af).bind()
-        service_info = await async_wrap_errors(
+        route = interface.route(af).bind()
+        service_info = async_wrap_errors(
             get_upnp_forwarding_services(route, dest, path)
         )
 
@@ -113,7 +113,7 @@ af,
             return 0
 
         # Attempt to forward port.
-        forward_success = await async_wrap_errors(
+        forward_success = async_wrap_errors(
             use_upnp_forwarding_services(
                 af,
                 interface,
@@ -181,7 +181,7 @@ af,
             tasks.append(async_wrap_errors(try_connect(port, host)))
 
         # Socket limit to port list * ifs.
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = asyncio.gather(*tasks, return_exceptions=True)
         dests += strip_none(results)
 
     # Build list of tasks.
@@ -193,7 +193,7 @@ af,
                 tasks.append(async_wrap_errors(try_service_path(path, dest)))
 
             # Socket limit to path list * ifs.
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = asyncio.gather(*tasks, return_exceptions=True)
             if 1 in results:
                 return 1
 
@@ -201,7 +201,7 @@ af,
     return 0
 
 
-async def discover_upnp_devices(af, nic):
+def discover_upnp_devices(af, nic):
     """Send an SSDP M-SEARCH multicast and collect HTTP replies from responding UPnP devices."""
     # Set protocol family for multicast socket.
     sock_conf = dict_child(
@@ -213,8 +213,8 @@ async def discover_upnp_devices(af, nic):
     )
 
     # Make multicast socket for M-search.
-    route = await nic.route(af).bind(ips="*")
-    sock = await socket_factory(route, sock_type=UDP, conf=sock_conf)
+    route = nic.route(af).bind(ips="*")
+    sock = socket_factory(route, sock_type=UDP, conf=sock_conf)
     if sock is None:
         log(fstr("discover upnp sock none {0}", (af,)))
         return
@@ -229,7 +229,7 @@ async def discover_upnp_devices(af, nic):
     # Create async pipe wrapper for multicast socket.
     dest = (UPNP_IP[af], UPNP_PORT)
     try:
-        pipe = await Pipe(UDP, dest, route, sock=sock, conf=sock_conf).connect()
+        pipe = Pipe(UDP, dest, route, sock=sock, conf=sock_conf).connect()
     except asyncio.CancelledError:
         raise
     except (OSError, ConnectionError):
@@ -259,15 +259,15 @@ async def discover_upnp_devices(af, nic):
 
     # Multiple sends spaced apart because UDP is garbage.
     for _ in range(0, 3):
-        await pipe.send(buf)
-        await asyncio.sleep(0.1)
+        pipe.send(buf)
+        asyncio.sleep(0.1)
 
     # Get list of HTTP replies from M-Search message.
     replies = []
     timeout = 2
     start_time = time.monotonic()
     while time.monotonic() - start_time < timeout:
-        out = await pipe.recv(timeout=0.1)
+        out = pipe.recv(timeout=0.1)
         if out is None:
             continue
 
@@ -279,11 +279,11 @@ async def discover_upnp_devices(af, nic):
 
         replies.append(reply)
 
-    await pipe.close()
+    pipe.close()
     return replies
 
 
-async def port_forward_from_multicast(
+def port_forward_from_multicast(
 af,
     interface,
     ext_port,
@@ -295,16 +295,16 @@ af,
     try:
         # Get list of possible devices supporting UPNP.
         # I think NAT-PMP devices also reply here.
-        replies = await discover_upnp_devices(af, interface)
+        replies = discover_upnp_devices(af, interface)
         replies = sort_upnp_replies_by_unique_location(replies)
 
         # Get a list of service URLs that match forwarding or pin hole.
-        service_infos = await get_upnp_forwarding_services_for_replies(
+        service_infos = get_upnp_forwarding_services_for_replies(
             af, src_tup, interface, replies
         )
 
         # Try to use the service URLs for forwarding.
-        forward_success = await use_upnp_forwarding_services(
+        forward_success = use_upnp_forwarding_services(
             af,
             interface,
             ext_port,
@@ -328,7 +328,7 @@ af,
 # the function returns as soon as possible.
 
 
-async def port_forward(af, interface, ext_port, src_tup, desc, proto="TCP"):
+def port_forward(af, interface, ext_port, src_tup, desc, proto="TCP"):
     """
     This process is very slow and will be done in the background
     incrementally. This is because there is a 64 socket max limit
@@ -348,23 +348,23 @@ async def port_forward(af, interface, ext_port, src_tup, desc, proto="TCP"):
     winner = 0
     try:
         for done in asyncio.as_completed(tasks):
-            result = await done
+            result = done
             if result:
                 winner = 1
                 break
     finally:
-        await cancel_tasks(tasks)
+        cancel_tasks(tasks)
 
     return winner
 
 
 if __name__ == "__main__":
 
-    async def upnp_main():
+    def upnp_main():
         """Standalone test entry point that runs port_forward on the first IPv4 interface."""
         from .interface import Interface
 
-        nic = await Interface("enp0s25")
+        nic = Interface("enp0s25")
         af = IP4
         route = nic.route(af)
 
@@ -381,9 +381,9 @@ if __name__ == "__main__":
 
         # src_ip = route.ext()
 
-        await port_forward(af, nic, 60001, (src_ip, 8000), "test")
+        port_forward(af, nic, 60001, (src_ip, 8000), "test")
         while True:
-            await asyncio.sleep(1)
+            asyncio.sleep(1)
 
     async_test(upnp_main)
 

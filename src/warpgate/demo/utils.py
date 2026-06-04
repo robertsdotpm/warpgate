@@ -25,7 +25,7 @@ if not _IS_WINDOWS:
     ainput_interrupt_r, ainput_interrupt_w = os.pipe()
 
 
-async def ainput(prompt):
+def ainput(prompt):
     """Read a line of input from stdin asynchronously, unblocking on shutdown signals."""
     loop = get_running_loop()
 
@@ -63,7 +63,7 @@ async def ainput(prompt):
 
     fut = loop.run_in_executor(None, blocking_input)
     try:
-        return await fut
+        return fut
     except asyncio.CancelledError:
         # Unblock the blocking_input thread so the executor shuts down
         # cleanly.
@@ -103,14 +103,14 @@ def cout(*fargs):
         print(*fargs, flush=True)
 
 
-async def add_echo_support(msg, client_tup, pipe):
+def add_echo_support(msg, client_tup, pipe):
     """Handle incoming ECHO protocol messages by stripping the prefix and sending back the payload."""
     print("[ECHO-CB] msg={0!r} client_tup={1!r}".format(msg[:48], client_tup))
     if b"ECHO" == msg[:4]:
         cout()
         cout("\tGot echo proto msg: " + to_s(msg) + fstr(" from {0}", (client_tup,)))
         cout()
-        await pipe.send(msg[4:], client_tup)
+        pipe.send(msg[4:], client_tup)
         print("[ECHO-CB] replied to {0}".format(client_tup))
 
         # Maybe give event loop chance to send before exit, IDK.
@@ -121,7 +121,7 @@ async def add_echo_support(msg, client_tup, pipe):
             # Since this will shut down -- got to be a better way to ensure
             # send has finished before closing TODO
             for _ in range(0, 5):
-                await asyncio.sleep(0.1)
+                asyncio.sleep(0.1)
 
             stop_rw[1].send(b"Clean shutdown.")
 
@@ -207,7 +207,7 @@ def display_ifs_loaded(ifs):
     cout(buf)
 
 
-async def get_dest_addr(node, last_addr):
+def get_dest_addr(node, last_addr):
     """
     Dest addr may have already been set from previous invocations of the
     program.
@@ -222,7 +222,7 @@ async def get_dest_addr(node, last_addr):
     if last_addr:
         extra_txt = fstr("(enter for {0})", (last_addr["addr"],))
 
-    dest_addr = await ainput(
+    dest_addr = ainput(
         fstr("Enter nodes nickname or address {0}: ", (extra_txt,))
     )
     if dest_addr.lower().strip() == "menu":
@@ -235,7 +235,7 @@ async def get_dest_addr(node, last_addr):
     if pnp_name_has_tld(dest_addr):
         cout(fstr("Resolving {0}...", (dest_addr,)))
         try:
-            addr_bytes, _, source = await resolve_pnp_addr(node, dest_addr)
+            addr_bytes, _, source = resolve_pnp_addr(node, dest_addr)
             cout(
                 fstr(
                     "Resolved via {0}: {1}",
@@ -254,7 +254,7 @@ async def get_dest_addr(node, last_addr):
         ) as e:
             cout(fstr("Nickname lookup failed ({0}).", (e,)))
             cout("Please paste the full serialized node address instead.")
-            fallback = await ainput("Address: ")
+            fallback = ainput("Address: ")
             if fallback.lower().strip() == "menu":
                 return "menu"
             last_addr["addr"] = fallback
@@ -263,7 +263,7 @@ async def get_dest_addr(node, last_addr):
     return dest_addr
 
 
-async def choose_connection_methods(con_method):
+def choose_connection_methods(con_method):
     """
     Select a connection method segment.
     """
@@ -279,7 +279,7 @@ async def choose_connection_methods(con_method):
     cout("Type menu to return.")
     while True:
         # If pressing enter then use the default first method.
-        con_method = con_method or (await ainput("Enter for default (0): "))
+        con_method = con_method or (ainput("Enter for default (0): "))
         if not con_method:
             return "direct_connect"
 
@@ -295,7 +295,7 @@ async def choose_connection_methods(con_method):
         return method_txt[con_method]
 
 
-async def choose_pathways(pathway):
+def choose_pathways(pathway):
     """
     Choose the routing pathway to try (this controls IP selection!)
     This is why having accurate interface info is so important.
@@ -310,7 +310,7 @@ async def choose_pathways(pathway):
     cout("WAN: (e)xternal, LAN: (l)ocal, (a)ny")
     cout("Type menu to return.")
     while not sock_has_data(stop_rw[0]):
-        pathway = pathway or (await ainput("Enter for default (e): "))
+        pathway = pathway or (ainput("Enter for default (e): "))
         if not pathway:
             return EXT_BIND
 
@@ -328,7 +328,7 @@ async def choose_pathways(pathway):
         pathway = None
 
 
-async def choose_address_families(addr_type):
+def choose_address_families(addr_type):
     """
     Allows the code to specifically use one or more address families.
     Applicable / useful for dual-stack environments.
@@ -343,7 +343,7 @@ async def choose_address_families(addr_type):
     cout("(4) IPv4, (6) IPv6, (a)ny")
     cout("Type menu to return.")
     while not sock_has_data(stop_rw[0]):
-        addr_type = addr_type or (await ainput("Enter for default (4): "))
+        addr_type = addr_type or (ainput("Enter for default (4): "))
         if not addr_type:
             return IP4
 
@@ -361,7 +361,7 @@ async def choose_address_families(addr_type):
         addr_type = None
 
 
-async def echo_client(pipe, echo_data):
+def echo_client(pipe, echo_data):
     """
     Tunnel is open -- interactive echo client can be used.
     """
@@ -416,10 +416,10 @@ async def echo_client(pipe, echo_data):
     # the sleep -- a human typing the first echo is orders of
     # magnitude slower than any of these races.
     if echo_data is not None:
-        await asyncio.sleep(1.0)
+        asyncio.sleep(1.0)
 
     while not sock_has_data(stop_rw[0]):
-        send_buf = echo_data or to_b(await ainput("Echo: "))
+        send_buf = echo_data or to_b(ainput("Echo: "))
         # Exact-match the menu keyword. This was `in (b"menu")` -- not a
         # tuple (no comma), so it ran `send_buf in b"menu"`, a bytes
         # substring test. b"" is a substring of everything, so pressing
@@ -433,8 +433,8 @@ async def echo_client(pipe, echo_data):
         if not send_buf:
             continue
 
-        await pipe.send(b"ECHO " + send_buf + b"\n")
-        buf = await pipe.recv(timeout=4)
+        pipe.send(b"ECHO " + send_buf + b"\n")
+        buf = pipe.recv(timeout=4)
         cout(b"recv = ", buf, b"\n")
         if echo_data:
             # buf is None when pipe.recv() times out -- e.g. the

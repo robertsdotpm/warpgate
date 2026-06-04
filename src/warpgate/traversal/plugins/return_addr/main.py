@@ -12,7 +12,7 @@ class ReturnAddrPlugin(Plugin):
 
     name = "return_addr"
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Send a ReturnAddr signal message back to the requester with our current address."""
         log(fstr(
             "return_addr[{0}]: replying to GetAddr from peer",
@@ -23,7 +23,7 @@ class ReturnAddrPlugin(Plugin):
 
         # Send this message to the dest_addr for this plugin instance.
         try:
-            await self.send_signal(msg)
+            self.send_signal(msg)
             log(fstr(
                 "return_addr[{0}]: ReturnAddr sent",
                 (self.plugin_id,),

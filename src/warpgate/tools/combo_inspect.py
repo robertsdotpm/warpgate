@@ -62,11 +62,11 @@ def fmt_info(info):
     return " ".join(parts)
 
 
-async def resolve_remote(node, addr):
+def resolve_remote(node, addr):
     """Resolve a PNP nickname (or raw addr_bytes hex) through the local node's
     signal channel and return the parsed addr_map ready for combo enumeration.
     """
-    addr_bytes, _vk, _ = await resolve_pnp_addr(node, addr)
+    addr_bytes, _vk, _ = resolve_pnp_addr(node, addr)
     addr_map = parse_node_addr(addr_bytes)
     enrich_addr_map_with_loopback(addr_map)
     return addr_bytes, addr_map
@@ -119,7 +119,7 @@ def render_combos(
     print()
 
 
-async def main_async(args):
+def main_async(args):
     """Start a local node, resolve target addresses, render combos, exit."""
     addrs = args.addrs
     if len(addrs) not in (1, 2):
@@ -127,7 +127,7 @@ async def main_async(args):
         return 2
 
     print("starting local node (this is needed for address resolution)...")
-    node = await Node().start()
+    node = Node().start()
 
     try:
         if len(addrs) == 1:
@@ -137,15 +137,15 @@ async def main_async(args):
             self_map["pub_key_hex"] = to_s(node.kp.compact_public_key.hex()) if hasattr(node.kp.compact_public_key, "hex") else None
             enrich_addr_map_with_loopback(self_map)
 
-            _, dest_map = await resolve_remote(node, addrs[0])
+            _, dest_map = resolve_remote(node, addrs[0])
             render_combos("local", addrs[0], node, self_map, dest_map)
         else:
-            _, src_map = await resolve_remote(node, addrs[0])
-            _, dest_map = await resolve_remote(node, addrs[1])
+            _, src_map = resolve_remote(node, addrs[0])
+            _, dest_map = resolve_remote(node, addrs[1])
             render_combos(addrs[0], addrs[1], node, src_map, dest_map)
     finally:
         try:
-            await asyncio.wait_for(node.close(), timeout=10)
+            asyncio.wait_for(node.close(), timeout=10)
         except (asyncio.TimeoutError, OSError, ConnectionError):
             pass
 

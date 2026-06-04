@@ -109,10 +109,10 @@ class RandomProbePlugin(Plugin):
     )
 
     @classmethod
-    async def setup(cls, node):
+    def setup(cls, node):
         return RandomProbePluginFactory(sys_clock=node.sys_clock)
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Drive the random-probe rendezvous from initiator or responder side."""
         self.bridge_socks = []
         # Loopback is excluded above; any other route_type passes
@@ -207,11 +207,11 @@ class RandomProbePlugin(Plugin):
             # this, known_port = 0 and the symmetric side fires its
             # 256 probes at port 0 -- guaranteed no convergence.
             if my_role == "non_sym":
-                await self.prebind_non_sym_sock()
+                self.prebind_non_sym_sock()
 
             outgoing = self.build_msg(my_role, punch_time, to_s(self.session_nonce.hex()))
             outgoing.meta.plugin_name = "random_probe"
-            await self.send_signal(outgoing)
+            self.send_signal(outgoing)
             return
 
         # Responder: extract peer's params, lock our role, fire.
@@ -269,10 +269,10 @@ class RandomProbePlugin(Plugin):
             # non-sym side has to commit to a port BEFORE building
             # the response, otherwise the peer fires at port 0.
             if my_role == "non_sym":
-                await self.prebind_non_sym_sock()
+                self.prebind_non_sym_sock()
             our_msg = self.build_msg(my_role, punch_time, reply.payload.magic)
             our_msg.meta.plugin_name = "random_probe"
-            await self.send_signal(our_msg)
+            self.send_signal(our_msg)
 
         # Guard against MQTT redelivery: the peer's RandomProbeMsg
         # gets fanned out across multiple brokers, so this run() can
@@ -299,10 +299,10 @@ class RandomProbePlugin(Plugin):
         # too early near the boundary.
         ntp_delay = punch_time - self.sys_clock.time()
         if 0 < ntp_delay <= p_or_default("max_sleep"):
-            await asyncio.sleep(ntp_delay)
+            asyncio.sleep(ntp_delay)
 
         try:
-            route = await self.bind()
+            route = self.bind()
         except (OSError, ValueError):
             log("RandomProbePlugin: route bind failed; aborting")
             if not self.result.done():
@@ -347,7 +347,7 @@ class RandomProbePlugin(Plugin):
         # See investigation in 2026-05-03 commit history for the full
         # case.
         loop_for_algo = get_running_loop()
-        res = await loop_for_algo.run_in_executor(
+        res = loop_for_algo.run_in_executor(
             None,
             lambda: sync_run_bidirectional_spray(
                 bind_ip=bind_ip,
@@ -442,7 +442,7 @@ class RandomProbePlugin(Plugin):
 
         from aionetiface import Pipe, UDP
         try:
-            pipe = await Pipe(
+            pipe = Pipe(
                 UDP, dest=worker_addr_for_pipe,
                 route=route, sock=listener_sock,
             ).connect()
@@ -617,7 +617,7 @@ class RandomProbePlugin(Plugin):
         # + connect + small slop.
         bridge_ceiling = 5.0
         try:
-            bridge_ready = await asyncio.wait_for(
+            bridge_ready = asyncio.wait_for(
                 bridge_ready_fut, timeout=bridge_ceiling,
             )
         except asyncio.TimeoutError:
@@ -644,7 +644,7 @@ class RandomProbePlugin(Plugin):
         # post-Pipe-wrap and the bug is in pipe.send.  If it
         # doesn't, the sock itself stopped working after wrap.
 
-    async def close(self):
+    def close(self):
         """Close bridge sockets and cancel the result future.
 
         Mirrors udp_punch's close() so close_plugin() in traversal_utils
@@ -712,7 +712,7 @@ class RandomProbePlugin(Plugin):
             },
         })
 
-    async def prebind_non_sym_sock(self):
+    def prebind_non_sym_sock(self):
         """Bind the non-sym side's UDP socket *before* signaling +
         STUN-discover the (mapped_ip, mapped_port) it lands at.
 
@@ -740,7 +740,7 @@ class RandomProbePlugin(Plugin):
         still useful for same-machine / loopback testing.
         """
         try:
-            route = await self.bind()
+            route = self.bind()
         except (OSError, ValueError):
             log("RandomProbePlugin: pre-bind route bind failed")
             return
@@ -799,7 +799,7 @@ class RandomProbePlugin(Plugin):
                 break
             try:
                 t0 = self.sys_clock.time()
-                resolved = await self.resolve_stun_dest(stun_server)
+                resolved = self.resolve_stun_dest(stun_server)
             except (OSError, ConnectionError, asyncio.TimeoutError):
                 if stun_budget is not None:
                     stun_budget -= self.sys_clock.time() - t0
@@ -815,7 +815,7 @@ class RandomProbePlugin(Plugin):
             # sync blocking I/O -- the prebound sock should
             # never get touched by asyncio.add_reader before
             # Pipe.connect takes ownership post-algorithm.
-            mapping = await loop.run_in_executor(
+            mapping = loop.run_in_executor(
                 None,
                 lambda srv=resolved, t=per_server_timeout: sync_stun_discover_mapping(
                     self.prebound_sock, srv, self.af,
@@ -860,10 +860,10 @@ class RandomProbePlugin(Plugin):
                 continue
         return out
 
-    async def resolve_stun_dest(self, dest):
+    def resolve_stun_dest(self, dest):
         """DNS-resolve *dest* using the plugin's NIC + AF context."""
         from aionetiface import resolv_dest
-        return await resolv_dest(self.af, dest, self.nic)
+        return resolv_dest(self.af, dest, self.nic)
 
     def our_known_port(self):
         """Known external port to advertise; 0 when we're playing sym role.
@@ -915,7 +915,7 @@ class RandomProbePluginFactory:
         plugin.sys_clock = self.sys_clock
         return plugin
 
-    async def close(self):
+    def close(self):
         """No-op: the factory holds no socket / process state."""
         return None
 

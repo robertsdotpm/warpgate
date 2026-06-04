@@ -20,7 +20,7 @@ def rendezvous_rank(key, servers):
     return sorted(servers, key=score, reverse=True)
 
 
-async def get_turn_client(
+def get_turn_client(
 af,
     server,
     interface,
@@ -38,13 +38,13 @@ af,
         msg_cb=msg_cb,
     )
 
-    await asyncio.wait_for(turn_client.start(), 4)
+    asyncio.wait_for(turn_client.start(), 4)
 
-    peer_tup = await turn_client.client_tup_future
-    relay_tup = await turn_client.relay_tup_future
+    peer_tup = turn_client.client_tup_future
+    relay_tup = turn_client.relay_tup_future
 
     if None not in [dest_peer, dest_relay]:
-        await asyncio.wait_for(turn_client.accept_peer(dest_peer, dest_relay), 4)
+        asyncio.wait_for(turn_client.accept_peer(dest_peer, dest_relay), 4)
 
     return peer_tup, relay_tup, turn_client
 
@@ -62,7 +62,7 @@ PER_SERVER_TIMEOUT = 4.0
 RACE_BATCH_SIZE = 2
 
 
-async def get_first_working_turn_client(
+def get_first_working_turn_client(
     af,
     servers,
     nic,
@@ -95,9 +95,9 @@ async def get_first_working_turn_client(
     if not servers:
         return None
 
-    async def try_one(server):
+    def try_one(server):
         try:
-            _, _, turn_client = await asyncio.wait_for(
+            _, _, turn_client = asyncio.wait_for(
                 get_turn_client(af, server, nic, msg_cb=msg_cb),
                 timeout=per_server_timeout,
             )
@@ -116,7 +116,7 @@ async def get_first_working_turn_client(
             for fut in asyncio.as_completed(tasks):
                 client = None
                 try:
-                    client = await fut
+                    client = fut
                 except (OSError, ConnectionError, asyncio.TimeoutError):
                     client = None
                 if client is not None:
@@ -126,26 +126,26 @@ async def get_first_working_turn_client(
             for t in tasks:
                 if not t.done():
                     t.cancel()
-            late = await asyncio.gather(*tasks, return_exceptions=True)
+            late = asyncio.gather(*tasks, return_exceptions=True)
             losers = [
                 item for item in late
                 if isinstance(item, TURNClient) and item is not winner
             ]
             if losers:
-                await asyncio.gather(
+                asyncio.gather(
                     *[item.close() for item in losers],
                     return_exceptions=True,
                 )
         if winner is not None:
             return winner
     elif batch:
-        client = await try_one(batch[0])
+        client = try_one(batch[0])
         if client is not None:
             return client
 
     # Batch failed -- sequential fallthrough over remaining servers.
     for server in rest:
-        client = await try_one(server)
+        client = try_one(server)
         if client is not None:
             return client
     return None

@@ -250,11 +250,11 @@ def load_signing_key(nics, listen_ips, listen_port, install_path, node_name=None
     return sk, is_fresh
 
 
-async def fallback_machine_id(netifaces, app_id="warpgate"):
+def fallback_machine_id(netifaces, app_id="warpgate"):
     """Derive a stable machine ID from hostname, default interface name, and MAC address."""
     host = socket.gethostname()
     if_name = get_default_iface(netifaces)
-    mac = await get_mac_address(if_name, netifaces)
+    mac = get_mac_address(if_name, netifaces)
     buf = fstr(
         "{0} {1} {2} {3}",
         (
@@ -267,7 +267,7 @@ async def fallback_machine_id(netifaces, app_id="warpgate"):
     return to_s(hashlib.sha256(to_b(buf)).hexdigest())
 
 
-async def close_idle_pipes(node):
+def close_idle_pipes(node):
     """
     As the number of free processes in the process pool
     decreases and the pool approaches full the need to
@@ -317,7 +317,7 @@ async def close_idle_pipes(node):
             node.resources.last_recv_queue.remove(pipe)
             node.resources.last_recv_table.pop(pipe.sock, None)
             try:
-                await asyncio.wait_for(pipe.close(), timeout=2)
+                asyncio.wait_for(pipe.close(), timeout=2)
             except asyncio.TimeoutError:
                 log("close idle pipe close timeout")
             except (OSError, ConnectionError):
@@ -325,7 +325,7 @@ async def close_idle_pipes(node):
                 log("unknown exception for close pipe in close_idle_pipes.")
 
         # Sleep until the next pipe is due, capped at 5 seconds
-        await asyncio.sleep(min(next_sleep, 5))
+        asyncio.sleep(min(next_sleep, 5))
 
 
 # Cap on STUN probe sockets open at once across the whole interface
@@ -341,7 +341,7 @@ STUN_SOCKET_BUDGET = 32
 STUN_POOL_MAX = 6
 
 
-async def load_stun_clients(ifs, limit=USE_MAP_NO):
+def load_stun_clients(ifs, limit=USE_MAP_NO):
     """Load `limit` TCP STUN clients per AF per interface, indexed, within a socket budget.
 
     Each (af, interface) job probes a pool of candidate STUN servers
@@ -369,9 +369,9 @@ async def load_stun_clients(ifs, limit=USE_MAP_NO):
     per_job_pool = min(STUN_POOL_MAX, max(limit, STUN_SOCKET_BUDGET // len(jobs)))
     jobs_per_batch = max(1, STUN_SOCKET_BUDGET // per_job_pool)
 
-    async def run_job(af, if_index, interface):
+    def run_job(af, if_index, interface):
         """Fetch STUN clients for one (af, interface) pair and return them with their index."""
-        clients = await get_n_stun_clients(
+        clients = get_n_stun_clients(
             af=af,
             n=limit,
             mode=RFC5389,
@@ -390,7 +390,7 @@ async def load_stun_clients(ifs, limit=USE_MAP_NO):
 
     for i in range(0, len(jobs), jobs_per_batch):
         batch = jobs[i:i + jobs_per_batch]
-        results = await asyncio.gather(
+        results = asyncio.gather(
             *[run_job(af, ix, iface) for af, ix, iface in batch],
             return_exceptions=False,
         )
@@ -413,7 +413,7 @@ def worker_init():
         pass
 
 
-async def get_pp_executors(workers=None):
+def get_pp_executors(workers=None):
     """Create a ThreadPoolExecutor for tcp_punch's burst-send worker.
 
     Was ProcessPoolExecutor for "more accurate timing and isolating
@@ -454,17 +454,17 @@ async def get_pp_executors(workers=None):
     return workers, pp_executor
 
 
-async def load_machine_id(app_id, netifaces):
+def load_machine_id(app_id, netifaces):
     """Return a hashed machine ID for app_id, falling back to a network-derived value on failure."""
     try:
         return hashed_machine_id(app_id)
     except asyncio.CancelledError:  # pylint: disable=try-except-raise
         raise
     except (OSError, ValueError):
-        return await fallback_machine_id(netifaces, app_id)
+        return fallback_machine_id(netifaces, app_id)
 
 
-async def soft_bind_and_listen(node, route, label, ips=None):
+def soft_bind_and_listen(node, route, label, ips=None):
     """Bind and add_listener for one route; log on failure, never raise.
 
     Returns the actual bound port on success, 0 on failure.
@@ -481,7 +481,7 @@ async def soft_bind_and_listen(node, route, label, ips=None):
     v4 never hit this because each v4 NIC has a single, distinct nic IP.
     """
     try:
-        await route.bind(port=node.listen_port, ips=ips)
+        route.bind(port=node.listen_port, ips=ips)
     except (OSError, ValueError, AssertionError) as exc:
         log(fstr("listen_on_ifs: bind failed for {0}: {1}", (label, exc)))
         return 0
@@ -489,7 +489,7 @@ async def soft_bind_and_listen(node, route, label, ips=None):
         raise
 
     try:
-        result = await node.add_listener(TCP, route)
+        result = node.add_listener(TCP, route)
     except (OSError, ValueError, AssertionError) as exc:
         log(fstr("listen_on_ifs: add_listener failed for {0}: {1}", (label, exc)))
         return 0
@@ -501,7 +501,7 @@ async def soft_bind_and_listen(node, route, label, ips=None):
     return result[0]
 
 
-async def bind_nic_v4(node, nic_i, nic):
+def bind_nic_v4(node, nic_i, nic):
     """Bind the v4 NIC-local listener on one NIC.  Returns bound port (0 = fail).
 
     v4-only and pinned to the NIC's v4 address. This used to call
@@ -523,7 +523,7 @@ async def bind_nic_v4(node, nic_i, nic):
         return 0
 
     label = fstr("v4 nic={0}", (nic.id,))
-    nic_port = await soft_bind_and_listen(node, v4_route, label, ips=nic_ip)
+    nic_port = soft_bind_and_listen(node, v4_route, label, ips=nic_ip)
     if nic_port <= 0:
         return 0
 
@@ -531,7 +531,7 @@ async def bind_nic_v4(node, nic_i, nic):
     return nic_port
 
 
-async def bind_nic_v6_ext(node, nic_i, nic, label):
+def bind_nic_v6_ext(node, nic_i, nic, label):
     """Bind v6 ext (global) on one NIC.  Returns bound port (0 = fail).
 
     The ext IP is pinned explicitly (route.ext()) so this path can never
@@ -543,7 +543,7 @@ async def bind_nic_v6_ext(node, nic_i, nic, label):
     except (LookupError, IndexError, ValueError) as exc:
         log(fstr("listen_on_ifs: {0} no ext ip: {1}", (label, exc)))
         return 0
-    port = await soft_bind_and_listen(node, v6_route, label, ips=ext_ip)
+    port = soft_bind_and_listen(node, v6_route, label, ips=ext_ip)
     if port > 0:
         node.if_ports.setdefault((IP6, nic_i), {})["ext"] = port
     return port
@@ -558,7 +558,7 @@ def fe80_iprs(nic):
     return out
 
 
-async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
+def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     """Bind a v6 fe80 link-local listener on one NIC.  Returns port (0 = fail).
 
     Part of the NIC's "nic" path -- the v6 NIC-local listener, mirror of
@@ -575,7 +575,7 @@ async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     would otherwise bind/mutate the same object concurrently.
     """
     route = copy.deepcopy(fe80_ipr.route)
-    port = await soft_bind_and_listen(
+    port = soft_bind_and_listen(
         node, route, label, ips=ipr_norm(fe80_ipr),
     )
     if port > 0:
@@ -583,7 +583,7 @@ async def bind_nic_v6_fe80(node, nic_i, fe80_ipr, label):
     return port
 
 
-async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
+def bind_loopback(node, cand_af, cand_ip, cand_port, label):
     """Bind a per-node loopback alias.  Returns port (0 = fail).  Non-critical.
 
     Deepcopies the route because add_listener retains the reference; without
@@ -600,10 +600,10 @@ async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
         # routes loopback traffic via `lo` and a NIC-pinned listen
         # socket can't accept SYNs that arrive on lo.
         from aionetiface import Interface
-        default_nic = await Interface("default")
+        default_nic = Interface("default")
         cand_route = default_nic.route(cand_af)
-        await cand_route.bind(ips=cand_ip, port=cand_port)
-        await node.add_listener(TCP, cand_route)
+        cand_route.bind(ips=cand_ip, port=cand_port)
+        node.add_listener(TCP, cand_route)
         log(fstr("listen_on_ifs: {0} bound af={1}", (label, cand_af)))
         return cand_port
     except (OSError, ValueError, AssertionError) as exc:
@@ -611,7 +611,7 @@ async def bind_loopback(node, cand_af, cand_ip, cand_port, label):
         return 0
 
 
-async def listen_on_ifs(node):
+def listen_on_ifs(node):
     """Bind TCP listeners for every NIC, plus the per-node loopback aliases.
 
     Each NIC has two bind paths:
@@ -649,7 +649,7 @@ async def listen_on_ifs(node):
                 if nic_ipr in listen_iprs:
                     label = fstr("listen_ip {0}", (nic_ipr,))
                     ip_tasks.append((label, soft_bind_and_listen(node, nic_ipr.route, label)))
-        results = await asyncio.gather(
+        results = asyncio.gather(
             *(c for _, c in ip_tasks), return_exceptions=True,
         )
         failed = []
@@ -694,7 +694,7 @@ async def listen_on_ifs(node):
         cand_label = fstr("loopback {0}:{1}", (cand_ip, cand_port))
         aux.append((cand_label, bind_loopback(node, cand_af, cand_ip, cand_port, cand_label)))
 
-    results = await asyncio.gather(
+    results = asyncio.gather(
         *([c for _, _, _, _, c in plan] + [c for _, c in aux]),
         return_exceptions=True,
     )
@@ -750,7 +750,7 @@ async def listen_on_ifs(node):
         raise RuntimeError(msg)
 
 
-async def remote_reachability_cb(reachability, _msg, client_tup, pipe):
+def remote_reachability_cb(reachability, _msg, client_tup, pipe):
     """Mark the NIC as reachable when an inbound connection arrives from the known warpgate probe server."""
     try:
         warpgate_ips = (
@@ -771,7 +771,7 @@ async def remote_reachability_cb(reachability, _msg, client_tup, pipe):
         log_exception()
 
 
-async def forward(node, port, reachability):
+def forward(node, port, reachability):
     """Run UPnP+PCP port forwarding for every NIC/AF and probe reachability, returning (forwarded, reachable) lists."""
     from ..traversal.plugins.upnp.main import port_forward as upnp_port_forward
     from .pcp_client import pcp_try_anycast_and_gateway, PROTOCOL_TCP
@@ -792,7 +792,7 @@ async def forward(node, port, reachability):
     for nic in node.ifs:
         for af in nic.supported():
 
-            async def do_forward(af=af, nic=nic):
+            def do_forward(af=af, nic=nic):
                 """Forward the listen port for one (af, nic) pair and return [af, nic.id] on success.
 
                 Races UPnP and PCP: the first to install a mapping wins.
@@ -804,7 +804,7 @@ async def forward(node, port, reachability):
                 the cold-start budget.
                 """
                 reachability[af][nic.id] = asyncio.Future()
-                route = await nic.route(af).bind()
+                route = nic.route(af).bind()
                 src_ip = route.nic() if af == IP4 else route.ext()
                 src_tup = (src_ip, port)
 
@@ -819,12 +819,12 @@ async def forward(node, port, reachability):
                          int((time.monotonic() - race_t0) * 1000), result),
                     ))
 
-                async def via_upnp():
-                    out = await upnp_port_forward(af, nic, port, src_tup, "warpgate")
+                def via_upnp():
+                    out = upnp_port_forward(af, nic, port, src_tup, "warpgate")
                     race_mark("upnp", out)
                     return out
 
-                async def via_pcp():
+                def via_pcp():
                     gws = nic.netifaces.gateways()
                     gw = None
                     if af in gws:
@@ -833,7 +833,7 @@ async def forward(node, port, reachability):
                         if glist:
                             gw = glist[0][0]
                     sock_af = socket.AF_INET6 if af == IP6 else socket.AF_INET
-                    parsed = await pcp_try_anycast_and_gateway(
+                    parsed = pcp_try_anycast_and_gateway(
                         sock_af, src_ip, gw, port, proto=PROTOCOL_TCP,
                         suggested_ext_port=port,
                     )
@@ -847,7 +847,7 @@ async def forward(node, port, reachability):
                 winner = 0
                 try:
                     for done in asyncio.as_completed(race):
-                        result = await done
+                        result = done
                         if result:
                             winner = 1
                             break
@@ -855,13 +855,13 @@ async def forward(node, port, reachability):
                     for t in race:
                         if not t.done():
                             t.cancel()
-                    await asyncio.gather(*race, return_exceptions=True)
+                    asyncio.gather(*race, return_exceptions=True)
                 if winner:
                     return [af, nic.id]
 
             tasks.append(do_forward())
 
-    forward_success = strip_none(await asyncio.gather(*tasks, return_exceptions=True))
+    forward_success = strip_none(asyncio.gather(*tasks, return_exceptions=True))
     fwd_stage("forwards_done")
 
     # Reachability probe: curl a remote server to trigger a connect-
@@ -874,24 +874,24 @@ async def forward(node, port, reachability):
     if node.conf.get("enable_reachability_test", False):
         test_addr = {IP4: "158.69.27.176", IP6: "2607:5300:60:80b0::1"}
 
-        async def reachability_test(af, nic):
+        def reachability_test(af, nic):
             """Trigger the remote warpgate probe server to connect back to us on the forwarded port."""
             route = nic.route(af)
             curl = WebCurl((test_addr[af], 80), route, do_close=0)
             try:
-                await curl.vars({"action": "hello", "proto": "tcp", "port": str(port)}).get(
+                curl.vars({"action": "hello", "proto": "tcp", "port": str(port)}).get(
                     "/warpgate/net_debug.php"
                 )
             except asyncio.TimeoutError:
                 return None
 
-        await asyncio.gather(
+        asyncio.gather(
             *[reachability_test(af, nic) for nic in node.ifs for af in nic.supported()],
             return_exceptions=True,
         )
         fwd_stage("reachability_done")
 
-        await asyncio.sleep(2)
+        asyncio.sleep(2)
         fwd_stage("sleep_done")
 
         reachable = [

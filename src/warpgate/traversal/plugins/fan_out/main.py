@@ -101,7 +101,7 @@ class FanOutPlugin(Plugin):
         self.constraint_af = af
         self.constraint_route_type = route_type
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Spawn one child per viable combo, race their results, return the winner."""
         if self.target_plugin_name is None:
             raise ValueError("fan_out.run: configure_target() never called")
@@ -181,10 +181,10 @@ class FanOutPlugin(Plugin):
         # long after run_plugin returns).
         PHASE_STAGGER_S = 0.25
 
-        async def staggered_run_plugin(child, delay):
+        def staggered_run_plugin(child, delay):
             if delay > 0:
-                await asyncio.sleep(delay)
-            return await manager.run_plugin(child)
+                asyncio.sleep(delay)
+            return manager.run_plugin(child)
 
         tasks = [
             asyncio.ensure_future(
@@ -205,7 +205,7 @@ class FanOutPlugin(Plugin):
         try:
             for fut in asyncio.as_completed(list(result_futs.keys()), timeout=self.timeout):
                 try:
-                    candidate_pipe = await fut
+                    candidate_pipe = fut
                 except (asyncio.TimeoutError, OSError, ConnectionError, ValueError):
                     log_exception()
                     continue
@@ -231,10 +231,10 @@ class FanOutPlugin(Plugin):
             for t in tasks:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            asyncio.gather(*tasks, return_exceptions=True)
             for c in children:
                 try:
-                    await close_plugin(
+                    close_plugin(
                         c, manager.plugins, manager.inbound_pipes,
                     )
                 except (OSError, asyncio.TimeoutError):
@@ -256,7 +256,7 @@ class FanOutPlugin(Plugin):
                 t.cancel()
             if c is not winner:
                 try:
-                    await close_plugin(
+                    close_plugin(
                         c, manager.plugins, manager.inbound_pipes,
                     )
                 except (OSError, asyncio.TimeoutError):
@@ -265,7 +265,7 @@ class FanOutPlugin(Plugin):
         # Drain cancellations so we don't leave Python warnings about
         # tasks that were destroyed while pending.
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            asyncio.gather(*tasks, return_exceptions=True)
 
         self.result.set_result(pipe)
 

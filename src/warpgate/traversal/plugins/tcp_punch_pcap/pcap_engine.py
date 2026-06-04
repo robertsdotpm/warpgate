@@ -73,7 +73,7 @@ def build_bpf_for_punch(port_allocs, local_ip, peer_ip):
     return "tcp and {0} and ({1})".format(host_clause, local_port_clause)
 
 
-async def pcap_setup_engine(nic_pcap_name, port_allocs, src_ip, dest_ip,
+def pcap_setup_engine(nic_pcap_name, port_allocs, src_ip, dest_ip,
                              loop=None):
     """Open the backend, install a BPF, return (backend, mux, port_alloc_subs).
 
@@ -115,7 +115,7 @@ async def pcap_setup_engine(nic_pcap_name, port_allocs, src_ip, dest_ip,
     return (backend, mux, port_alloc_subs)
 
 
-async def spawn_connections(port_alloc_subs, src_ip, dest_ip, loop=None):
+def spawn_connections(port_alloc_subs, src_ip, dest_ip, loop=None):
     """For each (port_alloc, sub) build a Connection and call start_active.
 
     Returns the list of Connection objects in port_allocs order so the
@@ -128,7 +128,7 @@ async def spawn_connections(port_alloc_subs, src_ip, dest_ip, loop=None):
         )
         conns.append(conn)
         try:
-            await conn.start_active(
+            conn.start_active(
                 remote_ip=dest_ip,
                 remote_port=int(pa.dest_port),
                 local_port=int(pa.src_port),
@@ -141,7 +141,7 @@ async def spawn_connections(port_alloc_subs, src_ip, dest_ip, loop=None):
     return conns
 
 
-async def wait_first_established(conns, monitor_timeout=3.0):
+def wait_first_established(conns, monitor_timeout=3.0):
     """Equivalent to socket_event_monitor: wait the FULL monitor_timeout
     collecting all Connections that reach ESTABLISHED, then return the
     set (possibly empty).
@@ -179,7 +179,7 @@ async def wait_first_established(conns, monitor_timeout=3.0):
             remaining = end - now
             if remaining <= 0:
                 break
-            done, pending = await asyncio.wait(
+            done, pending = asyncio.wait(
                 pending,
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -238,7 +238,7 @@ def sort_key_ft(conn):
     return pair
 
 
-async def choose_canonical_winner(established, src_ip, dest_ip,
+def choose_canonical_winner(established, src_ip, dest_ip,
                                   slave_timeout=4.0):
     """Master/slave canonical-winner handshake -- pcap mirror of
     legacy ``choose_winning_tcp_sock``.
@@ -277,13 +277,13 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
         winner_ft = getattr(winner, "ft", None)
         winner_key = winner_ft.key() if winner_ft is not None else None
         try:
-            await winner.send(b"$")
+            winner.send(b"$")
             log("tcp_punch_pcap: master sent $ on {0}".format(winner_key))
         except Exception as exc:
             log("tcp_punch_pcap: master send($) failed: {0}".format(exc))
             for c in sorted_conns:
                 try:
-                    await c.close()
+                    c.close()
                 except Exception:
                     pass
             return None
@@ -305,7 +305,7 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
     pending = set(tasks.keys())
     try:
         while pending and winner is None:
-            done, pending = await asyncio.wait(
+            done, pending = asyncio.wait(
                 pending,
                 timeout=slave_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -340,7 +340,7 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
             "({0:.3f}s)".format(elapsed))
         for c in sorted_conns:
             try:
-                await c.close()
+                c.close()
             except Exception:
                 pass
         return None
@@ -353,18 +353,18 @@ async def choose_canonical_winner(established, src_ip, dest_ip,
     return winner
 
 
-async def cleanup_losers(conns, winner):
+def cleanup_losers(conns, winner):
     """Close every Connection that didn't win."""
     for c in conns:
         if c is winner:
             continue
         try:
-            await c.close()
+            c.close()
         except Exception:
             pass
 
 
-async def pcap_selector_punch_engine(
+def pcap_selector_punch_engine(
         nic_pcap_name, port_allocs, src_ip, dest_ip,
         f_sleep_until_async, params=None, loop=None,
 ):
@@ -398,7 +398,7 @@ async def pcap_selector_punch_engine(
     mux = None
     conns = []
     try:
-        backend, mux, port_alloc_subs = await pcap_setup_engine(
+        backend, mux, port_alloc_subs = pcap_setup_engine(
             nic_pcap_name, port_allocs, src_ip, dest_ip, loop=loop,
         )
         if backend is None:
@@ -410,31 +410,31 @@ async def pcap_selector_punch_engine(
 
         # Bucket-aligned wait. f_sleep_until_async is a coroutine that
         # blocks until the rendezvous moment.
-        await f_sleep_until_async()
+        f_sleep_until_async()
 
         # Burst-start every Connection. start_active queues the SYN
         # frame and returns immediately; the SYN is on the wire within
         # one flush_outbox() call per Connection.
-        conns = await spawn_connections(
+        conns = spawn_connections(
             port_alloc_subs, src_ip, dest_ip, loop=loop,
         )
 
         # Monitor for ESTABLISHED Connections. Returns the list of
         # all Connections that converged within the grace window.
-        established = await wait_first_established(
+        established = wait_first_established(
             conns, monitor_timeout=monitor_timeout,
         )
 
         if not established:
             log("tcp_punch_pcap: spray missed; closing all conns")
-            await cleanup_losers(conns, None)
+            cleanup_losers(conns, None)
             return None
 
         # Canonical-winner handshake: both peers must converge on the
         # SAME 4-tuple. Without this step v2 picks established[0]
         # while legacy uses `$` master/slave -- mismatch closes each
         # side's chosen winner.
-        winner = await choose_canonical_winner(
+        winner = choose_canonical_winner(
             established, src_ip, dest_ip,
         )
 
@@ -444,11 +444,11 @@ async def pcap_selector_punch_engine(
             # choose_canonical_winner already closed the established
             # set on failure; close any spawned-but-never-established
             # conns too.
-            await cleanup_losers(conns, None)
+            cleanup_losers(conns, None)
             return None
 
         # Close losers; return winner.
-        await cleanup_losers(conns, winner)
+        cleanup_losers(conns, winner)
         return winner
     finally:
         # The winner Connection keeps the backend/mux alive until the

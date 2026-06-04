@@ -100,7 +100,7 @@ def is_udp_punch_datagram(msg):
     return kind is not None
 
 
-async def node_protocol(node, msg, client_tup, pipe):
+def node_protocol(node, msg, client_tup, pipe):
     """Peel control frames at the start of the buffer, then dispatch the
     remaining bytes as a single opaque payload to every registered msg_cb.
 
@@ -190,7 +190,7 @@ async def node_protocol(node, msg, client_tup, pipe):
             nonce = msg[len(WG_LIVENESS_PING_PREFIX):nl]
             msg = msg[nl + 1:]
         try:
-            await pipe.send(
+            pipe.send(
                 WG_LIVENESS_PONG_PREFIX + nonce + b"\n", client_tup,
             )
             log("[LIVENESS] PING recv nonce={0} pipe_id={1}; PONG sent ok".format(
@@ -211,10 +211,10 @@ async def node_protocol(node, msg, client_tup, pipe):
     # data follows in the same TCP buffer.
     probe = b"long_warpgate_test_string_abcd123"
     if msg == probe or msg == probe + b"\n":
-        await pipe.send(b"warpgate test string\r\n\r\n", client_tup)
+        pipe.send(b"warpgate test string\r\n\r\n", client_tup)
         return
     if msg.startswith(probe + b"\n"):
-        await pipe.send(b"warpgate test string\r\n\r\n", client_tup)
+        pipe.send(b"warpgate test string\r\n\r\n", client_tup)
         msg = msg[len(probe) + 1:]
         if not msg:
             return
@@ -229,7 +229,7 @@ async def node_protocol(node, msg, client_tup, pipe):
     if not coros:
         return
 
-    results = await asyncio.gather(*coros, return_exceptions=True)
+    results = asyncio.gather(*coros, return_exceptions=True)
     for r in results:
         if isinstance(r, KeyboardInterrupt):
             log("reraising key interrupt")

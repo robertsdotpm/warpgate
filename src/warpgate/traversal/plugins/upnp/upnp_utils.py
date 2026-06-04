@@ -86,7 +86,7 @@ Ensure we bind to link local scope and private IPs.
 """
 
 
-async def get_upnp_route(af, nic, hostname=None):
+def get_upnp_route(af, nic, hostname=None):
     """Return a bound route suitable for reaching the given UPnP hostname on the specified NIC."""
     if af == IP6:
         route = nic.route(af)
@@ -100,8 +100,8 @@ async def get_upnp_route(af, nic, hostname=None):
             # Global scope src.
             ip = route.ext()
 
-        return await route.bind(ips=ip)
-    return await nic.route(af).bind()
+        return route.bind(ips=ip)
+    return nic.route(af).bind()
 
 
 # Creates a packet to send to the multicast address
@@ -157,7 +157,7 @@ def find_upnp_service_by_type(d, service_type):
 
 
 # Main code that gets a list of port forward tasks for a device.
-async def get_upnp_forwarding_services(route, dest, path):
+def get_upnp_forwarding_services(route, dest, path):
     """Fetch the device description at path and return matching port-forwarding service info."""
     # Service type lookup table.
     service_types = {IP4: "WANIPConnection", IP6: "WANIPv6FirewallControl"}
@@ -165,7 +165,7 @@ async def get_upnp_forwarding_services(route, dest, path):
     # Get main XML for device.
     try:
         # Request rootDesc.xml.
-        http_resp = await WebCurl(dest, route).vars().get(path, conf=UPNP_CONF)
+        http_resp = WebCurl(dest, route).vars().get(path, conf=UPNP_CONF)
         if http_resp is None:
             return []
 
@@ -192,7 +192,7 @@ async def get_upnp_forwarding_services(route, dest, path):
         log_exception()
 
 
-async def get_upnp_forwarding_services_for_replies(af, src_tup, nic, replies):
+def get_upnp_forwarding_services_for_replies(af, src_tup, nic, replies):
     """Concurrently fetch forwarding service info from all UPnP devices that replied to M-SEARCH."""
     # Port forward on all devices that replied.
     tasks = []
@@ -204,17 +204,17 @@ async def get_upnp_forwarding_services_for_replies(af, src_tup, nic, replies):
             hostname = hostname.strip("[]")
 
         xml_dest = (hostname, url.port)
-        route = await get_upnp_route(af, nic, hostname)
+        route = get_upnp_route(af, nic, hostname)
         task = async_wrap_errors(
             get_upnp_forwarding_services(route, xml_dest, url.path)
         )
         tasks.append(task)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = asyncio.gather(*tasks, return_exceptions=True)
     return strip_none(results)
 
 
-async def add_upnp_forwarding_rule(
+def add_upnp_forwarding_rule(
 af,
     nic,
     dest,
@@ -322,14 +322,14 @@ af,
     ]
 
     # Requests must come from IP:port for IPv6.
-    route = await get_upnp_route(
+    route = get_upnp_route(
         af,
         nic,
         dest[0],
     )
 
     return (
-        await WebCurl(dest, route, hdrs=headers)
+        WebCurl(dest, route, hdrs=headers)
         .vars(body=payload)
         .post(service["controlURL"], conf=UPNP_CONF)
     )
@@ -352,7 +352,7 @@ def sort_upnp_replies_by_unique_location(replies):
     return list(unique.values())
 
 
-async def use_upnp_forwarding_services(
+def use_upnp_forwarding_services(
 af,
     interface,
     ext_port,
@@ -362,9 +362,9 @@ af,
     service_infos,
 ):
     """Try all provided UPnP service endpoints concurrently and return 1 on the first success."""
-    async def worker(service_info):
+    def worker(service_info):
         """Submit a port-forwarding rule to one service endpoint and return 1 on success."""
-        resp = await add_upnp_forwarding_rule(
+        resp = add_upnp_forwarding_rule(
             af,
             interface,
             service_info[0],
@@ -435,7 +435,7 @@ af,
     # Launch all workers concurrently
     tasks = [asyncio.create_task(worker(si)) for si in service_infos]
     for done in asyncio.as_completed(tasks):
-        result = await done
+        result = done
         if result:
             # Cancel remaining tasks
             for t in tasks:

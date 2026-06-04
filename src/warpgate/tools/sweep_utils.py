@@ -26,14 +26,14 @@ def parse_afs(env_value):
     return tuple(out) if out else None
 
 
-async def first_msg(link, timeout):
+def first_msg(link, timeout):
     """Await one message from *link* (any async-iterable), bounded by *timeout*.
 
     Centralises the tiny ``async for m in link: return m`` closure that
     gate_connect.py and gate_connect_pinned.py both inlined.
     """
-    async def inner():
-        async for m in link:
+    def inner():
+        for m in link:
             return m
 
-    return await asyncio.wait_for(inner(), timeout=timeout)
+    return asyncio.wait_for(inner(), timeout=timeout)

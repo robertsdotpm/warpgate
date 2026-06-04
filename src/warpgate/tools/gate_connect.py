@@ -36,7 +36,7 @@ def parse_afs(env_value):
     return tuple((IP4 if v == 4 else IP6) for v in ints)
 
 
-async def main():
+def main():
     target = os.environ["WG_TARGET"]
     name = os.environ.get("WG_CONNECT_NAME") or None
     # Default 900s: test_all_phases runs every phase serially -- tcp_punch
@@ -68,12 +68,12 @@ async def main():
     # WG_NIC pins the connector to a single interface (see gate_listen).
     nic = os.environ.get("WG_NIC") or None
     nic_names = [nic] if nic else None
-    async with (Gate(name=name, nic_names=nic_names) if name
+    with (Gate(name=name, nic_names=nic_names) if name
                 else Gate(nic_names=nic_names)) as gate:
         print("WG_CONNECTOR_READY: {0} afs={1} plugins={2} route_types={3}".format(
             gate.full_name or "?", afs, plugins, route_types,
         ), flush=True)
-        link = await gate.connect(
+        link = gate.connect(
             peer.find(target),
             test_all_phases=True,
             timeout=timeout,
@@ -101,10 +101,10 @@ async def main():
         # quick echo squeaks through.
         hold_s = float(os.environ.get("WG_HOLD_SECONDS", "0") or "0")
         try:
-            async with link:
-                await link.send(b"PING:gate_sweep")
+            with link:
+                link.send(b"PING:gate_sweep")
 
-                msg = await first_msg(link, timeout=10.0)
+                msg = first_msg(link, timeout=10.0)
                 ok = msg is not None and msg.startswith(b"PONG:")
 
                 if ok and hold_s > 0:
@@ -115,10 +115,10 @@ async def main():
                     while time.monotonic() - t0 < hold_s:
                         rnd += 1
                         try:
-                            await link.send(
+                            link.send(
                                 b"PING:hold-" + str(rnd).encode("ascii")
                             )
-                            hm = await asyncio.wait_for(one(), timeout=10.0)
+                            hm = asyncio.wait_for(one(), timeout=10.0)
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:  # pylint: disable=broad-except
@@ -128,7 +128,7 @@ async def main():
                             hold_err = "bad-reply:{0}".format(hm)
                             break
                         last_ok = time.monotonic() - t0
-                        await asyncio.sleep(1.0)
+                        asyncio.sleep(1.0)
                     print(
                         "OUTCOME hold_target={0}s hold_rounds={1} "
                         "hold_last_ok={2:.1f}s hold_err={3}".format(

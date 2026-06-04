@@ -142,7 +142,7 @@ class WarpgateServer(RESTD):
         }
 
     @RESTD.GET(["version"])
-    async def get_version(self, v, pipe):
+    def get_version(self, v, pipe):
         """Return the Warpgate version and author information."""
         return {
             "title": "Warpgate",
@@ -152,7 +152,7 @@ class WarpgateServer(RESTD):
         }
 
     @RESTD.GET(["ifs"])
-    async def get_interfaces(self, v, pipe):
+    def get_interfaces(self, v, pipe):
         """Return a JSON-serialised list of all loaded network interfaces."""
         try:
             return {"ifs": if_list_to_dict(self.interfaces), "error": 0}
@@ -161,14 +161,14 @@ class WarpgateServer(RESTD):
             return {"error": 4, "msg": "unable to convert ifs to dict."}
 
     @RESTD.GET(["addr"])
-    async def get_peer_addr(self, v, pipe):
+    def get_peer_addr(self, v, pipe):
         """Return the serialised P2P address bytes of this node."""
         if self.node.addr_bytes is None:
             return {"error": 5, "msg": "warpgate node addr bytes is none."}
         return {"addr": to_s(self.node.addr_bytes), "error": 0}
 
     @RESTD.GET(["open"])
-    async def open_p2p_pipe(self, v, pipe):
+    def open_p2p_pipe(self, v, pipe):
         """Initiate a P2P connection to dest_addr and store it under the given con_name."""
         con_name = v["name"]["open"]
         dest_addr = v["pos"][0]
@@ -185,7 +185,7 @@ class WarpgateServer(RESTD):
             dest_addr = self.node.addr_bytes
 
         # Attempt to make the connection.
-        con = await create_task(
+        con = create_task(
             async_wrap_errors(
                 self.node.connect(
                     to_b(dest_addr),
@@ -221,7 +221,7 @@ class WarpgateServer(RESTD):
             return {"msg": fstr("Con {0} failed connect.", (con_name,)), "error": 3}
 
     @RESTD.GET(["info"])
-    async def get_con_info(self, v, pipe):
+    def get_con_info(self, v, pipe):
         """Return socket and route metadata for the named open connection."""
         con_name = v["name"]["con"]
         if con_name not in self.cons:
@@ -232,7 +232,7 @@ class WarpgateServer(RESTD):
         return self.con_info(con_name, con)
 
     @RESTD.GET(["send"])
-    async def pipe_send_text(self, v, pipe):
+    def pipe_send_text(self, v, pipe):
         """URL-decode the message parameter and send it as text over the named connection."""
         con_name = v["name"]["send"]
         en_msg = urldecode(v["pos"][0])
@@ -241,7 +241,7 @@ class WarpgateServer(RESTD):
         con = self.cons[con_name]
 
         # Send data.
-        send_success = await con.send(data=to_b(en_msg), dest_tup=con.stream.dest_tup)
+        send_success = con.send(data=to_b(en_msg), dest_tup=con.stream.dest_tup)
 
         # Check return value.
         if not send_success:
@@ -251,7 +251,7 @@ class WarpgateServer(RESTD):
         return {"con_name": con_name, "sent": len(en_msg), "error": 0}
 
     @RESTD.GET(["recv"])
-    async def pipe_recv_text(self, v, pipe):
+    def pipe_recv_text(self, v, pipe):
         """Wait for and return a text message from the named connection's receive buffer."""
         con_name = v["name"]["recv"]
 
@@ -260,7 +260,7 @@ class WarpgateServer(RESTD):
         sub = load_sub_or_default(v, self.subs)
         timeout = get_opt_param(v, "timeout") or 2
         try:
-            out = await con.recv(sub, timeout=timeout, full=True)
+            out = con.recv(sub, timeout=timeout, full=True)
             if out is None:
                 return {"msg": fstr("recv buffer {0} empty.", (sub,)), "error": 6}
 
@@ -274,19 +274,19 @@ class WarpgateServer(RESTD):
             return {"msg": "recv timeout", "error": 5}
 
     @RESTD.GET(["close"])
-    async def pipe_close(self, v, pipe):
+    def pipe_close(self, v, pipe):
         """Close the named P2P connection and remove it from the connection table."""
         con_name = v["name"]["close"]
 
         # Close the con -- fires cleanup handler.
         con = self.cons[con_name]
-        await con.close()
+        con.close()
 
         # Indicate closed.
         return {"closed": con_name, "error": 0}
 
     @RESTD.POST(["binary"])
-    async def pipe_send_binary(self, v, pipe):
+    def pipe_send_binary(self, v, pipe):
         """Send the raw POST body as binary data over the named P2P connection."""
         con_name = v["name"]["binary"]
 
@@ -294,7 +294,7 @@ class WarpgateServer(RESTD):
         con = self.cons[con_name]
 
         # Last content-len bytes == payload.
-        send_success = await con.send(v["body"], con.stream.dest_tup)
+        send_success = con.send(v["body"], con.stream.dest_tup)
         if not send_success:
             return {"error": 8, "msg": "binary send failed."}
 
@@ -302,7 +302,7 @@ class WarpgateServer(RESTD):
         return {"con_name": con_name, "sent": len(v["body"]), "error": 0}
 
     @RESTD.GET(["binary"])
-    async def pipe_get_binary(self, v, pipe):
+    def pipe_get_binary(self, v, pipe):
         """Read raw binary data from the named connection's receive buffer and return it directly."""
         con_name = v["name"]["binary"]
 
@@ -314,7 +314,7 @@ class WarpgateServer(RESTD):
 
         # Get binary from matching buffer.
         timeout = get_opt_param(v, "timeout") or 2
-        out = await con.recv(sub, timeout=timeout, full=True)
+        out = con.recv(sub, timeout=timeout, full=True)
         if out is None:
             return {"msg": fstr("recv buffer {0} empty.", (sub,)), "error": 6}
 
@@ -322,7 +322,7 @@ class WarpgateServer(RESTD):
         return out[1]
 
     @RESTD.GET(["tunnel"])
-    async def http_tunnel_trick(self, v, pipe):
+    def http_tunnel_trick(self, v, pipe):
         """Upgrade this HTTP connection to a transparent bidirectional tunnel to the named P2P pipe."""
         con_name = v["name"]["pipe"]
 
@@ -345,7 +345,7 @@ class WarpgateServer(RESTD):
         return None
 
     @RESTD.GET(["sub"], ["name"], ["msg_p"])
-    async def pipe_do_sub(self, v, pipe):
+    def pipe_do_sub(self, v, pipe):
         """Create a named message subscription filter on the specified P2P connection."""
         # Get variable names.
         con_name = v["name"]["sub"]
@@ -377,7 +377,7 @@ class WarpgateServer(RESTD):
         }
 
     @RESTD.DELETE(["sub"], ["name"])
-    async def pipe_do_unsub(self, v, pipe):
+    def pipe_do_unsub(self, v, pipe):
         """Remove a named subscription filter from the specified P2P connection."""
         con_name = v["name"]["sub"]
         sub_name = v["name"]["name"]
@@ -395,7 +395,7 @@ class WarpgateServer(RESTD):
 
 
 # pragma: no cover
-async def start_warpgate_server(port=REST_API_PORT, ifs=None, enable_upnp=False):
+def start_warpgate_server(port=REST_API_PORT, ifs=None, enable_upnp=False):
     """Start a Warpgate node and bind the REST API server to the loopback interface on port."""
     if enable_upnp:
         pass
@@ -404,40 +404,40 @@ async def start_warpgate_server(port=REST_API_PORT, ifs=None, enable_upnp=False)
     node_conf = dict_child({"enable_upnp": enable_upnp}, NODE_CONF)
 
     # Load netifaces.
-    netifaces = await aionetiface_setup_netifaces()
+    netifaces = aionetiface_setup_netifaces()
 
     # Load interfaces.
     if ifs is None:
         ifs = []
     if not ifs:
         # Load a list of interface names.
-        if_names = await list_interfaces(netifaces=netifaces)
+        if_names = list_interfaces(netifaces=netifaces)
         if not if_names:
             raise AssertionError("warpgate rest could not find if names")
 
         # Load those interfaces with NAT details.
-        ifs = await load_interfaces(if_names, Interface)
+        ifs = load_interfaces(if_names, Interface)
         if not ifs:
             raise AssertionError("warpgate rest no ifs loaded.")
 
     # Start Warpgate node.
     node = Node(ifs, port=NODE_PORT + 60 + 1, conf=node_conf)
-    await node.start()
+    node.start()
 
     # Start Warpgate server.
     p2p_server = WarpgateServer(ifs, node)
     for nic in ifs:
-        await p2p_server.listen_loopback(TCP, port, nic)
+        p2p_server.listen_loopback(TCP, port, nic)
 
     # Stop this thread exiting.
     return p2p_server
 
 
-async def warpgate_workspace():
+def warpgate_workspace():
     """Launch the Warpgate REST server and block indefinitely for manual testing."""
-    await start_warpgate_server()
+    start_warpgate_server()
     while True:
-        await asyncio.sleep(1)
+        asyncio.sleep(1)
 
 
 if __name__ == "__main__":

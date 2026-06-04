@@ -390,7 +390,7 @@ def sig_msg_to_buf(msg, dest_pk):
     return to_b(buf)
 
 
-async def close_plugin(plugin, plugins, inbound_pipes):
+def close_plugin(plugin, plugins, inbound_pipes):
     """Release plugin resources and remove it from registries.
 
     Safe to call multiple times (pop is a no-op when the key is absent).
@@ -418,7 +418,7 @@ async def close_plugin(plugin, plugins, inbound_pipes):
     close_fn = getattr(plugin, "close", None)
     if close_fn is not None:
         try:
-            await asyncio.wait_for(close_fn(), timeout=5.0)
+            asyncio.wait_for(close_fn(), timeout=5.0)
         except (asyncio.TimeoutError, OSError):
             log_exception()
         except asyncio.CancelledError:

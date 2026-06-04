@@ -61,7 +61,7 @@ class NATMapping:
         return NATMapping([d["local"], d["reply"], d["remote"]], d["sock"])
 
 
-async def get_high_port_mapping(stun_client):
+def get_high_port_mapping(stun_client):
     """Bind to a high-numbered port via STUN and return the resulting NAT mapping."""
     assert stun_client.conf["reuse_addr"]
     nic = stun_client.interface
@@ -69,7 +69,7 @@ async def get_high_port_mapping(stun_client):
     for _ in range(0, 5):
         try:
             # Reserve a sock for use.
-            _, high_port = await get_high_port_socket(
+            _, high_port = get_high_port_socket(
                 nic.route(af),
                 socket_factory,
                 sock_type=TCP,
@@ -77,10 +77,10 @@ async def get_high_port_mapping(stun_client):
 
             # Bind to a sock with that port.
             route = nic.route(af)
-            await route.bind(port=high_port)
+            route.bind(port=high_port)
 
             # Determine associated remote port.
-            ret = await stun_client.get_mapping(
+            ret = stun_client.get_mapping(
                 # Upgraded to a pipe.
                 pipe=route
             )
@@ -140,7 +140,7 @@ def init_predictions(mode, src_nat, dest_nat, recv_mappings=None, test_no=8):
     return use_range, src_nat, dest_nat, recv_mappings
 
 
-async def preload_mappings(no, stuns):
+def preload_mappings(no, stuns):
     """Concurrently fetch no high-port STUN mappings from the given STUN clients."""
     # Get a mapping to use.
     tasks = []
@@ -149,7 +149,7 @@ async def preload_mappings(no, stuns):
         task = get_high_port_mapping(stun)
         tasks.append(task)
 
-    mappings = await asyncio.gather(*tasks)
+    mappings = asyncio.gather(*tasks)
     mappings = strip_none(mappings)
     return mappings
 
@@ -309,7 +309,7 @@ mode,
     raise AssertionError("Can't predict this NAT type.")
 
 
-async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=8):
+def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, test_no=8):
     # Wider spray for the predictor path to absorb carrier-NAT
     # allocation-pointer drift between the STUN preload and the punch
     # fire. At test_no=2 the wire-level mappings only had to drift by 2
@@ -339,7 +339,7 @@ async def nat_prediction(mode, src_nat, dest_nat, stuns, recv_mappings=None, tes
     # time bucket.  3 successive samples are enough to pin the
     # allocation pattern; get_single_mapping's IndexError fallback to
     # preloaded_mappings[0] covers indices beyond 3.
-    preloaded_mappings = await preload_mappings(3, stuns)
+    preloaded_mappings = preload_mappings(3, stuns)
     assert len(preloaded_mappings)
 
     # Use default ports for client if unknown

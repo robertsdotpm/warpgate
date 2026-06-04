@@ -285,7 +285,7 @@ self,
 
 if __name__ == "__main__":
 
-    async def main():
+    def main():
         """Run a standalone punch test from the command line."""
         # from ....nic.interface import Interface
         # nic = await Interface()

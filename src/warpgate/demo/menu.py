@@ -18,7 +18,7 @@ from .utils import (
 
 # Open a tunnel to a remote destination.
 # Accepts a PNP address or a full node address.
-async def connect_option(node, con_opts):
+def connect_option(node, con_opts):
     """Open a P2P tunnel to a remote address and run an interactive echo session."""
     # Some variables set by command line flags or other parts.
     last_addr, echo_data, cmd_opts = con_opts
@@ -30,7 +30,7 @@ async def connect_option(node, con_opts):
     if isinstance(last_addr, str):
         dest_addr = last_addr
     else:
-        dest_addr = await get_dest_addr(node, last_addr)
+        dest_addr = get_dest_addr(node, last_addr)
 
     # Self-connect guard. The cascade has no native "same machine,
     # same NIC, same identity" path -- punching to yourself fails in
@@ -73,7 +73,7 @@ async def connect_option(node, con_opts):
         return "menu"
 
     # Get connect cmd segments manually if not set.
-    plugin_name = await choose_connection_methods(con_method)
+    plugin_name = choose_connection_methods(con_method)
     if plugin_name == "menu":
         return "menu"
 
@@ -82,7 +82,7 @@ async def connect_option(node, con_opts):
         cout()
         cout("Auto-connecting... Please wait...")
         try:
-            pipe, plugin = await auto_connect(node, dest_addr, protocol=None)
+            pipe, plugin = auto_connect(node, dest_addr, protocol=None)
         except (OSError, ConnectionError, asyncio.TimeoutError) as e:
             cout("Auto-connect error: " + str(e))
             return "menu"
@@ -95,12 +95,12 @@ async def connect_option(node, con_opts):
         cout(pipe.sock)
         pipe.subscribe(SUB_ALL)
         try:
-            return await echo_client(pipe, echo_data)
+            return echo_client(pipe, echo_data)
         finally:
-            await pipe.close()
+            pipe.close()
 
-    route_type = await choose_pathways(pathway)
-    af = await choose_address_families(addr_type)
+    route_type = choose_pathways(pathway)
+    af = choose_address_families(addr_type)
     if "menu" in (route_type, af):
         return "menu"
 
@@ -118,7 +118,7 @@ async def connect_option(node, con_opts):
     # (plugin.result) is wrapped so connection timeouts and failures are
     # handled gracefully.
     try:
-        plugin = await node.connect(af, route_type, dest_addr, plugin_name)
+        plugin = node.connect(af, route_type, dest_addr, plugin_name)
     except (OSError, ConnectionError, asyncio.TimeoutError) as e:
         cout("Connection error: " + str(e))
         return "menu"
@@ -164,7 +164,7 @@ async def connect_option(node, con_opts):
     # a cleanup-loop-driven plugin.result.cancel() should NOT tear
     # down the interactive menu.  Distinguish via plugin.result.cancelled().
     try:
-        pipe = await async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
+        pipe = async_wrap_errors(plugin.result, timeout=plugin.timeout + 10)
     except asyncio.CancelledError:
         try:
             cancelled_internally = plugin.result.cancelled()
@@ -182,7 +182,7 @@ async def connect_option(node, con_opts):
     # plugin.close() tears those down -- the bridge's write-arm then fails
     # with fd=-1 on the very first ECHO and the round-trip times out.
     if pipe is None and plugin_holder[0] is not None:
-        await close_plugin(
+        close_plugin(
             plugin_holder[0],
             node.traversal.plugins,
             node.traversal.inbound_pipes,
@@ -199,16 +199,16 @@ async def connect_option(node, con_opts):
         # are setup for pipe methods so this says to queue
         # all messages received so they can be awaited.
         pipe.subscribe(SUB_ALL)
-        return await echo_client(pipe, echo_data)
+        return echo_client(pipe, echo_data)
     finally:
         if pipe:
-            await pipe.close()
+            pipe.close()
 
     # Return to menu for unexpected code paths.
     return "menu"
 
 
-async def accept_option(nick, node=None):
+def accept_option(nick, node=None):
     """Wait in an accept loop, printing the node's PNP nickname, until a stop signal arrives.
 
     Awaits node.nat_classify_task (if present) BEFORE printing "Listen on
@@ -228,7 +228,7 @@ async def accept_option(nick, node=None):
         if nct is not None and not nct.done():
             print("\tWaiting for NAT classification to complete...", flush=True)
             try:
-                await nct
+                nct
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 # NAT classify is best-effort; surface failure but don't
                 # block the listener if classification errored.  The cached
@@ -238,16 +238,16 @@ async def accept_option(nick, node=None):
 
     print("\tListen on PNP: ", nick, flush=True)
     while not sock_has_data(stop_rw[0]):
-        await asyncio.sleep(1)
+        asyncio.sleep(1)
 
     return "menu"
 
 
-async def nickname_option(node):
+def nickname_option(node):
     """Prompt for a nickname string and register it on the PNP network."""
-    choice = await ainput("Enter nickname: ")
+    choice = ainput("Enter nickname: ")
     try:
-        ret = await node.nickname(choice)
+        ret = node.nickname(choice)
         cout(fstr("Nickname registered = {0}", (str(ret),)))
     except (OSError, ConnectionError, asyncio.TimeoutError):
         cout("Nickname taken.")
@@ -255,13 +255,13 @@ async def nickname_option(node):
     return "menu"
 
 
-async def stop_nodes_option(nodes):
+def stop_nodes_option(nodes):
     """Gracefully shut down all provided nodes."""
     cout("")
     cout("Stopping nodes...")
     for n in nodes:
         try:
-            await n.close()
+            n.close()
         except (OSError, asyncio.TimeoutError):
             log("exception in stop nodes")
             log_exception()
@@ -269,7 +269,7 @@ async def stop_nodes_option(nodes):
     return ""
 
 
-async def run_menu_program(
+def run_menu_program(
     nick,
     ifs,
     nodes,
@@ -278,13 +278,13 @@ async def run_menu_program(
 ):
     """Display the interactive menu and dispatch to the chosen option handler."""
     # Select menu program.
-    menu_option = menu_option or (await ainput("Select menu option: "))
+    menu_option = menu_option or (ainput("Select menu option: "))
     menu_option = menu_option.lower().strip()
 
     # Connect to a remote host using PNP or full node address.
     if "connect:" and menu_option == "0":
         assert con_opts
-        return await connect_option(nodes[0], con_opts)
+        return connect_option(nodes[0], con_opts)
 
     # Just run the event loop so cons can be accepted.
     # Just an asyncio sleep loop.
@@ -295,11 +295,11 @@ async def run_menu_program(
         # scripted callers (--cmd 1 matrix runs) race the classifier
         # and any connector that resolves the nickname during that
         # window picks up a stale-NAT addr.
-        return await accept_option(nick, node=nodes[0])
+        return accept_option(nick, node=nodes[0])
 
     # Set a new nickname for the primary node.
     if "nickname:" and menu_option == "2":
-        return await nickname_option(nodes[0])
+        return nickname_option(nodes[0])
 
     # Close all nodes and exit the program.
     if "exit:" and menu_option in ("3", "exit", "quit"):

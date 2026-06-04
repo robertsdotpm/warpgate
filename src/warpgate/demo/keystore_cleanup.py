@@ -60,7 +60,7 @@ def discover_keystore_entries():
     return out
 
 
-async def delete_from_pnp(nic, sys_clock, pnp_name, priv_hex):
+def delete_from_pnp(nic, sys_clock, pnp_name, priv_hex):
     """Sign a DELETE for pnp_name against the configured PNP server
     using the keypair from priv_hex.  Returns True on success."""
     # Local imports keep this module cheap to import even when
@@ -74,16 +74,16 @@ async def delete_from_pnp(nic, sys_clock, pnp_name, priv_hex):
     sk = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
     kp = Keypair(priv=sk)
 
-    client = await Client(pnp_dest, pnp_pk, sys_clock, nic)
+    client = Client(pnp_dest, pnp_pk, sys_clock, nic)
     # Single-PNP-server deployment uses ".p2p" as the TLD.  If we
     # ever go multi-server we'll need to thread the active TLD
     # through; for now this matches what derive_default_pnp_name +
     # registration use.
     full_name = pnp_name + ".p2p"
-    await client.delete(full_name, kp)
+    client.delete(full_name, kp)
 
 
-async def prompt_keystore_cleanup(nic, sys_clock):
+def prompt_keystore_cleanup(nic, sys_clock):
     """Interactive cleanup flow.  Returns True if anything was
     deleted (caller can re-attempt setup), False otherwise."""
     entries = discover_keystore_entries()
@@ -109,7 +109,7 @@ async def prompt_keystore_cleanup(nic, sys_clock):
     cout("or anything else to cancel.")
 
     try:
-        response = (await ainput("Choice: ")).strip().lower()
+        response = (ainput("Choice: ")).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
 
@@ -130,7 +130,7 @@ async def prompt_keystore_cleanup(nic, sys_clock):
         # gone, signature mismatch) we still want to nuke the local
         # keystore file so the user isn't blocked.
         try:
-            await delete_from_pnp(nic, sys_clock, pnp_name, priv_hex)
+            delete_from_pnp(nic, sys_clock, pnp_name, priv_hex)
             cout("Deleted '{0}' from PNP server.".format(pnp_name))
             cleaned += 1
         except Exception as exc:  # pylint: disable=broad-except

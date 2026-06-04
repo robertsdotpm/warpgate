@@ -24,7 +24,7 @@ class DirectConnect(Plugin):
     name = "direct_connect"
     transport = TCP
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         # Re-entry guard.  TM's recv_signal_msg falls through to
         # scheduling another run_plugin task when a duplicate signal
         # for the same pipe_id arrives while plugin.result is still
@@ -40,14 +40,14 @@ class DirectConnect(Plugin):
 
         dest = (self.dest["ip"], self.dest["port"])
         try:
-            route = await self.bind()
+            route = self.bind()
         except (OSError, ValueError):
             log_exception()
             self.result.set_result(None)
             return
 
         try:
-            pipe = await asyncio.wait_for(
+            pipe = asyncio.wait_for(
                 Pipe(TCP, dest, route).connect(),
                 timeout=8.0,
             )
@@ -65,11 +65,11 @@ class DirectConnect(Plugin):
         # can resolve any reverse_connect inbound future for plugin_id
         # without a separate signal-channel round trip.
         try:
-            await pipe.send(CON_ID_PREFIX + to_b(self.plugin_id) + b"\n")
+            pipe.send(CON_ID_PREFIX + to_b(self.plugin_id) + b"\n")
         except (OSError, ConnectionError, asyncio.TimeoutError):
             log_exception()
             try:
-                await pipe.close()
+                pipe.close()
             except asyncio.CancelledError:
                 raise
             except Exception:

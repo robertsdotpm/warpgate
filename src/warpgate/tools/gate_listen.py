@@ -25,13 +25,13 @@ from warpgate.gate import Gate, GateAfNotSupported
 from warpgate.tools.sweep_utils import parse_afs
 
 
-async def handle(pipe, msg):
+def handle(pipe, msg):
     """Default echo handler: PING:foo -> PONG:foo."""
     if msg.startswith(b"PING:"):
-        await pipe.send(b"PONG:" + msg[5:])
+        pipe.send(b"PONG:" + msg[5:])
 
 
-async def emit_ready_when_registered(gate):
+def emit_ready_when_registered(gate):
     """Print WG_CAPS (interfaces + supported AFs) then WG_READY once registered.
 
     The orchestrator uses WG_CAPS to verify the listener can serve the
@@ -40,7 +40,7 @@ async def emit_ready_when_registered(gate):
     """
     caps_emitted = False
     for _ in range(2000):
-        await asyncio.sleep(0.1)
+        asyncio.sleep(0.1)
         # Emit WG_CAPS as soon as interfaces are loaded -- that lets
         # the orchestrator decide whether to even continue this
         # iteration before the slower PNP registration completes.
@@ -73,7 +73,7 @@ async def emit_ready_when_registered(gate):
           "after 200s)", flush=True)
 
 
-async def main():
+def main():
     name = os.environ.get("WG_LISTEN_NAME") or None
     # WG_NIC pins the listener to a single interface by display name so
     # the matrix VMs' flaky IPv4-only mobile NIC is excluded -- without
@@ -99,7 +99,7 @@ async def main():
     gate = Gate(name=name, nic_names=nic_names, conf=conf, afs=afs)
     asyncio.ensure_future(emit_ready_when_registered(gate))
     try:
-        await gate.listen(handle)
+        gate.listen(handle)
     except asyncio.CancelledError:
         raise
     except GateAfNotSupported as exc:

@@ -100,7 +100,7 @@ class PunchPcapPlugin(Plugin):
     proto_messages = ()
 
     @classmethod
-    async def setup(cls, node):
+    def setup(cls, node):
         """Plugin entry point. DISABLED BY DEFAULT.
 
         The pcap stack is empirical / research-grade and brings hard
@@ -147,7 +147,7 @@ class PunchPcapPlugin(Plugin):
         node.resources.register(factory_holder)
         return factory_holder
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Coordinate the bucket-aligned punch exchange and dispatch the
         pcap-driven spray on the second message."""
         if self.plugin_id in self.completed_pipe_ids:
@@ -177,7 +177,7 @@ class PunchPcapPlugin(Plugin):
         puncher = self.punch_clients.get(self.plugin_id)
         if puncher is None:
             try:
-                puncher, stuns = await self.setup_puncher_client(reply)
+                puncher, stuns = self.setup_puncher_client(reply)
             except BaseException as exc:
                 raise
             if puncher is None:
@@ -186,17 +186,17 @@ class PunchPcapPlugin(Plugin):
                 return
             puncher = self.punch_clients.get(self.plugin_id) or puncher
             if self.plugin_id not in self.punch_clients:
-                puncher = await self.configure_puncher_process(puncher, stuns)
+                puncher = self.configure_puncher_process(puncher, stuns)
 
         # Advance the NAT exchange.
-        outgoing_msg = await self.advance_punching_protocol(
+        outgoing_msg = self.advance_punching_protocol(
             puncher, reply, puncher.punch_time,
         )
         if outgoing_msg is None:
             return
-        await self.send_signal(outgoing_msg)
+        self.send_signal(outgoing_msg)
 
-    async def setup_puncher_client(self, reply):
+    def setup_puncher_client(self, reply):
         """Build the PunchClient + load STUN. Same shape as tcp_punch."""
         if_index = self.src["if_index"]
         stuns = self.stun_clients.get(self.af, {}).get(if_index, [])
@@ -206,7 +206,7 @@ class PunchPcapPlugin(Plugin):
             )
             from ..tcp_punch.punch_defs import PUNCH_CONF
             try:
-                retry = await asyncio.wait_for(
+                retry = asyncio.wait_for(
                     get_n_stun_clients(
                         af=self.af, n=USE_MAP_NO, mode=RFC5389,
                         interface=self.nic, proto=TCP, conf=PUNCH_CONF,
@@ -257,7 +257,7 @@ class PunchPcapPlugin(Plugin):
         puncher.add_port_allocator(boundary_port_alloc)
         return puncher, stuns
 
-    async def configure_puncher_process(self, puncher, stuns):
+    def configure_puncher_process(self, puncher, stuns):
         self.punch_clients[self.plugin_id] = puncher
         self.nat_alloc = NATPredictAlloc(stuns)
         self.nat_alloc.set_nat_info(self.src["nat"], self.dest["nat"])
@@ -275,7 +275,7 @@ class PunchPcapPlugin(Plugin):
             )
         return puncher
 
-    async def advance_punching_protocol(self, puncher, reply, punch_time):
+    def advance_punching_protocol(self, puncher, reply, punch_time):
         """Identical shape to tcp_punch.advance_punching_protocol."""
         tx_unix = int(self.sys_clock.time())
         clock_uncertainty = float(getattr(self.sys_clock, "uncertainty", 0.0))
@@ -317,7 +317,7 @@ class PunchPcapPlugin(Plugin):
             ))
             return None
 
-        port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
+        port_alloc, is_end = self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
         # Only fold-then-signal when recv_mappings was supplied: for the
         # INITIATOR's first call we've only sent OUR predictions out and
@@ -354,7 +354,7 @@ class PunchPcapPlugin(Plugin):
         msg.meta.plugin_name = "tcp_punch"
         return msg
 
-    async def delayed_start_punching_proc(self, nic, puncher):
+    def delayed_start_punching_proc(self, nic, puncher):
         """Wait for the peer's mapping reply (or reply_delay timeout) then fire the pcap engine.
 
         On a winner, wrap the userspace ``Connection`` in a
@@ -379,7 +379,7 @@ class PunchPcapPlugin(Plugin):
         shim_wrapped = False
         try:
             try:
-                await asyncio.wait_for(self.mapping_reply, reply_delay)
+                asyncio.wait_for(self.mapping_reply, reply_delay)
             except asyncio.TimeoutError:
                 log("[PCAP-PUNCH-DELAY] mapping_reply timed out after "
                     "{0}s; proceeding".format(reply_delay))
@@ -396,7 +396,7 @@ class PunchPcapPlugin(Plugin):
             local_ports = sorted(set(int(pa.src_port)
                                      for pa in puncher.port_allocs))
             loop = asyncio.get_event_loop()
-            firewall_ports = await loop.run_in_executor(
+            firewall_ports = loop.run_in_executor(
                 None, install_block_ports, local_ports,
             )
 
@@ -409,10 +409,10 @@ class PunchPcapPlugin(Plugin):
             # PunchClient.sleep_until (which time.sleep()'s).
             loop = asyncio.get_event_loop()
 
-            async def sleep_until_async():
-                await loop.run_in_executor(None, puncher.sleep_until)
+            def sleep_until_async():
+                loop.run_in_executor(None, puncher.sleep_until)
 
-            winner_conn = await pcap_selector_punch_engine(
+            winner_conn = pcap_selector_punch_engine(
                 nic_pcap_name=nic_pcap_name,
                 port_allocs=puncher.port_allocs,
                 src_ip=puncher.src_ip,
@@ -428,7 +428,7 @@ class PunchPcapPlugin(Plugin):
                     "at {0}".format(puncher.secondary_punch_time))
                 puncher.punch_time = puncher.secondary_punch_time
                 puncher.secondary_punch_time = 0
-                winner_conn = await pcap_selector_punch_engine(
+                winner_conn = pcap_selector_punch_engine(
                     nic_pcap_name=nic_pcap_name,
                     port_allocs=puncher.port_allocs,
                     src_ip=puncher.src_ip,
@@ -469,7 +469,7 @@ class PunchPcapPlugin(Plugin):
                     # Outer race resolved already; close shim cleanly so
                     # firewall rules and Connection both come down.
                     try:
-                        await shim.close()
+                        shim.close()
                     except Exception:
                         pass
             else:
@@ -512,11 +512,11 @@ class PunchPcapPlugin(Plugin):
                 return entry["name"]
         return ""
 
-    async def close(self):
+    def close(self):
         """Cancel any in-flight delayed-start task."""
         task = self.punch_proc.pop(self.plugin_id, None)
         self.punch_clients.pop(self.plugin_id, None)
-        await cancel_task(task)
+        cancel_task(task)
         if not self.result.done():
             self.result.cancel()
         self.completed_pipe_ids.add(self.plugin_id)
@@ -551,6 +551,6 @@ class PunchPcapFactory:
         plugin.completed_pipe_ids = self.completed_pipe_ids
         return plugin
 
-    async def close(self):
+    def close(self):
         # Nothing to shut down: no proc pool, no shared sockets.
         return None

@@ -12,7 +12,7 @@ class ReverseConnectPlugin(Plugin):
     name = "reverse_connect"
     transport = TCP
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Signal the peer to dial us; await the inbound pipe."""
         # Re-entry guard.  Same shape as direct_connect's.  TM's
         # recv_signal_msg may schedule a second run() while the first
@@ -29,11 +29,11 @@ class ReverseConnectPlugin(Plugin):
         # Reserve the inbound future BEFORE sending the signal -- a
         # fast peer could connect back before we register, otherwise.
         self.register_inbound()
-        await self.send_signal(msg)
+        self.send_signal(msg)
         log(fstr(
             "reverse_connect[{0}]: signal sent, awaiting inbound",
             (self.plugin_id,),
         ))
-        pipe = await self.wait_for_inbound()
+        pipe = self.wait_for_inbound()
         if not self.result.done():
             self.result.set_result(pipe)

@@ -54,7 +54,7 @@ from aionetiface.utility.cleanup import (  # noqa: F401, E402
 
 
 # Shutdown the node server and do cleanup.
-async def node_stop(node):
+def node_stop(node):
     """Shut down the node, closing traversal plugins, resources, the daemon, and the stop socket pair."""
     log("[NODE-STOP] mono={0:.4f} node_stop entered".format(
         time.monotonic()
@@ -89,19 +89,19 @@ async def node_stop(node):
                     continue
                 if hasattr(pipe, "close"):
                     try:
-                        await close_with_timeout(pipe)
+                        close_with_timeout(pipe)
                     except (OSError, asyncio.TimeoutError):
                         pass
             else:
                 result.cancel()
 
     if getattr(node, "resources", None):
-        await node.resources.close()
+        node.resources.close()
 
     # Close the traversal manager's background signal-handler tasks.
     traversal = getattr(node, "traversal", None)
     if traversal is not None and hasattr(traversal, "close"):
-        await traversal.close()
+        traversal.close()
 
     # Close the MQTT router and its background dispatcher tasks. Without this,
     # dispatcher coroutines from each MQTTClient stay pending after node_stop
@@ -109,7 +109,7 @@ async def node_stop(node):
     router = getattr(node, "router", None)
     if router is not None and hasattr(router, "close"):
         try:
-            await asyncio.wait_for(router.close(), timeout=4)
+            asyncio.wait_for(router.close(), timeout=4)
         except asyncio.TimeoutError:
             log("Timeout closing node.router")
 
@@ -117,7 +117,7 @@ async def node_stop(node):
     # Using Daemon.close(node) directly rather than super(node.__class__, node).close()
     # because the super() pattern breaks if Node is ever subclassed: super(SubClass, node)
     # would resolve to Node, calling node_stop() again and looping infinitely.
-    await Daemon.close(node)
+    Daemon.close(node)
 
     # Close the stop-signal socket pair.
     for sock in (

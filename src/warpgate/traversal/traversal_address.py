@@ -3,13 +3,13 @@ import asyncio
 from aionetiface import log
 
 
-async def get_updated_addr_from_mqtt(node, dest_bytes):
+def get_updated_addr_from_mqtt(node, dest_bytes):
     """Ask the peer for its freshest address bytes via the get_addr plugin over MQTT."""
     af = None  # AF selection is handled inside connect().
     route_type = None
-    plugin = await node.connect(af, route_type, dest_bytes, "get_addr")
+    plugin = node.connect(af, route_type, dest_bytes, "get_addr")
     try:
-        updated_bytes = await asyncio.wait_for(plugin.result, timeout=10)
+        updated_bytes = asyncio.wait_for(plugin.result, timeout=10)
     except asyncio.TimeoutError:
         log("get_updated_addr_from_mqtt timed out waiting for reply")
         return None
@@ -29,7 +29,7 @@ async def get_updated_addr_from_mqtt(node, dest_bytes):
         return None
     finally:
         try:
-            await plugin.close()
+            plugin.close()
         except asyncio.CancelledError:
             raise
         except Exception:

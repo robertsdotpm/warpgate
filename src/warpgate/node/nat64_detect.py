@@ -44,7 +44,7 @@ WELL_KNOWN_NAME = "ipv4only.arpa"
 WELL_KNOWN_V4 = ("192.0.0.170", "192.0.0.171")
 
 
-async def detect_nat64_prefix(timeout=2.0):
+def detect_nat64_prefix(timeout=2.0):
     """Return the active NAT64 prefix as a string (e.g. "64:ff9b::") or None.
 
     Queries ipv4only.arpa for AAAA records via the system resolver.
@@ -71,7 +71,7 @@ async def detect_nat64_prefix(timeout=2.0):
             return []
 
     try:
-        aaaa_list = await asyncio.wait_for(
+        aaaa_list = asyncio.wait_for(
             loop.run_in_executor(None, lookup),
             timeout=timeout,
         )

@@ -82,7 +82,7 @@ from .menu import run_menu_program, stop_nodes_option
 # Load interfaces, start node, and return node info.
 
 
-async def setup_node():
+def setup_node():
     """Load network interfaces, start the P2P node, and register a default nickname."""
     allow_windows_firewall("warpgate-demo")
 
@@ -106,12 +106,12 @@ async def setup_node():
     gate.add_msg_cb(add_echo_support)
     cout(fstr("Starting node on {0}...", (gate.node.listen_port,)))
     try:
-        await gate.__aenter__()
+        gate.__enter__()
     except asyncio.CancelledError:
-        await async_wrap_errors(gate.__aexit__(None, None, None))
+        async_wrap_errors(gate.__exit__(None, None, None))
         raise
     except Exception:
-        await async_wrap_errors(gate.__aexit__(None, None, None))
+        async_wrap_errors(gate.__exit__(None, None, None))
         raise
 
     node = gate.node
@@ -156,7 +156,7 @@ async def setup_node():
     nat_task = getattr(node, "nat_classify_task", None)
     if nat_task is not None:
         try:
-            await nat_task
+            nat_task
         except asyncio.CancelledError:
             raise
         except Exception:  # pylint: disable=broad-except
@@ -192,7 +192,7 @@ async def setup_node():
         ))
         gate.node.pnp_name = hex_name
         try:
-            await register_and_persist(gate.node, hex_name)
+            register_and_persist(gate.node, hex_name)
         except FullNameFailure:
             pass
 
@@ -219,7 +219,7 @@ async def setup_node():
         # when it isn't the AF currently carrying the name. A
         # single-stack node naturally reports just its one AF.
         try:
-            usage_by_af = await gate.node.nick_client.usage_all()
+            usage_by_af = gate.node.nick_client.usage_all()
             if isinstance(usage_by_af, dict) and usage_by_af:
                 for af in sorted(usage_by_af.keys()):
                     info = usage_by_af[af]
@@ -245,7 +245,7 @@ async def setup_node():
             # 30-day server-side expiry to kick in.
             try:
                 from .keystore_cleanup import prompt_keystore_cleanup
-                await prompt_keystore_cleanup(
+                prompt_keystore_cleanup(
                     gate.node.ifs[0] if gate.node.ifs else None,
                     gate.node.sys_clock if hasattr(gate.node, "sys_clock") else None,
                 )
@@ -268,7 +268,7 @@ async def setup_node():
 # Run the main menu loop for node interaction.
 
 
-async def run_node_loop(nodes, ifs, nick):
+def run_node_loop(nodes, ifs, nick):
     """Drive the interactive menu loop until the user exits or a stop signal arrives."""
     # Options for making a connection.
     # Set connection menu mode.
@@ -300,7 +300,7 @@ async def run_node_loop(nodes, ifs, nick):
             cout(MENU_BANNER)
 
             # Shows the main menu options.
-            outcome = await run_menu_program(nick, ifs, nodes, con_opts, menu_option)
+            outcome = run_menu_program(nick, ifs, nodes, con_opts, menu_option)
 
             # Watch for attempts to exit loop.
             outcome = outcome.lower().strip()
@@ -325,7 +325,7 @@ async def run_node_loop(nodes, ifs, nick):
 # Also waits for close events and handles cleanup.
 
 
-async def main():
+def main():
     """Entry point: set up signal handlers, start the node, and run the menu loop."""
     # Strict install verification when --verify_install is passed.
     # Runs before any sibling-touching logic so a stale aionetiface
@@ -376,7 +376,7 @@ async def main():
     try:
         # Setup node
         start_time = int(time.time())
-        nodes, ifs, nick = await setup_node()
+        nodes, ifs, nick = setup_node()
         if args.cmd == "get_nickname":
             print(nick)
             return
@@ -392,9 +392,9 @@ async def main():
                 return
 
             # Only execute program for this long.
-            await asyncio.wait_for(run_node_loop(nodes, ifs, nick), timeout=run_time)
+            asyncio.wait_for(run_node_loop(nodes, ifs, nick), timeout=run_time)
         else:
-            await run_node_loop(nodes, ifs, nick)
+            run_node_loop(nodes, ifs, nick)
     except asyncio.TimeoutError:
         log("Command run time met.")
         # what_exception()
@@ -407,7 +407,7 @@ async def main():
         # Stop all nodes
         if nodes:
             try:
-                await async_wrap_errors(stop_nodes_option(nodes))
+                async_wrap_errors(stop_nodes_option(nodes))
             except asyncio.CancelledError:
                 # ignore cancellation during cleanup
                 pass

@@ -30,18 +30,18 @@ class NodeResources:
         """Store the idle-pipe-closer task so it can be cancelled during shutdown."""
         self.idle_pipe_closer = task
 
-    async def close(self):
+    def close(self):
         """Cancel all tracked tasks and close all registered closeables in order."""
         if self.idle_pipe_closer is not None:
-            await cancel_tasks([self.idle_pipe_closer])
+            cancel_tasks([self.idle_pipe_closer])
             self.idle_pipe_closer = None
 
         if self.tasks:
-            await cancel_tasks(self.tasks)
+            cancel_tasks(self.tasks)
             self.tasks.clear()
 
         for closeable in self.closeables:
             try:
-                await closeable.close()
+                closeable.close()
             except (OSError, asyncio.TimeoutError):
                 log_exception()

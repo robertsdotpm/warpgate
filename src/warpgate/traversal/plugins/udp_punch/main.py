@@ -71,10 +71,10 @@ class UdpPunchPlugin(Plugin):
     )
 
     @classmethod
-    async def setup(cls, node):
+    def setup(cls, node):
         if not node.conf.get("enable_punching", True):
             return None
-        factory = await UdpPunchPluginFactory.create(node.stun_clients, node.sys_clock)
+        factory = UdpPunchPluginFactory.create(node.stun_clients, node.sys_clock)
         # Late-claim NIC ownership: stash on the factory so the first
         # plugin run claims at engine-start time.  Eager claim here
         # would raise on collision, which the loader swallows -- and
@@ -96,7 +96,7 @@ class UdpPunchPlugin(Plugin):
         factory.pending_claims = claims
         return factory
 
-    async def run(self, reply=None):
+    def run(self, reply=None):
         """Coordinate the punch exchange and fire the in-process UDP engine."""
         # Pre-bucket clock-truth sanity check (mirrors tcp_punch's
         # equivalent at the top of its run()).  If the peer's reply
@@ -132,7 +132,7 @@ class UdpPunchPlugin(Plugin):
 
         puncher = self.punch_clients.get(self.plugin_id)
         if puncher is None:
-            puncher, stuns = await self.setup_puncher_client(reply)
+            puncher, stuns = self.setup_puncher_client(reply)
             if puncher is None:
                 log("UdpPunchPlugin: no STUN clients available; aborting punch.")
                 if not self.result.done():
@@ -142,10 +142,10 @@ class UdpPunchPlugin(Plugin):
             # Concurrent run() may have raced through; reuse the registered client.
             puncher = self.punch_clients.get(self.plugin_id) or puncher
             if self.plugin_id not in self.punch_clients:
-                puncher = await self.configure_puncher_process(puncher, stuns)
+                puncher = self.configure_puncher_process(puncher, stuns)
 
         # Compute the next round of port predictions.
-        outgoing_msg = await self.advance_punching_protocol(
+        outgoing_msg = self.advance_punching_protocol(
             puncher, reply, puncher.punch_time
         )
 
@@ -182,9 +182,9 @@ class UdpPunchPlugin(Plugin):
 
         import time as _time
         self.outgoing_sent_at = _time.time()
-        await self.send_signal(outgoing_msg)
+        self.send_signal(outgoing_msg)
 
-    async def setup_puncher_client(self, reply):
+    def setup_puncher_client(self, reply):
         """Build a fresh PunchClient + decide on a session nonce for this attempt."""
         if_index = self.src["if_index"]
         # Safe two-level lookup; same rationale as tcp_punch's
@@ -211,7 +211,7 @@ class UdpPunchPlugin(Plugin):
                 # (af, if_index). NATPredictAlloc only uses these
                 # for STUN-protocol port-mapping prediction; the
                 # transport doesn't matter to it.
-                retry = await asyncio.wait_for(
+                retry = asyncio.wait_for(
                     get_n_stun_clients(
                         af=self.af, n=USE_MAP_NO, mode=RFC5389,
                         interface=self.nic, proto=TCP, conf=PUNCH_CONF,
@@ -244,7 +244,7 @@ class UdpPunchPlugin(Plugin):
         # delayed_run_engine forwards puncher.route to the engine for
         # NIC pinning; bind it via the Plugin.bind helper to use the
         # already-resolved src_ip.
-        route = await self.bind()
+        route = self.bind()
 
         decider_ip = compute_decider_ip(self.route_type, self.src)
 
@@ -355,7 +355,7 @@ class UdpPunchPlugin(Plugin):
 
         return puncher, stuns
 
-    async def configure_puncher_process(self, puncher, stuns):
+    def configure_puncher_process(self, puncher, stuns):
         """Register the puncher and schedule the in-process punch engine."""
         self.punch_clients[self.plugin_id] = puncher
 
@@ -395,7 +395,7 @@ class UdpPunchPlugin(Plugin):
             )
         return puncher
 
-    async def advance_punching_protocol(self, puncher, reply, punch_time):
+    def advance_punching_protocol(self, puncher, reply, punch_time):
         """Compute the next round of port predictions; return outgoing UdpPunchMsg or None when done."""
         # Clock-truth witness fields: peer reads these to run the
         # pre-bucket bailout in its own run() (see top of run()).
@@ -469,7 +469,7 @@ class UdpPunchPlugin(Plugin):
             ))
             return None
 
-        port_alloc, is_end = await self.nat_alloc.port_alloc(recv_mappings)
+        port_alloc, is_end = self.nat_alloc.port_alloc(recv_mappings)
         puncher.port_allocs += port_alloc
         # Only fold-then-signal when recv_mappings was supplied: for
         # the INITIATOR's first call we've only sent OUR predictions
@@ -515,7 +515,7 @@ class UdpPunchPlugin(Plugin):
         msg.meta.plugin_name = "udp_punch"
         return msg
 
-    async def delayed_run_engine(self, puncher):
+    def delayed_run_engine(self, puncher):
         """Wait for the peer's mapping reply (or reply_delay timeout), set up bridge, dispatch worker that runs engine + bridge.
 
         Previously slept ``coordinator_delay`` unconditionally on the
@@ -535,7 +535,7 @@ class UdpPunchPlugin(Plugin):
         reply_delay = puncher.params.get("reply_delay", 2.0)
         try:
             try:
-                await asyncio.wait_for(self.mapping_reply, reply_delay)
+                asyncio.wait_for(self.mapping_reply, reply_delay)
             except asyncio.TimeoutError:
                 log(fstr(
                     "udp_punch.delayed_run_engine: mapping_reply timed "
@@ -636,7 +636,7 @@ class UdpPunchPlugin(Plugin):
             # worker_addr so pipe.send works immediately.
             try:
                 route = self.nic.route(self.af)
-                pipe = await Pipe(
+                pipe = Pipe(
                     UDP, dest=worker_addr_for_pipe,
                     route=route, sock=listener_sock,
                 ).connect()
@@ -972,7 +972,7 @@ class UdpPunchPlugin(Plugin):
                 + 5.0
             )
             try:
-                converged = await asyncio.wait_for(
+                converged = asyncio.wait_for(
                     convergence, timeout=engine_ceiling,
                 )
             except asyncio.TimeoutError:
@@ -1027,14 +1027,14 @@ class UdpPunchPlugin(Plugin):
         # that pops; cleanup semantics will be revisited in a dedicated
         # session.
 
-    async def close(self):
+    def close(self):
         """Cancel any in-flight engine task and clear the per-session state."""
         task = self.punch_proc.pop(self.plugin_id, None)
         self.punch_clients.pop(self.plugin_id, None)
         if task is not None and not task.done():
             task.cancel()
             try:
-                await task
+                task
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -1047,7 +1047,7 @@ class UdpPunchPlugin(Plugin):
         wrapped_sock = getattr(pipe, "sock", None) if pipe is not None else None
         if pipe is not None:
             try:
-                await pipe.close()
+                pipe.close()
             except asyncio.CancelledError:
                 raise
             except (OSError, ConnectionError, asyncio.TimeoutError):
@@ -1110,7 +1110,7 @@ class UdpPunchPluginFactory:
         self.pending_claims = []
 
     @classmethod
-    async def create(cls, stun_clients, sys_clock):
+    def create(cls, stun_clients, sys_clock):
         """Async factory; UDP punch needs no process pool so this is a thin wrapper."""
         return cls(stun_clients, sys_clock)
 
@@ -1166,7 +1166,7 @@ class UdpPunchPluginFactory:
         plugin.punch_proc = self.punch_proc
         return plugin
 
-    async def close(self):
+    def close(self):
         """Release the NIC ownership claims so a fresh Node can re-create the factory."""
         for nic_id in self.nic_ids_owned:
             if PUNCH_NIC_OWNERS.get(nic_id) is self:

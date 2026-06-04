@@ -168,7 +168,7 @@ def turn_proc_attrs(af, attr_code, attr_data, msg, self):
 
 
 # Processes attributes from a TURN message.
-async def process_attributes(af, self, msg):
+def process_attributes(af, self, msg):
     """Walk all attributes in a TURN message, updating client state and returning any error info."""
     # Unpack attributes from message.
     error_code = 0
@@ -199,7 +199,7 @@ async def process_attributes(af, self, msg):
 
 # Process any replies from the TURN server.
 # This function is run concurrently and doesn't block the main program.
-async def turn_msg_handler(client, data, client_tup, pipe):
+def turn_msg_handler(client, data, client_tup, pipe):
     """msg_cb-style handler for TURN server messages on the signaling
     pipe.  Replaces the old process_replies polling loop -- registered
     via turn_pipe.add_msg_cb(...) in TURNClient.start() so each inbound
@@ -209,14 +209,14 @@ async def turn_msg_handler(client, data, client_tup, pipe):
     must not kill subsequent dispatch.
     """
     try:
-        await dispatch_one(client, data)
+        dispatch_one(client, data)
     except asyncio.CancelledError:
         raise
     except Exception:  # pylint: disable=broad-except
         log_exception()
 
 
-async def dispatch_one(self, out):
+def dispatch_one(self, out):
     """Dispatch one inbound frame from the TURN server's signaling
     pipe.  Recognises three classes:
       1. ChannelData (first byte 0x40-0x7F) — strip channel header,
@@ -311,7 +311,7 @@ async def dispatch_one(self, out):
         return
 
     try:
-        error_code, error_msg = await process_attributes(
+        error_code, error_msg = process_attributes(
             self.turn_pipe.route.af, self, turn_msg
         )
     except (OSError, ValueError):

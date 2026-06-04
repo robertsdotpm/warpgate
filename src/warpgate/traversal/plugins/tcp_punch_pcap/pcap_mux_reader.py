@@ -92,10 +92,10 @@ class MuxSubscriber(object):
         self.backend = mux.backend
         self.stopped = False
 
-    async def next_frame(self, timeout=None):
+    def next_frame(self, timeout=None):
         if timeout is None:
-            return await self.queue.get()
-        return await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            return self.queue.get()
+        return asyncio.wait_for(self.queue.get(), timeout=timeout)
 
     def stop(self):
         if self.stopped:

@@ -137,7 +137,7 @@ class NATPredictAlloc:
         ))
         return None
 
-    async def port_alloc(self, recv_mappings=None):
+    def port_alloc(self, recv_mappings=None):
         """Progress the exchange state machine and return (port_allocs, is_end) for this round."""
         # Change protocol state transition.
         self.state, self.side = nat_predict_states(
@@ -150,7 +150,7 @@ class NATPredictAlloc:
         fetch_states = [INITIATED_PREDICTIONS]
         fetch_states += [RECEIVED_PREDICTIONS]
         if self.state in fetch_states:
-            self.send_mappings, self.preloaded_mappings = await nat_prediction(
+            self.send_mappings, self.preloaded_mappings = nat_prediction(
                 self.punch_mode,
                 self.src_nat,
                 self.dest_nat,
@@ -213,10 +213,10 @@ class NATPredictAlloc:
         self.punch_mode = get_punch_mode(self.af, str(dest_ip), self.same_machine)
 
 
-async def workspace():
+def workspace():
     """Interactive workspace for testing NATPredictAlloc locally."""
-    nic = await Interface()
-    stun_clients = await get_n_stun_clients(
+    nic = Interface()
+    stun_clients = get_n_stun_clients(
         af=nic.supported()[0], n=5, proto=UDP, interface=nic, conf=PUNCH_CONF
     )
 
@@ -226,12 +226,12 @@ async def workspace():
     # Load test defaults.
     nat_predict.set_punch_mode()
     nat_predict.set_nat_info()
-    send_alloc = await nat_predict.port_alloc()
+    send_alloc = nat_predict.port_alloc()
 
     # Simulate receiving mappings by just using our own.
     # Obviously this is meaningless and real would come from a client.
     recv_mappings = nat_predict.send_mappings
-    updated_alloc = await nat_predict.port_alloc(recv_mappings)
+    updated_alloc = nat_predict.port_alloc(recv_mappings)
 
 
 if __name__ == "__main__":
