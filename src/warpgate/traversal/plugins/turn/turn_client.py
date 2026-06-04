@@ -14,6 +14,7 @@ Key differences from a standard TURN library:
   - Full Pipe object compatibility
 """
 import asyncio
+import runloom
 from struct import pack
 from aionetiface import (
     PipeEvents, Pipe, UDP, NET_CONF, to_b, to_s, fstr, log, log_exception,
@@ -229,10 +230,15 @@ self,
         async_retry(lambda: self.allocate_relay(sign=False), count=5)
         log(fstr("Turn expect unauth success"))
 
-        # Wait for client to be ready.
-        self.auth_event.wait()  # Authentication success.
+        # Wait for client to be ready.  Bound the waits: in the sync model
+        # these are cooperative Events with no event loop behind them, so an
+        # unauthenticated / unreachable server would otherwise hang start()
+        # forever.  The reply-driven handler sets these events from the
+        # reader goroutine; the timeout matches get_turn_client's old
+        # asyncio.wait_for budget.
+        self.auth_event.wait(timeout=8)  # Authentication success.
         log(fstr("Turn auth success"))
-        self.relay_event.wait()  # Our relay address available.
+        self.relay_event.wait(timeout=8)  # Our relay address available.
         log(fstr("Turn relay event success"))
 
         # Return our relay tup.
@@ -248,7 +254,15 @@ self,
         def refresher():
             """Periodically refresh the TURN allocation to prevent it from expiring."""
             while self.state != TURN_ERROR_STOPPED:
-                asyncio.sleep(TURN_REFRESH_EXPIRY - 60)
+                # Sleep in short slices instead of one long sleep so that
+                # close()/state-change is observed promptly.  As a goroutine
+                # (sync model), a single multi-minute time.sleep here would
+                # otherwise hold runloom.run() open until the full interval.
+                target = TURN_REFRESH_EXPIRY - 60
+                slept = 0
+                while slept < target and self.state != TURN_ERROR_STOPPED:
+                    asyncio.sleep(min(1, target - slept))
+                    slept += 1
                 if self.state == TURN_ERROR_STOPPED:
                     break
                 try:
@@ -266,11 +280,19 @@ self,
                         log_exception()
                         continue
 
-        # First run of this function.
+        # First run of this function.  The allocation refresher is a
+        # long-lived loop; under asyncio it was a background task, in the
+        # sync model it is a goroutine (the async strip would otherwise run
+        # refresher() eagerly here and never return).
         if not n:
-            self.allocate_refresher_task = asyncio.create_task(
-                async_wrap_errors(refresher())
-            )
+            def run_refresher():
+                """Run the allocation refresher loop on its own goroutine."""
+                try:
+                    refresher()
+                except Exception:
+                    log_exception()
+
+            self.allocate_refresher_task = runloom.go(run_refresher)
             self.tasks.append(self.allocate_refresher_task)
 
         return self

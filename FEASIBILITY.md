@@ -22,11 +22,25 @@ in and exposes 471 public names with no event loop anywhere.
 | namebump | keypair gen, full ECDSA-signed packet wire roundtrip (sign/pack/unpack/verify + tamper) | **2/2** (run 8) |
 | sidewire | MQTT wire codec, **real connect to test.mosquitto.org**, **real signed pub/sub** | **3/3** run(1); 2/3 run(8) (see below) |
 | warpgate | full-stack sync import, core signal-proto registry, deterministic human nicknames, PNP ts-envelope + TLD codec | **4/4** (run 8) |
+| warpgate | **TURN client handshake** against a real server (relay1.expressturn.com): connect, Allocate, 401 challenge, REALM+NONCE parse, long-term credential key | **1/1** (run 8) |
 
 warpgate's *real P2P* (cross-NAT connect, hole punching) needs two peers behind
 real NATs + MQTT/TURN infra and is out of scope on one Linux box — as are the
 project's own connectivity tests, which need the same infra.  What runs here is
-the import of the whole stack + warpgate's local protocol/naming logic.
+the import of the whole stack + warpgate's local protocol/naming logic + the two
+client protocols it relies on:
+
+- **MQTT client** (sidewire): real CONNECT/CONNACK + subscribe and full signed
+  pub/sub against `test.mosquitto.org` — works (see sidewire's report).
+- **TURN client** (warpgate): the Allocate **handshake** against a real TURN
+  server runs as sync code — connect, Allocate, parse the 401 long-term-cred
+  challenge (REALM + NONCE), compute the credential key.  A full relay
+  allocation needs valid server credentials, and a relay *data path* can't be
+  tested from one host (you can't circuit a TURN relay back to yourself — coturn
+  rejects same-WAN-IP relay — and it needs a second peer).  Two sync-port
+  hand-fixes were needed: the allocation-refresher loop became a `runloom.go`
+  goroutine (with a poll-interruptible sleep), and the auth/relay `Event.wait()`
+  calls were bounded so an unauthenticated server can't hang `start()`.
 
 ## Findings the stack surfaced (beyond the aionetiface writeup)
 
